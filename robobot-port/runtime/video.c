@@ -21,10 +21,10 @@ static SDL_FRect r_top, r_bot;                         /* where each screen is d
 
 /* Controls from settings.toml [controls]; defaults follow the usual 3DS emulator layout. */
 static const struct { const char *name, *def; uint32_t bit; } binds_def[] = {
-    { "a", "X", BTN_A }, { "b", "Z", BTN_B }, { "x", "S", BTN_X }, { "y", "A", BTN_Y }, { "l", "Q", BTN_L }, { "r", "W", BTN_R },
-    { "start", "Return", BTN_START }, { "select", "Backspace", BTN_SELECT },
-    { "dpad_up", "I", BTN_UP }, { "dpad_down", "K", BTN_DOWN }, { "dpad_left", "J", BTN_LEFT }, { "dpad_right", "L", BTN_RIGHT },
-    { "circle_up", "Up", 0 }, { "circle_down", "Down", 0 }, { "circle_left", "Left", 0 }, { "circle_right", "Right", 0 } };
+    { "a", "L", BTN_A }, { "b", "K", BTN_B }, { "x", "I", BTN_X }, { "y", "J", BTN_Y }, { "l", "Q", BTN_L }, { "r", "E", BTN_R },
+    { "start", "=", BTN_START }, { "select", "-", BTN_SELECT },
+    { "dpad_up", "Up", BTN_UP }, { "dpad_down", "Down", BTN_DOWN }, { "dpad_left", "Left", BTN_LEFT }, { "dpad_right", "Right", BTN_RIGHT },
+    { "circle_up", "W", 0 }, { "circle_down", "S", 0 }, { "circle_left", "A", 0 }, { "circle_right", "D", 0 } };
 #define NBINDS (sizeof binds_def / sizeof *binds_def)
 static SDL_Scancode binds[NBINDS];
 static void load_binds(void) {

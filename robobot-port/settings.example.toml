@@ -1,27 +1,27 @@
 # Copy to settings.toml (in the folder you run the game from) and edit.
 # Key names are SDL key names: letters, "Up", "Down", "Left", "Right", "Return", "Backspace",
-# "Space", "Left Shift", "Right Shift", "Tab", "1".."9", "F1".. and so on.
+# "Space", "-", "=", "Left Shift", "Right Shift", "Tab", "1".."9", "F1".. and so on.
 
 [controls]
-# face buttons sit like the 3DS: Y left, X top, A right, B bottom
-a = "X"
-b = "Z"
-x = "S"
-y = "A"
+# face buttons as a diamond like the 3DS: X top (I), Y left (J), A right (L), B bottom (K)
+a = "L"
+b = "K"
+x = "I"
+y = "J"
 l = "Q"
-r = "W"
-start = "Return"
-select = "Backspace"
+r = "E"
+start = "="
+select = "-"
 # circle pad (movement)
-circle_up = "Up"
-circle_down = "Down"
-circle_left = "Left"
-circle_right = "Right"
+circle_up = "W"
+circle_down = "S"
+circle_left = "A"
+circle_right = "D"
 # d-pad
-dpad_up = "I"
-dpad_down = "K"
-dpad_left = "J"
-dpad_right = "L"
+dpad_up = "Up"
+dpad_down = "Down"
+dpad_left = "Left"
+dpad_right = "Right"
 
 [video]
 # stacked (like the console), large_top (bottom screen as a corner overlay),

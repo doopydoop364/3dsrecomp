@@ -23,8 +23,8 @@ from your own dump in `game/` and is never committed (this folder is git-exclude
 
 ## Controls and settings
 Copy `settings.example.toml` to `settings.toml` in the folder you run from (or point `RB_SETTINGS` at it).
-Defaults: arrow keys circle pad, X/Z = A/B, S/A = X/Y, Q/W = L/R, I/J/K/L d-pad, Enter Start,
-Backspace Select; gamepads by Nintendo button position; left mouse on the bottom screen is the stylus.
+Defaults: WASD circle pad, arrow keys d-pad, I/J/K/L = X/Y/B/A (a diamond like the 3DS), Q/E = L/R,
+= Start, - Select; gamepads by Nintendo button position; left mouse on the bottom screen is the stylus.
 Hotkeys: F1 next layout (stacked, large top, top only, side by side), F2 swap screens, F3 show the bottom
 screen in top-only mode, F11 fullscreen, F12 screenshot, Escape quit. `RB_INPUT` scripts input for tests.
 
