@@ -3,6 +3,7 @@
  * Layouts and algorithms follow the behaviour documented by the Azahar emulator's sources. */
 #include "pica.h"
 #include "input.h"
+#include "vkr.h"
 #include <sys/stat.h>
 #include <time.h>
 
@@ -116,6 +117,7 @@ static void texture_copy(uint32_t in, uint32_t out, uint32_t size, uint32_t in_w
 
 static void run_queue(void) {
     uint8_t *q = gsp_mem->mem + 0x800;
+    vkr_new_gen();                                                     /* the guest CPU ran since the last batch */
     while (q[1]) {
         uint32_t c[8];
         memcpy(c, q + 0x20 + (q[0] % 15) * 0x20, sizeof c);
@@ -123,18 +125,22 @@ static void run_queue(void) {
         uint32_t id = c[0] & 0xff;
         if (id < 8) gx_count[id]++;
         switch (id) {
-        case 0: if (mem_valid(c[1], c[3]) && mem_valid(c[2], c[3])) memmove((void *)(uintptr_t)c[2], (void *)(uintptr_t)c[1], c[3]); irq(IRQ_DMA); break;
+        case 0: vkr_sync_range(c[1], c[3], 0); vkr_sync_range(c[2], c[3], 1);
+                if (mem_valid(c[1], c[3]) && mem_valid(c[2], c[3])) memmove((void *)(uintptr_t)c[2], (void *)(uintptr_t)c[1], c[3]); irq(IRQ_DMA); break;
         case 1: { uint64_t t0 = host_ns(); uint64_t d0 = pica_draw_count(); lists++; pica_run_list(c[1], c[2]); uint64_t dt = host_ns() - t0; ns_gpu += dt;
                   { static int64_t tf = -2; if (tf == -2) { const char *e = getenv("RB_TIME_FRAME"); tf = e ? atoll(e) : -1; }
                     if ((int64_t)frames == tf) fprintf(stderr, "gpu: list %08x (%u bytes): %.2f ms, %llu draws\n", c[1], c[2], (double)dt / 1e6, (unsigned long long)(pica_draw_count() - d0)); }
                   irq(IRQ_P3D); break; }
         case 2:
-            if (c[1]) memory_fill(c[1], c[2], c[3], c[7] & 0xffff);
-            if (c[4]) memory_fill(c[4], c[5], c[6], c[7] >> 16);
+            if (c[1] && !vkr_fill(c[1], c[3], c[2], c[7] & 0xffff)) { vkr_sync_range(c[1], c[3] - c[1], 1); memory_fill(c[1], c[2], c[3], c[7] & 0xffff); }
+            if (c[4] && !vkr_fill(c[4], c[6], c[5], c[7] >> 16)) { vkr_sync_range(c[4], c[6] - c[4], 1); memory_fill(c[4], c[5], c[6], c[7] >> 16); }
             if (c[1]) irq(IRQ_PSC0); else if (c[4]) irq(IRQ_PSC1);
             break;
-        case 3: { uint64_t t0 = host_ns(); display_transfer(c[1], c[2], c[3], c[4], c[5]); ns_transfer += host_ns() - t0; irq(IRQ_PPF); break; }
-        case 4: texture_copy(c[1], c[2], c[3], c[4], c[5]); irq(IRQ_PPF); break;
+        case 3: { uint32_t ib = bpp_of[(c[5] >> 8) & 7], ob = bpp_of[(c[5] >> 12) & 7];
+                  vkr_sync_range(c[1], (c[3] & 0xffff) * (c[3] >> 16) * ib, 0); vkr_sync_range(c[2], (c[4] & 0xffff) * (c[4] >> 16) * ob, 1); }
+                { uint64_t t0 = host_ns(); display_transfer(c[1], c[2], c[3], c[4], c[5]); ns_transfer += host_ns() - t0; irq(IRQ_PPF); break; }
+        case 4: { uint32_t span = c[3] * 2 + 0x100000; vkr_sync_range(c[1], span, 0); vkr_sync_range(c[2], span, 1); }   /* gaps: generous span */
+                texture_copy(c[1], c[2], c[3], c[4], c[5]); irq(IRQ_PPF); break;
         case 5: break;
         default: LOG(1, "gx: unknown command %u", id);
         }
@@ -150,6 +156,8 @@ static void vblank(void) {
             if (u[1]) { memcpy(&shown[s], u + 4 + (u[0] & 1) * 0x1c, sizeof(FbInfo)); u[1] = 0; if (s == 0) swaps++; }
         }
     const uint8_t *fb[2] = { 0, 0 };
+    for (int s = 0; s < 2; s++) if (shown[s].left) vkr_sync_range(shown[s].left, shown[s].stride * (s ? 320u : 400u), 0);
+    vkr_frame();
     for (int s = 0; s < 2; s++)
         if (shown[s].left && mem_valid(shown[s].left, shown[s].stride * (s ? 320u : 400u))) fb[s] = (const uint8_t *)(uintptr_t)shown[s].left;
     video_frame(frames, fb[0], shown[0].stride, shown[0].format, fb[1], shown[1].stride, shown[1].format);

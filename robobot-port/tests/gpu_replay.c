@@ -7,6 +7,7 @@
  */
 #define _GNU_SOURCE
 #include "pica.h"
+#include "vkr.h"
 #include <sys/mman.h>
 #include <time.h>
 
@@ -53,6 +54,7 @@ int main(int argc, char **argv) {
     int reps = getenv("RB_BENCH") ? atoi(getenv("RB_BENCH")) : 1;
     for (int r = 0; r < reps; r++)                   /* repeated runs re-render the same pixels: only for timing */
         for (int k = 0; k < nl; k++) pica_run_list(lists[k][0], lists[k][1]);
+    vkr_sync_all();
     clock_gettime(CLOCK_MONOTONIC, &t1);
     fprintf(stderr, "render time: %.2f ms per run\n", ((double)(t1.tv_sec - t0.tv_sec) * 1e3 + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6) / reps);
     pica_report();

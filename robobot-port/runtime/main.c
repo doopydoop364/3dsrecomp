@@ -82,6 +82,7 @@ int main(int argc, char **argv) {
     sigaction(SIGSEGV, &sa, 0); sigaction(SIGBUS, &sa, 0); sigaction(SIGFPE, &sa, 0); sigaction(SIGILL, &sa, 0);
 
     settings_load();
+    if (!getenv("RB_RENDERER")) setenv("RB_RENDERER", settings_get("video.renderer", "vulkan"), 1);   /* vk.c reads it */
     video_init("robobot-port");
     input_init();
     audio_init();

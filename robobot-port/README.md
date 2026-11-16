@@ -28,6 +28,20 @@ Defaults: WASD circle pad, arrow keys d-pad, I/J/K/L = X/Y/B/A (a diamond like t
 Hotkeys: F1 next layout (stacked, large top, top only, side by side), F2 swap screens, F3 show the bottom
 screen in top-only mode, F11 fullscreen, F12 screenshot, Escape quit. `RB_INPUT` scripts input for tests.
 
+## Renderer
+Vulkan by default (`video.renderer = "vulkan"`; `RB_RENDERER=software` or `vulkan` overrides). The CPU still runs
+vertex shading, clipping and primitive assembly; `runtime/vk.c` rasterises and runs the fragment stage
+(`runtime/shaders/pica.frag` is a port of the software path: texture fetch and wrap, combiners, lighting, alpha
+test, depth). Render targets live in a surface cache keyed by address, size and format; guest memory stays the
+truth and a surface is written back only when a GX command, a texture read or the display needs the bytes.
+If Vulkan 1.3 is missing it falls back to the software renderer, which stays the reference.
+- Speed: the scripted run to stage 1 (3460 frames) takes 42 s headless instead of 117 s; about 75-80 fps uncapped in the stage.
+- Accuracy: screenshots differ from the software renderer in under 0.3% of pixels (triangle edges); blending is
+  done in floating point, so blended pixels can be 1 step off the hardware's integer result.
+- `RB_VK_VALIDATE=1` turns on the Khronos validation layer; `RB_VK_DEVICE=n` picks a GPU.
+- Not done yet: Vulkan presentation (the window still uses SDL's renderer), resolution scaling, texture filtering
+  (both renderers sample nearest), GPU-side display transfers.
+
 ## Audio
 `runtime/dsp.c` decodes the game's 24 DSP voices (PCM8, PCM16, DSP-ADPCM), resamples them linearly, mixes the three
 intermediate mixes down to stereo and reports voice status back to the game; `runtime/audio.c` plays it through SDL at

@@ -2,12 +2,13 @@
  * software rasteriser. Behaviour follows the facts in docs/pica_facts.md.
  * RB_PICA_LOG=n logs the first n draws in detail. */
 #include "pica.h"
+#include "vkr.h"
 #include <math.h>
 #include <pthread.h>
 #include <unistd.h>
 
 static uint32_t reg[0x300];
-static uint32_t lut[24][256];               /* lighting lookup tables, filled through 0x1C8-0x1CF */
+static uint32_t lut[24][256]; static uint64_t lut_version;               /* lighting lookup tables, filled through 0x1C8-0x1CF */
 static uintptr_t cur_word;
 static uint32_t top_list, cur_list;         /* top-level list of this submission, and the list now executing */                 /* host address of the command word being executed */
 static uintptr_t uni_src[96];              /* where each uniform's last upload came from */
@@ -84,7 +85,7 @@ static uint32_t write_reg(uint32_t id, uint32_t value, uint32_t mask) {
     }
     case 0x1c8: case 0x1c9: case 0x1ca: case 0x1cb: case 0x1cc: case 0x1cd: case 0x1ce: case 0x1cf: {
         uint32_t cfg = reg[0x1c5], idx = cfg & 0xff, type = (cfg >> 8) & 0x1f;
-        if (type < 24) lut[type][idx] = v;
+        if (type < 24) { lut[type][idx] = v; lut_version++; }
         reg[0x1c5] = (cfg & ~0xffu) | ((idx + 1) & 0xff);
         break;
     }
@@ -948,7 +949,39 @@ static void flush_tris(const Fb *fb) {
     ntris = 0;
 }
 
+/* ---- Vulkan backend hand-off (vk.c): the GPU rasterises the triangles queued for this draw ---- */
+static void vk_decode(int unit, uint8_t *rgba) {
+    const TexUnit *t = &tu[unit];
+    for (uint32_t y = 0; y < t->h; y++)
+        for (uint32_t x = 0; x < t->w; x++) texel(t, x, y, rgba + 4 * (y * t->w + x));
+}
+static void vk_submit(const Fb *fb, uint32_t caddr, uint32_t daddr) {
+    static VkrDraw d;
+    d.caddr = fb->color ? (uint32_t)(uintptr_t)fb->color : 0; d.daddr = fb->depth ? (uint32_t)(uintptr_t)fb->depth : 0;
+    (void)caddr; (void)daddr;
+    d.width = fb->width; d.height = fb->hreg + 1; d.cfmt = fb->cfmt; d.dfmt = fb->dfmt;
+    d.regs = reg; d.lut = &lut[0][0]; d.lut_version = lut_version;
+    for (uint32_t k = 0; k < 8; k++) {
+        const LightP *l = &lights[k];
+        float (*L)[4] = &d.lights[k * 6];
+        for (int c = 0; c < 3; c++) { L[0][c] = l->pos[c]; L[1][c] = l->spot[c]; L[2][c] = l->spec0[c]; L[3][c] = l->spec1[c]; L[4][c] = l->diff[c]; L[5][c] = l->amb[c]; }
+        L[0][3] = l->dbias; L[1][3] = l->dscale; memcpy(&L[2][3], &l->id, 4); memcpy(&L[3][3], &l->cfg, 4); L[4][3] = L[5][3] = 0;
+    }
+    for (int c = 0; c < 3; c++) d.gamb[c] = global_amb[c];
+    d.zscale = f24(reg[0x04d]); d.zoff = f24(reg[0x04e]);
+    d.flat = (uint32_t)flat_mode; d.flat_color = (uint32_t)(flat[0] | flat[1] << 8 | flat[2] << 16 | 0xffu << 24); d.nlights = nlights;
+    for (int u = 0; u < 3; u++) {
+        const TexUnit *t = &tu[u];
+        d.tex[u].on = (uint32_t)t->on;
+        if (!t->on) continue;
+        d.tex[u].addr = (uint32_t)(uintptr_t)t->base; d.tex[u].w = t->w; d.tex[u].h = t->h; d.tex[u].fmt = t->fmt;
+        d.tex[u].size = t->w * t->h * tex_bits[t->fmt] / 8; d.tex[u].wrap = t->wrap_s | t->wrap_t << 8; d.tex[u].border = t->border;
+    }
+    vkr_draw(&d, tris, ntris, vk_decode);
+}
+
 static void draw(int indexed) {
+    { static int tried; if (!tried) { tried = 1; vkr_init(); } }
     uint64_t t_draw0 = pns();
     n_draws++;
     { static int64_t stop = -2; if (stop == -2) { const char *e = getenv("RB_STOP_AFTER_DRAW"); stop = e ? atoll(e) : -1; }
@@ -1030,7 +1063,8 @@ static void draw(int indexed) {
         }
     }
     uint64_t tC = pns(); t_assemble += tC - tB;
-    flush_tris(&fb);
+    if (vkr_on) { vk_submit(&fb, caddr, daddr); ntris = 0; }
+    else flush_tris(&fb);
     t_raster += pns() - tC;
     if (((int64_t)n_draws > log_from && (int64_t)n_draws <= log_from + log_draws) || (int64_t)gpu_frame() == log_frame) {
         LOG(1, "pica: frame %llu draw #%u flat colour %02x%02x%02x  list %08x (running %08x)", (unsigned long long)gpu_frame(), draw_in_frame, flat[0], flat[1], flat[2], top_list, cur_list);
