@@ -20,6 +20,7 @@ static SDL_Texture *tex_top, *tex_bot;
 enum { L_STACKED, L_LARGE_TOP, L_TOP_ONLY, L_SIDE, L_COUNT };
 static int layout, swapped;
 static SDL_FRect r_top, r_bot;                         /* where each screen is drawn, in window pixels */
+static SDL_Scancode ff_key; static int ff_toggle, ff_on;   /* fast-forward: hold (or toggle) a key */
 
 /* Controls from settings.toml [controls]; defaults follow the usual 3DS emulator layout. */
 static const struct { const char *name, *def; uint32_t bit; } binds_def[] = {
@@ -105,6 +106,8 @@ void video_init(const char *title) {
     if (!tex_top || !tex_bot) fatal("cannot create the window: %s", SDL_GetError());
     SDL_SetTextureScaleMode(tex_top, SDL_SCALEMODE_NEAREST); SDL_SetTextureScaleMode(tex_bot, SDL_SCALEMODE_NEAREST);
     load_binds();
+    ff_key = SDL_GetScancodeFromName(settings_get("controls.fast_forward", "Tab"));
+    ff_toggle = !strcmp(settings_get("controls.fast_forward_mode", "hold"), "toggle");
     const char *lname = settings_get("video.layout", "stacked");
     static const char *lnames[L_COUNT] = { "stacked", "large_top", "top_only", "side_by_side" };
     for (int i = 0; i < L_COUNT; i++) if (!strcmp(lname, lnames[i])) layout = i;
@@ -213,6 +216,7 @@ void video_frame(uint64_t frame, const uint8_t *top, uint32_t top_stride, uint32
         if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat) {
             if (e.key.key == SDLK_F1) layout = (layout + 1) % L_COUNT;
             if (e.key.key == SDLK_F2) swapped = !swapped;
+            if (ff_toggle && e.key.scancode == ff_key) { ff_on = !ff_on; k_set_fast_forward(ff_on); }
             if (e.key.key == SDLK_F5) nfc_host_tap();             /* amiibo: tap the next dump from <game>/amiibo */
             if (e.key.key == SDLK_F6) nfc_host_remove();
             if (e.key.key == SDLK_F11) SDL_SetWindowFullscreen(win, !(SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN));
@@ -226,6 +230,7 @@ void video_frame(uint64_t frame, const uint8_t *top, uint32_t top_stride, uint32
     SDL_GetWindowSizeInPixels(win, &w, &h);
     place_screens(w, h, SDL_GetKeyboardState(0)[SDL_SCANCODE_F3]);
     poll_host_input();
+    if (!ff_toggle && ff_key != SDL_SCANCODE_UNKNOWN) { int on = SDL_GetKeyboardState(0)[ff_key]; if (on != ff_on) { ff_on = on; k_set_fast_forward(on); } }
     SDL_Texture *tt = tex_top, *tb = tex_bot;
     if (hi) {
         uint32_t S = hi_scale;

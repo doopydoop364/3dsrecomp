@@ -28,6 +28,11 @@ Defaults: WASD circle pad, arrow keys d-pad, I/J/K/L = X/Y/B/A (a diamond like t
 Hotkeys: F1 next layout (stacked, large top, top only, side by side), F2 swap screens, F3 show the bottom
 screen in top-only mode, F11 fullscreen, F12 screenshot, Escape quit. `RB_INPUT` scripts input for tests.
 
+## Settings layers and command line
+`games/<title id>.toml` holds per-game defaults (Robobot: large-top layout); your `settings.toml` overrides them, and
+command-line flags override both: `./build/robobot game --scale 2 --layout stacked --set video.texture_filter=linear`
+(`--help`-style usage on a bad flag). Hold Tab to fast-forward (`controls.fast_forward`, `fast_forward_mode = "toggle"`).
+
 ## Renderer
 Vulkan by default (`video.renderer = "vulkan"`; `RB_RENDERER=software` or `vulkan` overrides). The CPU still runs
 vertex shading, clipping and primitive assembly; `runtime/vk.c` rasterises and runs the fragment stage

@@ -1,4 +1,6 @@
-# Copy to settings.toml (in the folder you run the game from) and edit.
+# Copy to settings.toml (in the folder you run the game from) and edit. Per-game defaults live in
+# games/<title id>.toml; values here override them, and command-line flags (--scale 2, --set video.layout=stacked,
+# see --help) override both.
 # Key names are SDL key names: letters, "Up", "Down", "Left", "Right", "Return", "Backspace",
 # "Space", "-", "=", "Left Shift", "Right Shift", "Tab", "1".."9", "F1".. and so on.
 
@@ -22,6 +24,9 @@ dpad_up = "Up"
 dpad_down = "Down"
 dpad_left = "Left"
 dpad_right = "Right"
+# fast-forward while held (or press to toggle with fast_forward_mode = "toggle")
+fast_forward = "Tab"
+fast_forward_mode = "hold"
 
 [video]
 # stacked (like the console), large_top (bottom screen as a corner overlay),

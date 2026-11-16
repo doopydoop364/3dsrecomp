@@ -81,6 +81,7 @@ KObject *k_shmem(uint32_t size);
 KObject *k_session(const char *name);
 void k_signal(KObject *event);
 void k_add_periodic(void (*fn)(void), uint64_t period_ns);
+void k_set_fast_forward(int on);
 KThread *k_thread_create(uint32_t entry, uint32_t arg, uint32_t sp, int prio);
 void k_run(void) __attribute__((noreturn));
 static inline uint32_t *cmdbuf(void) { return (uint32_t *)(uintptr_t)(cur->cpu.tls + 0x80); }

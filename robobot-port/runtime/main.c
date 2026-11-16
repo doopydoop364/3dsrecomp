@@ -23,8 +23,31 @@ static void on_fault(int sig, siginfo_t *si, void *uc) {
 }
 static uint32_t rd32le(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
 
+static void usage(void) {
+    fprintf(stderr, "usage: robobot [game folder] [options]\n"
+        "  --scale N            internal resolution 1-4          --layout NAME   stacked, large_top, top_only, side_by_side\n"
+        "  --renderer NAME      vulkan or software               --filter NAME   console, nearest, linear\n"
+        "  --fullscreen         start in fullscreen              --set SECTION.KEY=VALUE   any settings.toml value\n");
+    exit(1);
+}
 int main(int argc, char **argv) {
-    const char *dir = argc > 1 ? argv[1] : "game";
+    const char *dir = "game";
+    static const char *cli[64][2]; int ncli = 0;
+    for (int i = 1; i < argc; i++) {                     /* flags are applied after the settings files are read */
+        const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : 0;
+        if (a[0] != '-') { dir = a; continue; }
+        if (ncli >= 63) break;
+        if (!strcmp(a, "--fullscreen")) { cli[ncli][0] = "video.fullscreen"; cli[ncli++][1] = "true"; }
+        else if (!v) usage();
+        else if (!strcmp(a, "--scale")) { cli[ncli][0] = "video.scale"; cli[ncli++][1] = v; i++; }
+        else if (!strcmp(a, "--layout")) { cli[ncli][0] = "video.layout"; cli[ncli++][1] = v; i++; }
+        else if (!strcmp(a, "--renderer")) { cli[ncli][0] = "video.renderer"; cli[ncli++][1] = v; i++; }
+        else if (!strcmp(a, "--filter")) { cli[ncli][0] = "video.texture_filter"; cli[ncli++][1] = v; i++; }
+        else if (!strcmp(a, "--set") && strchr(v, '=')) {
+            static char kv[64][128]; snprintf(kv[ncli], sizeof kv[ncli], "%s", v);
+            char *e = strchr(kv[ncli], '='); *e = 0; cli[ncli][0] = kv[ncli]; cli[ncli++][1] = e + 1; i++;
+        } else usage();
+    }
     host_game_dir = dir;
     if (getenv("RB_LOG")) log_level = atoi(getenv("RB_LOG"));
     char path[512]; uint8_t exh[0x800];
@@ -81,7 +104,8 @@ int main(int argc, char **argv) {
     signal(SIGTERM, on_stop); signal(SIGINT, on_stop);
     sigaction(SIGSEGV, &sa, 0); sigaction(SIGBUS, &sa, 0); sigaction(SIGFPE, &sa, 0); sigaction(SIGILL, &sa, 0);
 
-    settings_load();
+    settings_load(title);
+    for (int i = 0; i < ncli; i++) settings_set(cli[i][0], cli[i][1]);
     if (!getenv("RB_SCALE")) setenv("RB_SCALE", settings_get("video.scale", "1"), 1);
     if (!getenv("RB_TEX_FILTER")) setenv("RB_TEX_FILTER", settings_get("video.texture_filter", "console"), 1);
     if (!getenv("RB_RENDERER")) setenv("RB_RENDERER", settings_get("video.renderer", "vulkan"), 1);   /* vk.c reads it */

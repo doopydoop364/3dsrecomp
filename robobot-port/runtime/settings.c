@@ -1,5 +1,7 @@
-/* settings.toml reader: a small TOML subset (sections, key = "string" | number | true/false, # comments).
- * Looked up as $RB_SETTINGS, else ./settings.toml. Missing file or keys keep the defaults. */
+/* Settings: a small TOML subset (sections, key = "string" | number | true/false, # comments).
+ * Layers, later ones winning: games/<title id>.toml (per-game defaults shipped with the port), then the user's
+ * settings.toml ($RB_SETTINGS, else ./settings.toml), then command-line flags (settings_set). Missing files
+ * or keys keep the built-in defaults. */
 #include "settings.h"
 #include <ctype.h>
 #include <stdio.h>
@@ -17,11 +19,11 @@ static char *trim(char *s) {
     return s;
 }
 
-void settings_load(void) {
-    const char *path = getenv("RB_SETTINGS");
-    FILE *f = fopen(path ? path : "settings.toml", "r");
-    if (!f) return;
+static int load_file(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
     char line[256], section[64] = "";
+    int n0 = nentries;
     while (fgets(line, sizeof line, f) && nentries < 256) {
         char *p = trim(line);
         if (!*p || *p == '#') continue;
@@ -37,9 +39,22 @@ void settings_load(void) {
         nentries++;
     }
     fclose(f);
-    fprintf(stderr, "settings: %d values from %s\n", nentries, path ? path : "settings.toml");
+    fprintf(stderr, "settings: %d values from %s\n", nentries - n0, path);
+    return 1;
 }
-
+void settings_load(uint64_t title_id) {
+    char path[300];
+    snprintf(path, sizeof path, "games/%016llx.toml", (unsigned long long)title_id);
+    load_file(path);
+    const char *user = getenv("RB_SETTINGS");
+    load_file(user ? user : "settings.toml");
+}
+void settings_set(const char *key, const char *value) {
+    if (nentries == 256) return;
+    snprintf(entries[nentries].key, sizeof entries[nentries].key, "%s", key);
+    snprintf(entries[nentries].value, sizeof entries[nentries].value, "%s", value);
+    nentries++;
+}
 const char *settings_get(const char *key, const char *def) {
     for (int i = nentries - 1; i >= 0; i--) if (!strcmp(entries[i].key, key)) return entries[i].value;
     return def;

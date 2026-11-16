@@ -117,7 +117,8 @@ static Region *region_find(uint32_t addr) {
  * sees a steady 60 fps however long the host takes per frame, and runs are reproducible.
  * Wall-clock pacing keeps it from running faster than real time (RB_FAST=1 turns pacing off). */
 static uint64_t vclock = 1000000000ull, pace_wall0, pace_v0;
-static int pacing = -1;
+static int pacing = -1, fast_forward;
+void k_set_fast_forward(int on) { fast_forward = on; }   /* host hotkey: run as fast as the host can */
 static uint64_t wall_ns(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
@@ -127,7 +128,7 @@ static void advance_to(uint64_t t) {
     if (t <= vclock) return;
     vclock = t;
     if (pacing < 0) { pacing = getenv("RB_FAST") == 0; pace_wall0 = wall_ns(); pace_v0 = vclock; }
-    if (!pacing) return;
+    if (!pacing || fast_forward) return;
     uint64_t target = pace_wall0 + (vclock - pace_v0), w = wall_ns();
     if (target > w + 50000000ull) { pace_wall0 = w - (vclock - pace_v0); return; }   /* paused or debugging: resync */
     if (target > w) { struct timespec ts = { (time_t)((target - w) / 1000000000ull), (long)((target - w) % 1000000000ull) }; nanosleep(&ts, 0); }

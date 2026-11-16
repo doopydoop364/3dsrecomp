@@ -10,3 +10,7 @@ product = "CTR-P-AT3A"
 # found at run time through game/missing_functions.txt
 extra = [0x369e48, 0x369de4, 0x369d48, 0x369ca4, 0x369bc0]
 not_code = [0x2eb3b4, 0x48db68]    # strings that scans mistake for code (found by difftest)
+
+# ---- PC defaults for this game (the user's settings.toml and command-line flags override these) ----
+[video]
+layout = "large_top"   # the bottom screen is mostly menus here: show it as a corner overlay (F1 cycles layouts)
