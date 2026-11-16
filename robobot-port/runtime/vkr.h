@@ -49,3 +49,5 @@ typedef struct {
 } VkrScreen;
 void vkr_present(const VkrScreen scr[2], uint32_t win_w, uint32_t win_h, const uint8_t *overlay, uint32_t ow, uint32_t oh, int overlay_dirty, int fxaa);
 void vkr_counters(uint64_t out[4]);
+extern int vkr_why;   /* set before vkr_sync_range: 1 dma, 2 fill, 3 display transfer, 4 texture copy, 5 vblank, 6 surface, 7 texture */
+void vkr_sync_counts(uint64_t waits[8], uint64_t downloads[8]);

@@ -375,16 +375,20 @@ static void drop_surface(Surf *s) { bury(&s->im); if (s->small.img) bury(&s->sma
 
 /* Write back every dirty surface overlapping [addr, addr+size). will_write: the caller is about to change
  * those bytes, so clean surfaces there must be re-checked before their next use. */
+int vkr_why;                                              /* caller's reason for the next sync (profiler) */
+static uint64_t sync_by[8], dl_by[8];
+void vkr_sync_counts(uint64_t waits[8], uint64_t downloads[8]) { memcpy(waits, sync_by, sizeof sync_by); memcpy(downloads, dl_by, sizeof dl_by); }
 void vkr_sync_range(uint32_t addr, uint32_t size, int will_write) {
+    int why = vkr_why & 7; vkr_why = 0;
     if (!vkr_on) return;
     int any = 0;
     for (int i = 0; i < NSURF; i++) {
         Surf *s = &surf[i];
         if (!s->used || !overlaps(addr, size, s->addr, s->size)) continue;
-        if (s->dirty) { queue_download(s); any = 1; }
+        if (s->dirty) { queue_download(s); any = 1; dl_by[why]++; }
         if (will_write) s->checked = 0;
     }
-    if (any) { submit_wait(); nsyncs++; }
+    if (any) { submit_wait(); nsyncs++; sync_by[why]++; }
     if (will_write) invalidate_textures(addr, size);
 }
 void vkr_sync_all(void) { if (vkr_on) vkr_sync_range(0, 0xffffffffu, 0); }
@@ -396,7 +400,7 @@ static Surf *get_surface(uint32_t addr, uint32_t w, uint32_t h, uint32_t fmt, in
         Surf *s = &surf[i];
         if (s->used && s->addr == addr && s->w == w && s->h == h && s->fmt == fmt && s->depth == depth) { s->last = gen; return s; }
     }
-    vkr_sync_range(addr, size, 0);                                 /* write back what the new surface replaces */
+    vkr_why = 6; vkr_sync_range(addr, size, 0);                    /* write back what the new surface replaces */
     for (int i = 0; i < NSURF; i++) {
         Surf *s = &surf[i];
         if (s->used && overlaps(addr, size, s->addr, s->size)) drop_surface(s);
@@ -466,7 +470,7 @@ static void invalidate_textures(uint32_t addr, uint32_t size) {
         if (texs[i].used && overlaps(addr, size, texs[i].addr, texs[i].size)) { if (texs[i].checked == gen) nstale++; texs[i].checked = 0; }
 }
 static Tex *get_texture(const VkrTex *t, int unit, void (*decode)(int, int, int, uint8_t *)) {
-    for (uint32_t f = 0; f < t->faces; f++) vkr_sync_range(t->face_addr[f], t->size, 0);   /* render-to-texture: the bytes must be current */
+    for (uint32_t f = 0; f < t->faces; f++) { vkr_why = 7; vkr_sync_range(t->face_addr[f], t->size, 0); }   /* render-to-texture: the bytes must be current */
     Tex *e = 0, *lru = &texs[0];
     for (int i = 0; i < NTEX; i++) {
         Tex *x = &texs[i];

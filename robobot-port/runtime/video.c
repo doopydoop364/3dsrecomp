@@ -28,12 +28,12 @@ static SDL_Scancode ff_key; static int ff_toggle, ff_on;
 static int show_fps;
 /* In-game profiler: F10 records the next 300 frames and writes profile_<frame>.txt (where the time per frame went). */
 void gpu_counters(uint64_t out[3]); void pica_counters(uint64_t out[9]);
-static int prof_left; static uint64_t prof_frame0, prof_wall0, prof_p0[9], prof_v0[4], prof_g0[3], prof_paced0; static double prof_emu_max;
+static int prof_left; static uint64_t prof_frame0, prof_wall0, prof_p0[9], prof_v0[4], prof_g0[3], prof_paced0, prof_sw0[8], prof_dl0[8]; static double prof_emu_max;
 extern uint64_t k_paced_ns;
 static uint64_t wall_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
 static void prof_start(uint64_t frame) {
     prof_left = 300; prof_frame0 = frame; prof_wall0 = wall_now(); pica_counters(prof_p0); vkr_counters(prof_v0); gpu_counters(prof_g0);
-    prof_paced0 = k_paced_ns; prof_emu_max = 0;
+    prof_paced0 = k_paced_ns; prof_emu_max = 0; vkr_sync_counts(prof_sw0, prof_dl0);
     fprintf(stderr, "profiler: recording 300 frames\n");
 }
 static void prof_end(uint64_t frame) {
@@ -55,6 +55,12 @@ static void prof_end(uint64_t frame) {
         fprintf(f, "Vulkan waits/write-backs outside lists (display, vblank) %.2f ms; display transfers %.2f ms; textures %.2f ms (%.1f uploads)\n",
                 vk_outside, transfers, D(v[2], prof_v0[2]), (double)(v[3] - prof_v0[3]) / n);
         fprintf(f, "everything else (game code, services, audio, window) %.2f ms\n", other);
+        { uint64_t sw[8], dl[8]; vkr_sync_counts(sw, dl);
+          static const char *why[8] = { "other", "DMA", "memory fill", "display transfer", "texture copy", "vblank", "new surface", "texture read" };
+          fprintf(f, "GPU sync waits per frame by cause (waits / surface write-backs):");
+          for (int i = 0; i < 8; i++) if (sw[i] != prof_sw0[i] || dl[i] != prof_dl0[i])
+              fprintf(f, " %s %.2f/%.2f;", why[i], (double)(sw[i] - prof_sw0[i]) / n, (double)(dl[i] - prof_dl0[i]) / n);
+          fprintf(f, "\n"); }
         fprintf(f, "per frame: %.0f draws, %.0f triangles drawn (%.0f submitted triangles needed no clipping), %.0f vertices shaded\n",
                 (double)(p[4] - prof_p0[4]) / n, (double)(p[5] - prof_p0[5]) / n, (double)(p[8] - prof_p0[8]) / n, (double)(p[6] - prof_p0[6]) / n);
         fclose(f);
