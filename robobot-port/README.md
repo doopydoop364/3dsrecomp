@@ -130,15 +130,18 @@ emulator; enhancements never change game timing (virtual clock); per-game data b
 - Calls to the fplib NaN/Inf dispatcher (0x232cf4), hand-made return addresses and the static-initialiser
   table (0x675158) are special-cased.
 
-## Scripted path to gameplay (RB_FAST=1 RB_HEADLESS=1, about 1 min for 3600 frames)
-`RB_INPUT="1250-1255:A;1330-1335:A;1410-1415:A;1490-1495:A;1570-1575:A;1650-1655:A;1700-1705:START;1760-1765:A;1850-1855:A;2100-2105:A;2300-2305:A"`
-goes title, file select, data-sharing prompt (the first A picks No), Story Mode, then skips the intro movie with START and
-reaches the Area 1 world map and the Patched Plains hub, where Kirby is on screen and the lower screen menu draws correctly.
-Known bug: the intro movie (video decoder in 0x363000..0x372000) draws garbage, so START skips it for now.
-Moving Kirby with `circle=` entries has not been tested enough to reach the first stage; timings after frame 2300 are fragile.
+## Scripted path to gameplay
+`tests/play.sh "<RB_INPUT>" "<RB_SHOT frames>" <exit frame>` restores `build/pristine/` (a save the game made on a clean
+boot: copy `game/save`, `game/extdata`, `game/extdata_shared` there) before every run, because the game writes its save
+and a changed save changes the menu flow. `tests/sheet.py` (venv python) makes a contact sheet of the screenshots.
+This input reaches stage 1 of Patched Plains and walks right with a jump (about 1.5 minutes with RB_FAST):
 
-Stage entry (open): from the world map, holding A for 20 frames at frame 2500 shows the Area 1 hub, a warp star flies to the
-door, the screen wipes out, about 130 assets are read (frame 2689), and then the game goes back to the world map instead of
-starting the stage. Not a file error (no failed IPC call). The DSP now reports source status (buffer ids, positions, sync counts)
-so audio streams advance; that did not change this. Switches for digging: `RB_LOG_READS=1` prints every RomFS read with the frame,
-`RB_LOG_FROM=<frame>` raises the log level to 3 (every SVC and IPC call) from that frame.
+    1250-1255:A;1330-1335:A;1410-1415:A;1490-1495:A;1570-1575:A;1650-1655:A;1700-1705:START;1760-1765:A;
+    1850-1855:A;2300-2305:A;2800-2870:RIGHT;2950-2955:A;3200-3500:circle=154/0;3300-3320:B
+
+Title, file select, data-sharing prompt (No), Story Mode, START skips the intro movie, A on the world map enters Area 1,
+the d-pad walks to door 1, A enters, then the circle pad walks and B jumps.
+Known bug: the intro movie (video decoder in 0x363000..0x372000) draws garbage.
+Open question: a save written by an earlier run made the area entry bounce back to the world map (Kirby's star flew
+off again). That save is kept in `build/savesnap_after/`; it may point to a save-write bug or just a different saved state.
+`RB_LOG_READS=1` prints every RomFS read with its frame; `RB_LOG_FROM=<frame>` raises the log level to 3 from that frame.
