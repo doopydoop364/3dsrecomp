@@ -450,6 +450,7 @@ static Tex *get_texture(const VkrTex *t, int unit, void (*decode)(int, int, int,
 
 /* ---- samplers: the game's filters and mip range (texture_filter = "console"), or forced settings ---- */
 static int filter_mode = -1;                       /* 0 nearest (reference), 1 console, 2 force linear */
+static float max_aniso = 1;                        /* video.anisotropy (1 = off), clamped to the device limit */
 typedef struct { uint8_t mag, min, mip, as, at, minl, maxl; int16_t bias; } SKey;
 static struct { SKey k; VkSampler s; } samplers[256]; static int nsamplers;
 static VkSampler get_sampler(const VkrTex *t, int *hw) {
@@ -469,7 +470,8 @@ static VkSampler get_sampler(const VkrTex *t, int *hw) {
     VkSamplerCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = k.mag ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
         .minFilter = k.min ? VK_FILTER_LINEAR : VK_FILTER_NEAREST, .mipmapMode = k.mip ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST,
         .addressModeU = am[k.as], .addressModeV = am[k.at], .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        .minLod = (float)k.minl, .maxLod = (float)k.maxl, .mipLodBias = (float)k.bias / 256.0f };   /* Azahar leaves the bias at 0 */
+        .minLod = (float)k.minl, .maxLod = (float)k.maxl, .mipLodBias = (float)k.bias / 256.0f,
+        .anisotropyEnable = max_aniso > 1 && k.min, .maxAnisotropy = max_aniso };   /* Azahar leaves the bias at 0 */
     CHK(vkCreateSampler(dev, &ci, 0, &samplers[nsamplers].s));
     samplers[nsamplers].k = k;
     return samplers[nsamplers++].s;
@@ -728,10 +730,11 @@ int vkr_init(void) {
     if (qfam == ~0u) { LOG(1, "vulkan: no graphics queue"); return 0; }
     VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(pdev, VK_FORMAT_D24_UNORM_S8_UINT, &fp);
     d24fmt = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) ? VK_FORMAT_D24_UNORM_S8_UINT : VK_FORMAT_D32_SFLOAT_S8_UINT;
+    VkPhysicalDeviceFeatures feats; vkGetPhysicalDeviceFeatures(pdev, &feats);
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = qfam, .queueCount = 1, .pQueuePriorities = &prio };
     VkPhysicalDeviceVulkan13Features f13 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, .dynamicRendering = VK_TRUE, .shaderDemoteToHelperInvocation = VK_TRUE };
-    VkPhysicalDeviceFeatures2 f2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f13, .features = { .logicOp = VK_TRUE } };
+    VkPhysicalDeviceFeatures2 f2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f13, .features = { .logicOp = VK_TRUE, .samplerAnisotropy = feats.samplerAnisotropy } };
     const char *ext = VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME;
     VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f2, .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci,
         .enabledExtensionCount = 1, .ppEnabledExtensionNames = &ext };
@@ -772,6 +775,10 @@ int vkr_init(void) {
     mkimg_full(&dummy, 1, 1, 1, 1, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
     submit_wait();
     const char *fm = getenv("RB_TEX_FILTER");
+    const char *an = getenv("RB_ANISOTROPY");
+    max_aniso = an ? (float)atof(an) : 1; if (max_aniso < 1) max_aniso = 1;
+    if (!feats.samplerAnisotropy) max_aniso = 1;
+    if (max_aniso > props.limits.maxSamplerAnisotropy) max_aniso = props.limits.maxSamplerAnisotropy;
     filter_mode = !fm || !strcmp(fm, "console") ? 1 : !strcmp(fm, "nearest") ? 0 : !strcmp(fm, "linear") ? 2 : 1;
     const char *sc = getenv("RB_SCALE");
     scale = sc ? (uint32_t)atoi(sc) : 1; if (scale < 1) scale = 1; if (scale > 4) scale = 4;

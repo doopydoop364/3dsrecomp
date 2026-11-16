@@ -107,6 +107,7 @@ int main(int argc, char **argv) {
     settings_load(title);
     for (int i = 0; i < ncli; i++) settings_set(cli[i][0], cli[i][1]);
     if (!getenv("RB_SCALE")) setenv("RB_SCALE", settings_get("video.scale", "1"), 1);
+    if (!getenv("RB_ANISOTROPY")) setenv("RB_ANISOTROPY", settings_get("video.anisotropy", "1"), 1);
     if (!getenv("RB_TEX_FILTER")) setenv("RB_TEX_FILTER", settings_get("video.texture_filter", "console"), 1);
     if (!getenv("RB_RENDERER")) setenv("RB_RENDERER", settings_get("video.renderer", "vulkan"), 1);   /* vk.c reads it */
     video_init("robobot-port");

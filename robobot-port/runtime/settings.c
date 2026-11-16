@@ -66,3 +66,13 @@ int settings_int(const char *key, int def) {
     if (!strcmp(v, "false")) return 0;
     return atoi(v);
 }
+/* Calls fn(name, value) for every key in a section ("hotspots" -> "F7", "160,200"); later layers override earlier. */
+void settings_each(const char *section, void (*fn)(const char *name, const char *value)) {
+    size_t n = strlen(section);
+    for (int i = 0; i < nentries; i++) {
+        if (strncmp(entries[i].key, section, n) || entries[i].key[n] != '.') continue;
+        int newest = 1;
+        for (int j = i + 1; j < nentries; j++) if (!strcmp(entries[j].key, entries[i].key)) newest = 0;
+        if (newest) fn(entries[i].key + n + 1, entries[i].value);
+    }
+}

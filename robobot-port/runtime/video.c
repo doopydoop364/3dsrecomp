@@ -22,7 +22,15 @@ enum { L_STACKED, L_LARGE_TOP, L_TOP_ONLY, L_SIDE, L_COUNT };
 static int layout, swapped;
 static SDL_FRect r_top, r_bot;                         /* where each screen is drawn, in window pixels */
 static SDL_Scancode ff_key; static int ff_toggle, ff_on;
-static int show_fps;                                   /* F9: game frames/s and window frames/s, top left */
+static int show_fps;
+/* Touch hotspots from [hotspots] (per-game file or settings.toml): holding the key touches that point. */
+static struct { SDL_Scancode key; uint16_t x, y; } hot[32]; static int nhot;
+static void add_hotspot(const char *name, const char *value) {
+    int x, y; SDL_Scancode k = SDL_GetScancodeFromName(name);
+    if (nhot == 32 || k == SDL_SCANCODE_UNKNOWN || sscanf(value, "%d , %d", &x, &y) != 2 || x < 0 || x > 319 || y < 0 || y > 239)
+        { fprintf(stderr, "settings: hotspot %s = \"%s\" ignored (want a key name and \"x,y\" on the 320x240 touch screen)\n", name, value); return; }
+    hot[nhot].key = k; hot[nhot].x = (uint16_t)x; hot[nhot].y = (uint16_t)y; nhot++;
+}                                   /* F9: game frames/s and window frames/s, top left */
 uint64_t gpu_swaps(void);   /* fast-forward: hold (or toggle) a key */
 
 /* Controls from settings.toml [controls]; defaults follow the usual 3DS emulator layout. */
@@ -80,6 +88,7 @@ static void poll_host_input(void) {
         float bx = (mx - r_bot.x) * 320.0f / r_bot.w, by = (my - r_bot.y) * 240.0f / r_bot.h;
         if (bx >= 0 && bx < 320 && by >= 0 && by < 240) { s.touch = 1; s.tx = (uint16_t)bx; s.ty = (uint16_t)by; }
     }
+    for (int i = 0; i < nhot; i++) if (k[hot[i].key]) { s.touch = 1; s.tx = hot[i].x; s.ty = hot[i].y; }
     input_set_host(&s);
 }
 
@@ -125,6 +134,7 @@ void video_init(const char *title) {
     ff_key = SDL_GetScancodeFromName(settings_get("controls.fast_forward", "Tab"));
     ff_toggle = !strcmp(settings_get("controls.fast_forward_mode", "hold"), "toggle");
     show_fps = settings_int("video.show_fps", 0);
+    settings_each("hotspots", add_hotspot);
     const char *lname = settings_get("video.layout", "stacked");
     static const char *lnames[L_COUNT] = { "stacked", "large_top", "top_only", "side_by_side" };
     for (int i = 0; i < L_COUNT; i++) if (!strcmp(lname, lnames[i])) layout = i;
