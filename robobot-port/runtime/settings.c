@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 /* Settings: a small TOML subset (sections, key = "string" | number | true/false, # comments).
  * Layers, later ones winning: games/<title id>.toml (per-game defaults shipped with the port), then the user's
  * settings.toml ($RB_SETTINGS, else ./settings.toml), then command-line flags (settings_set). Missing files
@@ -75,4 +76,38 @@ void settings_each(const char *section, void (*fn)(const char *name, const char 
         for (int j = i + 1; j < nentries; j++) if (!strcmp(entries[j].key, entries[i].key)) newest = 0;
         if (newest) fn(entries[i].key + n + 1, entries[i].value);
     }
+}
+/* Writes one value into the user's settings.toml, keeping every other line (and comments): replaces the key in its
+ * section, adds it under the section header, or appends the section. Also applies it to the running settings. */
+int settings_save(const char *key, const char *value) {
+    const char *dot = strchr(key, '.');
+    if (!dot) return -1;
+    char sec[64], name[64], line[300];
+    snprintf(sec, sizeof sec, "%.*s", (int)(dot - key), key); snprintf(name, sizeof name, "%s", dot + 1);
+    int quote = !(!strcmp(value, "true") || !strcmp(value, "false") || (value[0] && strspn(value, "0123456789.-") == strlen(value)));
+    char newl[200]; snprintf(newl, sizeof newl, quote ? "%s = \"%s\"\n" : "%s = %s\n", name, value);
+    const char *path = getenv("RB_SETTINGS"); if (!path) path = "settings.toml";
+    char *out = 0; size_t outn = 0; FILE *m = open_memstream(&out, &outn);
+    FILE *f = fopen(path, "r");
+    char cur[64] = ""; int done = 0, saw_sec = 0;
+    while (f && fgets(line, sizeof line, f)) {
+        char tmp[300]; snprintf(tmp, sizeof tmp, "%s", line); char *p = trim(tmp);
+        if (*p == '[') {
+            if (!done && saw_sec) { fputs(newl, m); done = 1; }         /* key was missing from its section */
+            char *e = strchr(p, ']'); if (e) *e = 0; snprintf(cur, sizeof cur, "%s", trim(p + 1));
+            if (!strcmp(cur, sec)) saw_sec = 1;
+            fputs(line, m); continue;
+        }
+        char *eq = strchr(p, '=');
+        if (!done && eq && *p != '#' && !strcmp(cur, sec)) { *eq = 0; if (!strcmp(trim(p), name)) { fputs(newl, m); done = 1; continue; } }
+        fputs(line, m);
+    }
+    if (f) fclose(f);
+    if (!done) { if (!saw_sec) fprintf(m, "\n[%s]\n", sec); fputs(newl, m); }
+    fclose(m);
+    f = fopen(path, "w");
+    if (!f) { free(out); return -1; }
+    fwrite(out, 1, outn, f); fclose(f); free(out);
+    settings_set(key, value);
+    return 0;
 }

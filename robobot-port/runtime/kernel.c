@@ -132,7 +132,8 @@ static void advance_to(uint64_t t) {
     uint64_t target = pace_wall0 + (vclock - pace_v0), w = wall_ns();
     if (target > w + 50000000ull) { pace_wall0 = w - (vclock - pace_v0); return; }   /* paused or debugging: resync */
     if (target > w) { struct timespec ts = { (time_t)((target - w) / 1000000000ull), (long)((target - w) % 1000000000ull) }; nanosleep(&ts, 0); }
-    else if (w > target + 200000000ull) pace_wall0 = w - (vclock - pace_v0);         /* host too slow: do not try to catch up */
+    else if (w > target + 34000000ull) pace_wall0 = w - (vclock - pace_v0);          /* behind by more than 2 frames: resync instead of
+                                                                                        running fast to catch up (audio would be cut) */
 }
 KObject *k_new(KType t) { KObject *o = calloc(1, sizeof *o); o->type = t; return o; }
 uint32_t h_new(KObject *o) {

@@ -46,6 +46,7 @@ void audio_push(const int16_t *s, int frames) {
         out = buf;
     }
     if (wav) { fwrite(out, 4, (size_t)frames, wav); wav_bytes += 4u * (uint32_t)frames; }
-    if (stream && SDL_GetAudioStreamQueued(stream) < AUDIO_RATE * 4 * 7 / 100)   /* keep at most ~70 ms queued: low latency */
+    if (stream && SDL_GetAudioStreamQueued(stream) < AUDIO_RATE * 4 / 10)   /* keep at most ~100 ms queued: low latency */
         SDL_PutAudioStreamData(stream, out, frames * 4);
 }
+void audio_set_volume(int percent) { volume = (float)percent / 100.0f; }
