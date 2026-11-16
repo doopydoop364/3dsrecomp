@@ -17,7 +17,7 @@ layout(std140, set = 0, binding = 0) uniform Draw {
     uvec4 flags;           // x: flat mode, y: flat colour, z: light count, w: texture units on (bits)
     uvec4 texinfo[3];      // width, height, wrap_s | wrap_t << 8, border colour
 } D;
-layout(std430, set = 0, binding = 1) readonly buffer Lut { uint lut[24 * 256]; };
+layout(std430, set = 0, binding = 1) readonly buffer Lut { uint lut[24 * 256 + 128]; };   // lighting, then fog
 layout(set = 0, binding = 2) uniform sampler2D tex0;
 layout(set = 0, binding = 3) uniform sampler2D tex1;
 layout(set = 0, binding = 4) uniform sampler2D tex2;
@@ -266,5 +266,16 @@ void main() {
     ivec4 o = combine(vcol, t0, t1, t2, prim, sec);
     uint at = reg(0x104u);
     if ((at & 1u) != 0u && !cmp((at >> 4) & 7u, o.a, int((at >> 8) & 255u))) discard;
+    uint fm = reg(0x0e0u);
+    if ((fm & 7u) == 5u) {                                // fog
+        float d = gl_FragDepth;
+        float idx = ((fm >> 16) & 1u) != 0u ? (1.0 - d) * 128.0 : d * 128.0;
+        float fi = clamp(floor(idx), 0.0, 127.0);
+        uint e = lut[24u * 256u + uint(fi)];
+        float f = clamp(float((e >> 13) & 0x7ffu) / 2047.0 + float(int(e << 19) >> 19) / 2047.0 * (idx - fi), 0.0, 1.0);
+        uint fc = reg(0x0e1u);
+        vec3 fcol = vec3(fc & 255u, (fc >> 8) & 255u, (fc >> 16) & 255u);
+        o.rgb = ivec3(f * vec3(o.rgb) + (1.0 - f) * fcol);
+    }
     frag = vec4(o) / 255.0;
 }

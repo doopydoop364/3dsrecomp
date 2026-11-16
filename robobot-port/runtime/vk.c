@@ -460,6 +460,7 @@ static void ensure_render(Surf *c, Surf *d, uint32_t w, uint32_t h) {
     in_render = 1; rt_c = c; rt_d = d;
 }
 
+#define LUT_BYTES ((24 * 256 + 128) * 4)   /* lighting LUTs, then the fog LUT */
 typedef struct {
     uint32_t R[0x300]; float L[48][4]; float gamb[4], misc[4]; uint32_t flags[4]; uint32_t texinfo[3][4];
 } Ubo;
@@ -481,12 +482,12 @@ void vkr_draw(const VkrDraw *d, const void *tris, int ntris, void (*decode)(int,
     if (sd) sd->last = gen;
 
     /* staging space for this draw: vertices, uniforms and (if changed) the lighting LUT, all in one go */
-    VkDeviceSize vbytes = (VkDeviceSize)ntris * 3 * 112, need = vbytes + sizeof(Ubo) + 24 * 256 * 4 + 1024;
+    VkDeviceSize vbytes = (VkDeviceSize)ntris * 3 * 112, need = vbytes + sizeof(Ubo) + LUT_BYTES + 1024;
     if (((ring.used + 255) & ~(VkDeviceSize)255) + need > ring.size) { submit_wait(); begin_cmd(); }
     VkDeviceSize voff = ring_alloc(&ring, vbytes), uoff = ring_alloc(&ring, sizeof(Ubo));
     memcpy(ring.map + voff, tris, vbytes);
     if (d->lut_version != lut_ver || lut_ring_gen != ring_gen) {
-        lut_off = ring_alloc(&ring, 24 * 256 * 4); memcpy(ring.map + lut_off, d->lut, 24 * 256 * 4);
+        lut_off = ring_alloc(&ring, LUT_BYTES); memcpy(ring.map + lut_off, d->lut, 24 * 256 * 4); memcpy(ring.map + lut_off + 24 * 256 * 4, d->fog_lut, 128 * 4);
         lut_ver = d->lut_version; lut_ring_gen = ring_gen;
     }
     Ubo *u = (Ubo *)(ring.map + uoff);
@@ -510,7 +511,7 @@ void vkr_draw(const VkrDraw *d, const void *tris, int ntris, void (*decode)(int,
     if (sc && (sc->fmt == 1 || sc->fmt == 3)) k.wmask &= 7;      /* no alpha in memory: keep the image's alpha at 1 */
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, get_pipeline(&k));
 
-    VkDescriptorBufferInfo ub = { ring.buf, uoff, sizeof(Ubo) }, lb = { ring.buf, lut_off, 24 * 256 * 4 };
+    VkDescriptorBufferInfo ub = { ring.buf, uoff, sizeof(Ubo) }, lb = { ring.buf, lut_off, LUT_BYTES };
     VkDescriptorImageInfo ii[3];
     for (int t = 0; t < 3; t++) ii[t] = (VkDescriptorImageInfo){ sampler, tx[t] ? tx[t]->im.view : dummy.view, VK_IMAGE_LAYOUT_GENERAL };
     VkWriteDescriptorSet w[5] = {

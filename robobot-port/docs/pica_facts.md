@@ -197,7 +197,7 @@ These follow Azahar's software renderer on purpose; revisit them if output diffe
 - The combiner buffer lags one stage behind its update masks.
 - In stage 0, a colour source of "previous" is replaced by the stage's third colour source.
 - Fragment lighting is not implemented at all here. TEMPORARY in runtime/pica.c: lit draws get a
-  white primary fragment colour so lit surfaces are not black. Fog is not implemented.
+  white primary fragment colour so lit surfaces are not black. Fog: implemented since; see below.
 
 ## Learned from the replay test
 - Command-list chains can be long: Robobot's 3D scene jumps (0x23C/0x23D) about 174 times per pass,
@@ -234,3 +234,11 @@ These follow Azahar's software renderer on purpose; revisit them if output diffe
   diffuse += (diffuse*ndl*shadow_p + ambient)*dist*spot; specular += (spec0+spec1)*clamp*dist*spot*shadow_s.
   Fresnel (FR LUT) at the last light sets diffuse and/or specular alpha. Then diffuse.rgb += global ambient.
   Sums start at (0,0,0,1). Output to 8 bits by clamp(0,1)*255, truncated: primary = diffuse, secondary = specular.
+
+## Fog (Azahar software renderer)
+- 0x0E0 bits 0-2 mode (5 fog, 7 gas), bit 16 flip; 0x0E1 fog colour (r bits 0-7, g 8-15, b 16-23);
+  0x0E6 LUT index (advances by 1 per data write, used modulo 128); 0x0E8-0x0EF LUT data.
+- Entry: value bits 13-23 (/2047), signed difference bits 0-12 (/2047).
+- After the alpha test: index = clamped fragment depth * 128 (or (1 - depth) * 128 if flipped); i = clamp(floor, 0, 127);
+  factor = clamp(value + difference * (index - i), 0, 1); rgb = (u8)(factor * rgb + (1 - factor) * fog colour); alpha unchanged.
+- Gas mode is not implemented.

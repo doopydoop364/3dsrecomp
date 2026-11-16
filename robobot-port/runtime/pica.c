@@ -8,7 +8,8 @@
 #include <unistd.h>
 
 static uint32_t reg[0x300];
-static uint32_t lut[24][256]; static uint64_t lut_version;               /* lighting lookup tables, filled through 0x1C8-0x1CF */
+static uint32_t lut[24][256]; static uint64_t lut_version;   /* lighting lookup tables, filled through 0x1C8-0x1CF */
+static uint32_t fog_lut[128];               /* fog factors, filled through 0x0E8-0x0EF at index 0x0E6 */
 static uintptr_t cur_word;
 static uint32_t top_list, cur_list;         /* top-level list of this submission, and the list now executing */                 /* host address of the command word being executed */
 static uintptr_t uni_src[96];              /* where each uniform's last upload came from */
@@ -22,7 +23,7 @@ static uint64_t n_in_tris, n_clipped, n_culled;
 static int dump_draw = -1, dump_left;
 static float ndc_min[2], ndc_max[2];
 static uint64_t vtx_out[7], vtx_total, frag_cov, frag_alpha, frag_depth, frag_stencil;
-static uint64_t n_draws, n_tris, n_pixels, n_lists, n_skipped_gs, reg_writes[0x300];
+static uint64_t n_fog_draws, n_draws, n_tris, n_pixels, n_lists, n_skipped_gs, reg_writes[0x300];
 static int log_draws = -1;
 static int64_t log_from = -1, log_frame = -1;
 static uint64_t frame_draw_base, frame_seen = ~0ull;
@@ -89,6 +90,9 @@ static uint32_t write_reg(uint32_t id, uint32_t value, uint32_t mask) {
         reg[0x1c5] = (cfg & ~0xffu) | ((idx + 1) & 0xff);
         break;
     }
+    case 0x0e8: case 0x0e9: case 0x0ea: case 0x0eb: case 0x0ec: case 0x0ed: case 0x0ee: case 0x0ef:
+        fog_lut[reg[0x0e6] % 128] = v; reg[0x0e6] = (reg[0x0e6] + 1) & 0xffff; lut_version++;
+        break;
     case 0x2c0: if (uni_n) n_partial_uni++; uni_n = 0; if (v >> 31) n_f32_uni++; else n_f24_uni++; break;
     case 0x2c1: case 0x2c2: case 0x2c3: case 0x2c4: case 0x2c5: case 0x2c6: case 0x2c7: case 0x2c8: {
         int f32 = (int)(reg[0x2c0] >> 31);
@@ -687,6 +691,20 @@ static int fragment(const Vtx *v0, const Vtx *v1, const Vtx *v2, float b0, float
     return 1;
 }
 
+/* Fog (behaviour per the Azahar software renderer): after the alpha test, the clamped fragment depth
+ * (flipped when 0x0E0 bit 16 is set) indexes a 128-entry LUT of 11-bit value + signed 13-bit difference,
+ * and the combiner RGB is mixed towards the fog colour (0x0E1). Gas mode (7) is not implemented. */
+static void apply_fog(uint8_t c[4], float depth) {
+    if ((reg[0x0e0] & 7) != 5) return;
+    float idx = (reg[0x0e0] >> 16) & 1 ? (1.0f - depth) * 128.0f : depth * 128.0f;
+    float fi = floorf(idx); fi = fi < 0 ? 0 : fi > 127 ? 127 : fi;
+    uint32_t e = fog_lut[(uint32_t)fi];
+    float f = (float)((e >> 13) & 0x7ff) / 2047.0f + (float)((int32_t)(e << 19) >> 19) / 2047.0f * (idx - fi);
+    f = f < 0 ? 0 : f > 1 ? 1 : f;
+    uint32_t fc = reg[0x0e1];
+    for (int i = 0; i < 3; i++) c[i] = (uint8_t)(f * (float)c[i] + (1.0f - f) * (float)((fc >> (8 * i)) & 0xff));
+}
+
 /* ---- rasteriser ---- */
 static int64_t area(const Vtx *a, const Vtx *b, int32_t cx, int32_t cy) {
     return (int64_t)(b->x - a->x) * (cy - a->y) - (int64_t)(b->y - a->y) * (cx - a->x);
@@ -782,6 +800,7 @@ static void raster_band(const Fb *fb, const Tri *t, int32_t row_lo, int32_t row_
             if (stencil && allow_d) dp[3] = (uint8_t)((stencil_op((sa >> 8) & 7, sold, sref) & swm) | (sold & ~swm));
             if (!allow_c || !fb->color) continue;
             if (early_ds) fragment(v0, v1, v2, (float)w0, (float)w1, (float)w2, col);
+            if (!flat_mode) apply_fog(col, depth);
             uint8_t *cp = fb->color + fb_off(fb, px, py, fb->cbpp), dst[4], res[4];
             color_read(cp, fb->cfmt, dst);
             uint32_t bl = reg[0x101], kk = reg[0x103];
@@ -960,7 +979,7 @@ static void vk_submit(const Fb *fb, uint32_t caddr, uint32_t daddr) {
     d.caddr = fb->color ? (uint32_t)(uintptr_t)fb->color : 0; d.daddr = fb->depth ? (uint32_t)(uintptr_t)fb->depth : 0;
     (void)caddr; (void)daddr;
     d.width = fb->width; d.height = fb->hreg + 1; d.cfmt = fb->cfmt; d.dfmt = fb->dfmt;
-    d.regs = reg; d.lut = &lut[0][0]; d.lut_version = lut_version;
+    d.regs = reg; d.lut = &lut[0][0]; d.fog_lut = fog_lut; d.lut_version = lut_version;
     for (uint32_t k = 0; k < 8; k++) {
         const LightP *l = &lights[k];
         float (*L)[4] = &d.lights[k * 6];
@@ -1005,7 +1024,8 @@ static void draw(int indexed) {
     for (int u = 0; u < 3; u++) setup_tex(&tu[u], u);
     setup_tev();
     setup_lighting();
-    if ((reg[0x0e0] & 7) == 5 && !warned_tex[7]) { warned_tex[7] = 1; LOG(1, "pica: fog is not implemented"); }
+    if ((reg[0x0e0] & 7) == 5) { if (!n_fog_draws++) LOG(1, "pica: first fog draw at frame %llu", (unsigned long long)gpu_frame()); }
+    if ((reg[0x0e0] & 7) == 7 && !warned_tex[7]) { warned_tex[7] = 1; LOG(1, "pica: gas rendering (fog mode 7) is not implemented"); }
     uint32_t h = draw_in_frame * 2654435761u;                       /* colour depends only on the position in the frame */
     flat[0] = (uint8_t)(64 + (h >> 24) % 192); flat[1] = (uint8_t)(64 + (h >> 16) % 192); flat[2] = (uint8_t)(64 + (h >> 8) % 192); flat[3] = 255;
 
@@ -1128,6 +1148,7 @@ void pica_report(void) {
     fprintf(stderr, "\npica: other pipeline registers written:");
     for (int r = 0x229; r < 0x260; r++) if (reg_writes[r]) fprintf(stderr, " %03x:%llu", r, (unsigned long long)reg_writes[r]);
     fputc('\n', stderr);
+    fprintf(stderr, "pica: %llu draws with fog\n", (unsigned long long)n_fog_draws);
     fprintf(stderr, "pica: %llu command lists, %llu draws, %llu triangles rasterised, %llu pixels written, %llu geometry-shader draws skipped\n",
             (unsigned long long)n_lists, (unsigned long long)n_draws, (unsigned long long)n_tris, (unsigned long long)n_pixels, (unsigned long long)n_skipped_gs);
 }
