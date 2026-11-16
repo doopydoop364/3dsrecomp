@@ -400,9 +400,9 @@ static void hid(KObject *s, uint32_t *cmd) {
 
 void gsp_service(KObject *s, uint32_t *cmd);                      /* gpu.c */
 
-/* ---- dsp::DSP: audio processor, high-level and silent.
+/* ---- dsp::DSP: audio processor, high level (voices are decoded and mixed in dsp.c).
  * Implements the audio pipe handshake and the per-frame interrupt, so the game's sound library
- * starts up and keeps running. No samples are mixed and source status is not updated yet.
+ * starts up and keeps running; dsp.c decodes and mixes the voices and reports their status.
  * Protocol facts (pipe message, structure address list, frame period) follow the Azahar HLE. ---- */
 #define DSP_MEM 0x1ff00000u
 static KObject *dsp_sem_ev, *dsp_pipe_ev[4];
@@ -411,91 +411,11 @@ static uint32_t dsp_pipe_len;
 static int dsp_on, dsp_ticking;
 static uint64_t dsp_frames;
 
-/* Source status emulation: the sound library waits on buffer ids and sync counts that the DSP reports,
- * so every audio frame we apply the configuration (dirty flags, buffer queue) and advance each source by
- * rate * 160 samples without decoding anything. Layout and queue behaviour follow the Azahar HLE
- * (source.cpp, shared_memory.h); offsets are inside one 0x8000-byte region, two regions at +0x50000/+0x70000. */
-#define DSP_SRC 24
-#define DSP_STATUS_OFF 0xd00u
-#define DSP_CONFIG_OFF 0x3d24u
-typedef struct { uint32_t len; uint16_t id; uint8_t loop, from_queue, played; uint32_t start; } DspBuf;
-typedef struct {
-    int enabled, buffer_update, have_cur, cur_loop, cur_from_queue; uint16_t sync, cur_id, last_id;
-    uint32_t cur_len, pos; float rate, acc; DspBuf q[8]; int nq;
-} DspSrc;
-static DspSrc dsp_src[DSP_SRC];
-static uint32_t dspw(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return (v << 16) | (v >> 16); }
-static uint16_t dsp16(const uint8_t *p) { uint16_t v; memcpy(&v, p, 2); return v; }
-static void dsp_push(DspSrc *s, DspBuf b) { if (s->nq < 8) s->q[s->nq++] = b; }
-static int dsp_dequeue(DspSrc *s) {
-    if (!s->nq) return 0;
-    int best = 0;
-    for (int i = 1; i < s->nq; i++) if (s->q[i].id < s->q[best].id) best = i;
-    DspBuf b = s->q[best]; s->q[best] = s->q[--s->nq];
-    s->have_cur = 1; s->cur_len = b.len; s->cur_id = b.id; s->cur_loop = b.loop; s->last_id = 0;
-    s->pos = b.played ? 0 : b.start;
-    s->buffer_update = b.from_queue && !b.played;
-    if (b.loop) { b.played = 1; dsp_push(s, b); }
-    return 1;
-}
-static void dsp_source_config(DspSrc *s, uint8_t *c) {
-    uint32_t dirty; memcpy(&dirty, c, 4);
-    if (!dirty) return;
-    if (dirty & (1u << 29)) { memset(s, 0, sizeof *s); }                      /* reset_flag */
-    if (dirty & (1u << 4)) s->nq = 0;                                         /* partial_reset_flag */
-    if (dirty & (1u << 16)) s->enabled = c[160] != 0;
-    if (dirty & (1u << 28)) s->sync = dsp16(c + 162);
-    if (dirty & (1u << 18)) { memcpy(&s->rate, c + 52, 4); if (!(s->rate > 0)) s->rate = 1.0f; }
-    uint32_t start = (dirty & (1u << 21)) ? dspw(c + 164) : 0;
-    if (dirty & (1u << 30)) {                                                 /* embedded buffer */
-        int32_t len = (int32_t)dspw(c + 176);
-        if (len >= 0) dsp_push(s, (DspBuf){ (uint32_t)len, dsp16(c + 190), (uint8_t)((dsp16(c + 188) >> 1) & 1), 0, 0, start });
-    }
-    if (dirty & (1u << 19)) {                                                 /* buffer queue */
-        uint16_t bd = dsp16(c + 74);
-        for (int i = 0; i < 4; i++) if (bd & (1 << i)) {
-            const uint8_t *b = c + 76 + 20 * i; int32_t len = (int32_t)dspw(b + 4);
-            if (len >= 0) dsp_push(s, (DspBuf){ (uint32_t)len, dsp16(b + 16), b[15] != 0, 1, 0, 0 });
-        }
-        memset(c + 74, 0, 2);
-    }
-    memset(c, 0, 4);
-}
-static void dsp_source_tick(DspSrc *s) {
-    if (!s->enabled) return;
-    if (!s->have_cur) {
-        if (dsp_dequeue(s)) return;
-        s->enabled = 0; s->buffer_update = 1; s->last_id = s->cur_id; s->cur_id = 0; return;
-    }
-    s->acc += (s->rate > 0 ? s->rate : 1.0f) * 160.0f;
-    uint32_t n = (uint32_t)s->acc; s->acc -= (float)n;
-    while (n) {
-        uint32_t room = s->cur_len > s->pos ? s->cur_len - s->pos : 0;
-        if (n < room) { s->pos += n; break; }
-        s->pos += room; n -= room;
-        s->have_cur = 0;
-        if (!dsp_dequeue(s)) break;
-    }
-}
-static void dsp_sources_frame(void) {
-    static const uint32_t regions[2] = { 0x50000u, 0x70000u };
-    for (int i = 0; i < DSP_SRC; i++) {
-        for (int r = 0; r < 2; r++) dsp_source_config(&dsp_src[i], (uint8_t *)(uintptr_t)(DSP_MEM + regions[r] + DSP_CONFIG_OFF + 192u * i));
-        dsp_source_tick(&dsp_src[i]);
-        DspSrc *s = &dsp_src[i];
-        uint8_t st[12]; memset(st, 0, sizeof st);
-        st[0] = (uint8_t)s->enabled; st[1] = (uint8_t)s->buffer_update;
-        memcpy(st + 2, &s->sync, 2);
-        uint32_t pos = (s->pos << 16) | (s->pos >> 16); memcpy(st + 4, &pos, 4);
-        memcpy(st + 8, &s->cur_id, 2); memcpy(st + 10, &s->last_id, 2);
-        s->buffer_update = 0;
-        for (int r = 0; r < 2; r++) memcpy((void *)(uintptr_t)(DSP_MEM + regions[r] + DSP_STATUS_OFF + 12u * i), st, 12);
-    }
-}
+void dsp_audio_frame(void);                                       /* dsp.c */
 static void dsp_tick(void) {                                           /* one 160-sample audio frame */
     if (!dsp_on) return;
     dsp_frames++;
-    dsp_sources_frame();
+    dsp_audio_frame();
     if (dsp_pipe_ev[2]) k_signal(dsp_pipe_ev[2]);
 }
 static void dsp_send_struct_addresses(void) {
@@ -531,7 +451,7 @@ static void dsp_cmd(KObject *s, uint32_t *cmd) {
                 if (buf[0] == 0) memset((void *)(uintptr_t)DSP_MEM, 0, 0x80000);
                 dsp_on = 1; dsp_send_struct_addresses();
                 if (!dsp_ticking) { dsp_ticking = 1; k_add_periodic(dsp_tick, 4888700); }   /* 1310720 ARM11 cycles */
-                LOG(1, "dsp: audio pipe %s, silent audio running", buf[0] ? "wakeup" : "initialize");
+                LOG(1, "dsp: audio pipe %s, audio running", buf[0] ? "wakeup" : "initialize");
                 break;
             case 1: dsp_on = 0; LOG(1, "dsp: audio pipe shutdown"); break;
             default: LOG(1, "dsp: audio pipe state %u is not implemented (sleep)", buf[0]);

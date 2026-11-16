@@ -28,6 +28,12 @@ Defaults: WASD circle pad, arrow keys d-pad, I/J/K/L = X/Y/B/A (a diamond like t
 Hotkeys: F1 next layout (stacked, large top, top only, side by side), F2 swap screens, F3 show the bottom
 screen in top-only mode, F11 fullscreen, F12 screenshot, Escape quit. `RB_INPUT` scripts input for tests.
 
+## Audio
+`runtime/dsp.c` decodes the game's 24 DSP voices (PCM8, PCM16, DSP-ADPCM), resamples them linearly, mixes the three
+intermediate mixes down to stereo and reports voice status back to the game; `runtime/audio.c` plays it through SDL at
+32728 Hz. settings.toml: `[audio] enabled = true`, `volume = 100`. `RB_WAV=out.wav` records the output (also headless).
+Not done yet: per-voice filters, gain ramps, delay/reverb aux effects, polyphase interpolation.
+
 ## Rule for new code
 No address or size of a specific game in `.c`, `.h` or `.py` files. Layout comes from the ExHeader
 (`layout.h` for C code), idioms from detectors, and anything a person decides goes in `games/<id>.toml`.

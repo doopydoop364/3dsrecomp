@@ -1,5 +1,6 @@
 /* Loader: builds the guest address space and starts the game's main thread. */
 #define _GNU_SOURCE
+#include "audio.h"
 #include "host.h"
 #include "input.h"
 #include "settings.h"
@@ -83,6 +84,7 @@ int main(int argc, char **argv) {
     settings_load();
     video_init("robobot-port");
     input_init();
+    audio_init();
     services_init(dir);
     k_thread_create(text, 0, STACK_TOP, exh[0x20f] ? exh[0x20f] : 0x30);
     k_run();

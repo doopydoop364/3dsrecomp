@@ -31,3 +31,7 @@ fullscreen = false
 
 # Hotkeys: F1 next layout, F2 swap screens, F3 show bottom screen (top_only), F11 fullscreen,
 # F12 screenshot, Escape quit. Gamepads use the Nintendo button positions automatically.
+
+[audio]
+enabled = true
+volume = 100   # percent
