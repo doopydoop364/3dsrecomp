@@ -3,6 +3,7 @@
  * logged as STUB so they are easy to find. */
 #define _GNU_SOURCE
 #include "host.h"
+#include "input.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -337,10 +338,19 @@ static void hid_section(uint8_t *b, uint32_t *idx, uint32_t count, uint32_t entr
 }
 static void hid_pad_tick(void) {
     uint8_t *m = hid_mem->mem;
-    uint32_t pad[4] = { pad_state, 0, 0, 0 };                          /* state, newly pressed, newly released, circle pad */
+    InputState in; input_get(&in);
+    uint32_t state = in.buttons & 0x0fffffffu;
+    int r2 = in.cx * in.cx + in.cy * in.cy;
+    if (r2 > 40 * 40) {                                                /* circle pad direction bits, 30/60 degree sectors */
+        int ax = in.cx < 0 ? -in.cx : in.cx, ay = in.cy < 0 ? -in.cy : in.cy;
+        if (ax * 1000 > ay * 577) state |= in.cx > 0 ? CIRCLE_RIGHT : CIRCLE_LEFT;     /* tan(30) */
+        if (ay * 1000 > ax * 577) state |= in.cy > 0 ? CIRCLE_UP : CIRCLE_DOWN;
+    }
+    uint32_t pad[4] = { state, state & ~pad_state, pad_state & ~state, (uint32_t)(uint16_t)in.cx | (uint32_t)(uint16_t)in.cy << 16 };
+    pad_state = state;
     memcpy(m + 0x1c, &pad_state, 4);
     hid_section(m, &pad_idx, 8, 0x28, 16, pad);
-    uint32_t touch[2] = { 0, 0 };
+    uint32_t touch[2] = { in.touch ? (uint32_t)in.tx | (uint32_t)in.ty << 16 : 0, in.touch ? 1u : 0 };
     uint32_t tidx = pad_idx;
     memcpy(m + 0xa8 + 0x10, &tidx, 4);
     memcpy(m + 0xc8 + tidx * 8, touch, 8);

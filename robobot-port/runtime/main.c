@@ -1,6 +1,7 @@
 /* Loader: builds the guest address space and starts the game's main thread. */
 #define _GNU_SOURCE
 #include "host.h"
+#include "input.h"
 #include <signal.h>
 #include <sys/mman.h>
 #include <time.h>
@@ -79,6 +80,7 @@ int main(int argc, char **argv) {
     sigaction(SIGSEGV, &sa, 0); sigaction(SIGBUS, &sa, 0); sigaction(SIGFPE, &sa, 0); sigaction(SIGILL, &sa, 0);
 
     video_init("robobot-port");
+    input_init();
     services_init(dir);
     k_thread_create(text, 0, STACK_TOP, exh[0x20f] ? exh[0x20f] : 0x30);
     k_run();
