@@ -139,3 +139,27 @@ No interpreter and no JIT: the fallback is still ahead-of-time compiled code.
 - Running without the user's own dump, or shipping translated game code or assets.
 - Windows or macOS builds (Linux only for now).
 - Cycle-accurate timing. The runtime aims for "the game behaves the same", not hardware accuracy.
+
+## 10. Plan (2026-11-16, after Robobot became playable)
+
+State: Robobot plays through at 60 fps (Vulkan renderer, audio, video, amiibo, menu). Section 2's hard-coded values are
+gone: the layout comes from the ExHeader, special cases from idiom detectors. What still needs a person: decrypting
+and extracting the CIA (separate scripts, seed by hand) and the REA-made function list (`recomp/functions_rea.txt`).
+
+Each phase ends with a check that runs without a person. Robobot stays the regression game throughout: every phase
+must still build it and pass `tests/regress.sh` plus the scripted stage-1 run.
+
+| # | Phase | Delivers | Done when |
+|---|---|---|---|
+| 0 | Housekeeping | root `.gitignore` for dumps (done), commits under the GitHub no-reply address, push the branch | the work is backed up on GitHub |
+| 1 | Repository shape | `robobot-port/` becomes the generic layout of section 7 (`3dsrecomp/` with extract, analyze, recomp, runtime, tests, games); Robobot is just `games/0004000000183600.toml` | Robobot builds from the new tree, regress passes |
+| 2 | Extract stage | `3dsrecomp extract game.cia`: decrypt (reusing `decrypt_cia.py`), seeds from `seeddb.bin`, ExeFS, code decompression, RomFS, icon/title, into `work/<title-id>/` | Robobot's CIA extracts to byte-identical files |
+| 3 | Analysis without REA | recursive descent, data and constant pointer scans, idiom detectors, jump tables; writes `games/<id>.toml` | Robobot builds and plays with `functions_rea.txt` deleted; a coverage report shows what each pass found |
+| 4 | `3dsrecomp build/run` | one command, cached stages, the missing-function loop of section 5 (log, add, rebuild one file, restart) | `3dsrecomp run Robobot.cia` from a clean checkout reaches gameplay |
+| 5 | Second game | an ARM-only title from the user's library; fix the services, PICA features and idioms it needs | it reaches its first gameplay; audit counters show which PICA features it uses |
+| 6 | Thumb | Thumb decoding and translation in the recompiler, interworking (`bx`, `blx`), difftest coverage | a Thumb-using game builds; difftest passes on its Thumb functions |
+| 7 | CRO modules | recompile each `.cro` from RomFS at build time; `ldr:ro` service links them by their import/export tables | a CRO game (e.g. Pokemon, Smash) loads its modules |
+| 8 | Polish | game library / launcher, per-game defaults vs global settings, shared system font, packaging | a new user can go from a dump to playing with one command |
+
+Not in this plan: missing PICA features are added as games need them (the audit counters say which), the same for
+services. Save states and widescreen stay on the PC-experience list.
