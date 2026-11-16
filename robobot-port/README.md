@@ -136,3 +136,9 @@ goes title, file select, data-sharing prompt (the first A picks No), Story Mode,
 reaches the Area 1 world map and the Patched Plains hub, where Kirby is on screen and the lower screen menu draws correctly.
 Known bug: the intro movie (video decoder in 0x363000..0x372000) draws garbage, so START skips it for now.
 Moving Kirby with `circle=` entries has not been tested enough to reach the first stage; timings after frame 2300 are fragile.
+
+Stage entry (open): from the world map, holding A for 20 frames at frame 2500 shows the Area 1 hub, a warp star flies to the
+door, the screen wipes out, about 130 assets are read (frame 2689), and then the game goes back to the world map instead of
+starting the stage. Not a file error (no failed IPC call). The DSP now reports source status (buffer ids, positions, sync counts)
+so audio streams advance; that did not change this. Switches for digging: `RB_LOG_READS=1` prints every RomFS read with the frame,
+`RB_LOG_FROM=<frame>` raises the log level to 3 (every SVC and IPC call) from that frame.

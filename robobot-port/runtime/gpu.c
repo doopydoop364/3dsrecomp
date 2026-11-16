@@ -154,6 +154,8 @@ static void vblank(void) {
         if (shown[s].left && mem_valid(shown[s].left, shown[s].stride * (s ? 320u : 400u))) fb[s] = (const uint8_t *)(uintptr_t)shown[s].left;
     video_frame(frames, fb[0], shown[0].stride, shown[0].format, fb[1], shown[1].stride, shown[1].format);
     input_frame(frames);
+    { static long long from = -2; if (from == -2) { const char *e = getenv("RB_LOG_FROM"); from = e ? atoll(e) : -1; }
+      if (from >= 0 && (long long)frames == from) log_level = getenv("RB_LOG") ? atoi(getenv("RB_LOG")) : 3; }
     if (frames % 300 == 0) {
         static uint64_t last_swaps, last_lists, last_draws, last_wall, last_gpu, last_tr;
         uint64_t wall = host_ns();
