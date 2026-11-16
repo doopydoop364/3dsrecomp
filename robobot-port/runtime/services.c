@@ -412,6 +412,7 @@ static int dsp_on, dsp_ticking;
 static uint64_t dsp_frames;
 
 void dsp_audio_frame(void);                                       /* dsp.c */
+void y2r_service(KObject *s, uint32_t *cmd);                     /* y2r.c */
 static void dsp_tick(void) {                                           /* one 160-sample audio frame */
     if (!dsp_on) return;
     dsp_frames++;
@@ -492,7 +493,7 @@ static void errf(KObject *s, uint32_t *cmd) {
 
 static const struct { const char *name; ServiceFn fn; } table[] = {
     { "srv:", srv }, { "err:f", errf },
-    { "dsp::DSP", dsp },
+    { "dsp::DSP", dsp }, { "y2r:u", y2r_service },
     { "hid:USER", hid }, { "hid:SPVR", hid }, { "gsp::Gpu", gsp_service },
     { "fs:USER", fs_user }, { "ndm:u", quiet_ok },
     { "APT:A", apt }, { "APT:U", apt }, { "APT:S", apt },
