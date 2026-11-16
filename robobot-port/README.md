@@ -66,6 +66,10 @@ library itself must be installed, since the binary links it; loading it at runti
 - Not done yet: Vulkan presentation (the window still uses SDL's renderer, so full-resolution frames are read back),
   CPU/GPU overlap, GPU-side display transfers.
 
+## Motion controls
+A gamepad with motion sensors (DualSense, DualShock 4, Switch Pro, Joy-Con) drives the 3DS gyroscope and accelerometer
+(axes and scale as in Azahar; `input.motion = false` turns it off). Robobot does not use motion in the parts tested.
+
 ## Touch hotspots
 `[hotspots]` in settings.toml or the per-game file: `F7 = "160,200"` touches that bottom-screen point while the key is
 held (320x240, origin top left). Robobot needs none yet (its touch buttons have keys); add the amiibo icon once it appears.

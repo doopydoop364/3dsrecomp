@@ -103,7 +103,7 @@ int settings_save(const char *key, const char *value) {
         fputs(line, m);
     }
     if (f) fclose(f);
-    if (!done) { if (!saw_sec) fprintf(m, "\n[%s]\n", sec); fputs(newl, m); }
+    if (!done) { if (!saw_sec) { fflush(m); fprintf(m, outn ? "\n[%s]\n" : "[%s]\n", sec); } fputs(newl, m); }
     fclose(m);
     f = fopen(path, "w");
     if (!f) { free(out); return -1; }

@@ -23,3 +23,7 @@ void input_set_host(const InputState *s);
 /* Current state as the game should see it (host input, or the RB_INPUT script for this frame). */
 void input_get(InputState *out);
 void input_frame(uint64_t frame);
+/* Motion from a gamepad's sensors, in 3DS axes (axis mapping per Azahar): acceleration in g, rotation in deg/s.
+ * valid = 0 means no sensor: the console then rests flat and still. */
+void input_set_motion(const float accel_g[3], const float gyro_dps[3], int valid);
+int input_get_motion(float accel_g[3], float gyro_dps[3]);

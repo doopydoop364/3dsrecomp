@@ -421,18 +421,22 @@ static void hid_pad_tick(void) {
     if (tidx == 0) { uint64_t t = hid_ticks(); memcpy(m + 0xa8 + 8, m + 0xa8, 8); memcpy(m + 0xa8, &t, 8); }
     k_signal(hid_ev[0]); k_signal(hid_ev[1]);
 }
-static void hid_accel_tick(void) {
+static int16_t s16c(float v) { return (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v); }
+static void hid_accel_tick(void) {                                     /* gamepad motion if any: 512 per g (Azahar) */
     uint8_t *m = hid_mem->mem;
-    int16_t raw[3] = { (int16_t)(-2 * accel_rest[0]), (int16_t)(-2 * accel_rest[2]), (int16_t)(2 * accel_rest[1]) };
+    float a[3], g[3]; int16_t e[3] = { accel_rest[0], accel_rest[1], accel_rest[2] };
+    if (input_get_motion(a, g)) for (int i = 0; i < 3; i++) e[i] = s16c(a[i] * 512.0f);
+    int16_t raw[3] = { (int16_t)(-2 * e[0]), (int16_t)(-2 * e[2]), (int16_t)(2 * e[1]) };
     memcpy(m + 0x120, raw, 6);
-    hid_section(m + 0x108, &acc_idx, 8, 0x20, 6, accel_rest);
+    hid_section(m + 0x108, &acc_idx, 8, 0x20, 6, e);
     k_signal(hid_ev[2]);
 }
-static void hid_gyro_tick(void) {
+static void hid_gyro_tick(void) {                                      /* 14.375 per degree/s (Azahar) */
     uint8_t *m = hid_mem->mem;
-    int16_t zero[3] = { 0, 0, 0 };
-    memcpy(m + 0x170, zero, 6);
-    hid_section(m + 0x158, &gyro_idx, 32, 0x20, 6, zero);
+    float a[3], g[3]; int16_t e[3] = { 0, 0, 0 };
+    if (input_get_motion(a, g)) for (int i = 0; i < 3; i++) e[i] = s16c(g[i] * 14.375f);
+    memcpy(m + 0x170, e, 6);
+    hid_section(m + 0x158, &gyro_idx, 32, 0x20, 6, e);
     k_signal(hid_ev[3]);
 }
 static void hid(KObject *s, uint32_t *cmd) {

@@ -82,6 +82,13 @@ static void poll_host_input(void) {
             { SDL_GAMEPAD_BUTTON_DPAD_DOWN, BTN_DOWN }, { SDL_GAMEPAD_BUTTON_DPAD_LEFT, BTN_LEFT }, { SDL_GAMEPAD_BUTTON_DPAD_RIGHT, BTN_RIGHT } };
         for (unsigned i = 0; i < sizeof pb / sizeof *pb; i++) if (SDL_GetGamepadButton(pad, pb[i].b)) s.buttons |= pb[i].bit;
         int ax = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTX), ay = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTY);
+        float ac[3], gy[3];
+        if (SDL_GamepadSensorEnabled(pad, SDL_SENSOR_ACCEL) && SDL_GetGamepadSensorData(pad, SDL_SENSOR_ACCEL, ac, 3) &&
+            SDL_GetGamepadSensorData(pad, SDL_SENSOR_GYRO, gy, 3)) {          /* SDL: m/s^2 and rad/s; axes as Azahar maps them */
+            float a[3] = { ac[0] / SDL_STANDARD_GRAVITY, -ac[1] / SDL_STANDARD_GRAVITY, ac[2] / SDL_STANDARD_GRAVITY };
+            float g[3] = { -gy[0] * 57.29578f, gy[1] * 57.29578f, -gy[2] * 57.29578f };
+            input_set_motion(a, g, 1);
+        }
         if (ax * ax + ay * ay > 6000 * 6000) { cx = ax * 154 / 32767; cy = -ay * 154 / 32767; }
     }
     s.cx = (int16_t)(cx < -154 ? -154 : cx > 154 ? 154 : cx); s.cy = (int16_t)(cy < -154 ? -154 : cy > 154 ? 154 : cy);
@@ -424,7 +431,14 @@ void video_frame(uint64_t frame, const uint8_t *top, uint32_t top_stride, uint32
             if (e.key.key == SDLK_F12) { char p[64]; snprintf(p, sizeof p, "screenshot_%06llu.png", (unsigned long long)frame);
                                          if (hi) write_png_buf(p, frame_hi, OUT_W * hi_scale, OUT_H * hi_scale); else write_png(p); }
         }
-        if (e.type == SDL_EVENT_GAMEPAD_ADDED && !pad) { pad = SDL_OpenGamepad(e.gdevice.which); if (pad) fprintf(stderr, "gamepad: %s\n", SDL_GetGamepadName(pad)); }
+        if (e.type == SDL_EVENT_GAMEPAD_ADDED && !pad) {
+            pad = SDL_OpenGamepad(e.gdevice.which);
+            if (pad) {
+                int motion = settings_int("input.motion", 1) && SDL_GamepadHasSensor(pad, SDL_SENSOR_ACCEL) && SDL_GamepadHasSensor(pad, SDL_SENSOR_GYRO);
+                if (motion) { SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_ACCEL, true); SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_GYRO, true); }
+                fprintf(stderr, "gamepad: %s%s\n", SDL_GetGamepadName(pad), motion ? " (motion sensors used for the 3DS gyroscope)" : "");
+            }
+        }
         if (e.type == SDL_EVENT_GAMEPAD_REMOVED && pad && e.gdevice.which == SDL_GetGamepadID(pad)) { SDL_CloseGamepad(pad); pad = 0; }
     }
     int w, h;

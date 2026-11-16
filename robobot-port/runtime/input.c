@@ -65,3 +65,14 @@ void input_frame(uint64_t frame) {
 }
 
 void input_get(InputState *out) { *out = current; }
+
+static float m_accel[3], m_gyro[3]; static int m_valid;
+void input_set_motion(const float a[3], const float g[3], int valid) {
+    m_valid = valid;
+    if (valid) for (int i = 0; i < 3; i++) { m_accel[i] = a[i]; m_gyro[i] = g[i]; }
+}
+int input_get_motion(float a[3], float g[3]) {
+    if (!m_valid || getenv("RB_INPUT")) return 0;                /* scripted runs stay deterministic */
+    for (int i = 0; i < 3; i++) { a[i] = m_accel[i]; g[i] = m_gyro[i]; }
+    return 1;
+}

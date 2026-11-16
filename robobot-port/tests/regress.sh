@@ -2,6 +2,7 @@
 # Renderer regression check: Azahar replays must stay pixel-identical and screenshots at fixed
 # frames must match build/baseline/ byte for byte. Usage: tests/regress.sh [--no-shots]
 cd "$(dirname "$0")/.." || exit 1
+export RB_SETTINGS=/dev/null   # tests ignore the user's settings.toml (per-game defaults still apply)
 fail=0
 run() { # state vram linear list size ref expected
     out=$(RB_RENDERER=software ./build/gpu_replay "$1" "$2" "$3" "$4" "$5" /dev/null "$6" 2>/dev/null | grep -o '[0-9]*$')
