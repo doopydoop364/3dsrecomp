@@ -13,7 +13,7 @@ layout(std140, set = 0, binding = 0) uniform Draw {
     uvec4 R[192];          // PICA registers 0x000-0x2ff
     vec4 L[48];            // 8 lights x 6: pos+dbias, spot+dscale, spec0+id, spec1+cfg, diff, amb
     vec4 gamb;             // global ambient
-    vec4 misc;             // zscale, zoff, -, -
+    vec4 misc;             // zscale, zoff, render scale, -
     uvec4 flags;           // x: flat mode, y: flat colour, z: light count, w: texture units on (bits)
     uvec4 texinfo[3];      // width, height, wrap_s | wrap_t << 8 | filtered << 16, border colour
 } D;
@@ -256,7 +256,7 @@ void main() {
     if (((reg(0x083u) >> 28) & 7u) == 3u) uv0 /= i4.x * iw0;
     vec2 uv1 = i3.zw * iw0, uv2 = (((reg(0x080u) >> 13) & 1u) != 0u ? i3.zw : i5.zw) * iw0;
     vec2 dx0 = dFdx(uv0), dy0 = dFdy(uv0), dx1 = dFdx(uv1), dy1 = dFdy(uv1), dx2 = dFdx(uv2), dy2 = dFdy(uv2);
-    ivec2 px = ivec2(gl_FragCoord.xy);
+    ivec2 px = ivec2(gl_FragCoord.xy / D.misc.z);           // native pixel (surfaces may be rendered scaled)
     uint sc = reg(0x065u) & 3u;
     if (sc == 1u) {
         uint s1 = reg(0x066u), s2 = reg(0x067u);

@@ -5,6 +5,7 @@
 #include <zlib.h>
 #include "input.h"
 #include "settings.h"
+#include "vkr.h"
 
 #define OUT_W 400
 #define OUT_H 480
@@ -136,21 +137,59 @@ static void png_chunk(FILE *f, const char *type, const uint8_t *data, uint32_t n
     uint8_t crc[4] = { (uint8_t)(c >> 24), (uint8_t)(c >> 16), (uint8_t)(c >> 8), (uint8_t)c };
     fwrite(len, 1, 4, f); fwrite(type, 1, 4, f); if (n) fwrite(data, 1, n, f); fwrite(crc, 1, 4, f);
 }
-static void write_png(const char *path) {
-    static uint8_t raw[OUT_H * (OUT_W * 3 + 1)], z[sizeof raw + 4096];
-    for (int y = 0; y < OUT_H; y++) {
-        uint8_t *row = raw + (size_t)y * (OUT_W * 3 + 1); *row++ = 0;
-        for (int x = 0; x < OUT_W; x++) memcpy(row + x * 3, frame_rgba + ((size_t)y * OUT_W + x) * 4, 3);
+static void write_png_buf(const char *path, const uint8_t *rgba, uint32_t W, uint32_t H) {
+    size_t rawn = (size_t)H * (W * 3 + 1);
+    uint8_t *raw = malloc(rawn); uLongf zn = compressBound(rawn); uint8_t *z = malloc(zn);
+    if (!raw || !z) { free(raw); free(z); return; }
+    for (uint32_t y = 0; y < H; y++) {
+        uint8_t *row = raw + (size_t)y * (W * 3 + 1); *row++ = 0;
+        for (uint32_t x = 0; x < W; x++) memcpy(row + x * 3, rgba + ((size_t)y * W + x) * 4, 3);
     }
-    uLongf zn = sizeof z;
     FILE *f = fopen(path, "wb");
-    if (!f || compress(z, &zn, raw, sizeof raw) != Z_OK) { fprintf(stderr, "cannot write %s\n", path); if (f) fclose(f); return; }
-    uint8_t hdr[13] = { 0, 0, OUT_W >> 8, OUT_W & 255, 0, 0, OUT_H >> 8, OUT_H & 255, 8, 2, 0, 0, 0 };
+    if (!f || compress(z, &zn, raw, rawn) != Z_OK) { fprintf(stderr, "cannot write %s\n", path); if (f) fclose(f); free(raw); free(z); return; }
+    uint8_t hdr[13] = { (uint8_t)(W >> 24), (uint8_t)(W >> 16), (uint8_t)(W >> 8), (uint8_t)W, (uint8_t)(H >> 24), (uint8_t)(H >> 16), (uint8_t)(H >> 8), (uint8_t)H, 8, 2, 0, 0, 0 };
     fwrite("\x89PNG\r\n\x1a\n", 1, 8, f);
     png_chunk(f, "IHDR", hdr, 13); png_chunk(f, "IDAT", z, (uint32_t)zn); png_chunk(f, "IEND", 0, 0);
-    fclose(f);
+    fclose(f); free(raw); free(z);
     fprintf(stderr, "screenshot written to %s\n", path);
 }
+static void write_png(const char *path) { write_png_buf(path, frame_rgba, OUT_W, OUT_H); }
+
+/* Full-resolution frame (render scale S): native frame upscaled, then screens whose image came straight from a
+ * scaled Vulkan surface are redrawn from it. Same orientation rules as blit_screen. */
+static uint8_t *frame_hi; static uint32_t hi_scale;
+static int compose_hires(const uint8_t *top, const uint8_t *bot) {
+    const uint8_t *img[2] = { 0, 0 }; uint32_t iw, ih, S = 1, s2; int flip[2] = { 0, 0 };
+    if (top) img[0] = vkr_hires((uint32_t)(uintptr_t)top, 400, &iw, &ih, &flip[0], &S);
+    if (bot) img[1] = vkr_hires((uint32_t)(uintptr_t)bot, 320, &iw, &ih, &flip[1], &s2);
+    if (img[1] && !img[0]) S = s2;
+    if (!img[0] && !img[1]) return 0;
+    if (S != hi_scale) { free(frame_hi); frame_hi = malloc((size_t)OUT_W * OUT_H * S * S * 4); hi_scale = S; }
+    if (!frame_hi) return 0;
+    uint32_t W = OUT_W * S;
+    memset(frame_hi, 0, (size_t)W * OUT_H * S * 4);
+    for (int sc = 0; sc < 2; sc++) {
+        uint32_t ws = (sc ? 320 : 400) * S, ox = (sc ? 40 : 0) * S, oy = (sc ? 240 : 0) * S, pw = 240 * S;
+        if (!img[sc]) {                                    /* no scaled source: enlarge the native screen */
+            for (uint32_t y = 0; y < pw; y++) {
+                uint32_t *o = (uint32_t *)(frame_hi + ((size_t)(oy + y) * W + ox) * 4);
+                const uint32_t *in = (const uint32_t *)(frame_rgba + ((size_t)((oy + y) / S) * OUT_W + ox / S) * 4);
+                for (uint32_t x = 0; x < ws; x++) o[x] = in[x / S];
+            }
+            continue;
+        }
+        for (uint32_t X = 0; X < ws; X++) {
+            uint32_t row = flip[sc] ? ws - 1 - X : X, py = ws - 1 - row;
+            for (uint32_t Y = 0; Y < pw; Y++) {
+                const uint8_t *p = img[sc] + ((size_t)py * pw + (pw - 1 - Y)) * 4;
+                uint8_t *o = frame_hi + ((size_t)(oy + Y) * W + ox + X) * 4;
+                o[0] = p[0]; o[1] = p[1]; o[2] = p[2]; o[3] = 255;
+            }
+        }
+    }
+    return 1;
+}
+static SDL_Texture *tex_top_hi, *tex_bot_hi; static uint32_t tex_hi_scale;
 
 /* Called once per vertical blank with the framebuffers the game currently displays (0 = none yet). */
 void video_frame(uint64_t frame, const uint8_t *top, uint32_t top_stride, uint32_t top_fmt,
@@ -161,7 +200,11 @@ void video_frame(uint64_t frame, const uint8_t *top, uint32_t top_stride, uint32
     memset(frame_rgba, 0, sizeof frame_rgba);
     if (top) blit_screen(top, top_stride, top_fmt, 400, 0, 0);
     if (bot) blit_screen(bot, bot_stride, bot_fmt, 320, 40, 240);
-    if (want_shot) { char p[64]; snprintf(p, sizeof p, "build/shot_%06llu.png", (unsigned long long)frame); write_png(p); }
+    int hi = compose_hires(top, bot);
+    if (want_shot) {
+        char p[64]; snprintf(p, sizeof p, "build/shot_%06llu.png", (unsigned long long)frame); write_png(p);
+        if (hi) { snprintf(p, sizeof p, "build/shot_%06llu_hi.png", (unsigned long long)frame); write_png_buf(p, frame_hi, OUT_W * hi_scale, OUT_H * hi_scale); }
+    }
     if (headless) return;
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
@@ -170,7 +213,8 @@ void video_frame(uint64_t frame, const uint8_t *top, uint32_t top_stride, uint32
             if (e.key.key == SDLK_F1) layout = (layout + 1) % L_COUNT;
             if (e.key.key == SDLK_F2) swapped = !swapped;
             if (e.key.key == SDLK_F11) SDL_SetWindowFullscreen(win, !(SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN));
-            if (e.key.key == SDLK_F12) { char p[64]; snprintf(p, sizeof p, "screenshot_%06llu.png", (unsigned long long)frame); write_png(p); }
+            if (e.key.key == SDLK_F12) { char p[64]; snprintf(p, sizeof p, "screenshot_%06llu.png", (unsigned long long)frame);
+                                         if (hi) write_png_buf(p, frame_hi, OUT_W * hi_scale, OUT_H * hi_scale); else write_png(p); }
         }
         if (e.type == SDL_EVENT_GAMEPAD_ADDED && !pad) { pad = SDL_OpenGamepad(e.gdevice.which); if (pad) fprintf(stderr, "gamepad: %s\n", SDL_GetGamepadName(pad)); }
         if (e.type == SDL_EVENT_GAMEPAD_REMOVED && pad && e.gdevice.which == SDL_GetGamepadID(pad)) { SDL_CloseGamepad(pad); pad = 0; }
@@ -179,11 +223,27 @@ void video_frame(uint64_t frame, const uint8_t *top, uint32_t top_stride, uint32
     SDL_GetWindowSizeInPixels(win, &w, &h);
     place_screens(w, h, SDL_GetKeyboardState(0)[SDL_SCANCODE_F3]);
     poll_host_input();
-    SDL_UpdateTexture(tex_top, 0, frame_rgba, OUT_W * 4);
-    SDL_UpdateTexture(tex_bot, 0, frame_rgba + ((size_t)240 * OUT_W + 40) * 4, OUT_W * 4);
+    SDL_Texture *tt = tex_top, *tb = tex_bot;
+    if (hi) {
+        uint32_t S = hi_scale;
+        if (tex_hi_scale != S) {
+            if (tex_top_hi) SDL_DestroyTexture(tex_top_hi);
+            if (tex_bot_hi) SDL_DestroyTexture(tex_bot_hi);
+            tex_top_hi = SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, (int)(400 * S), (int)(240 * S));
+            tex_bot_hi = SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, (int)(320 * S), (int)(240 * S));
+            SDL_SetTextureScaleMode(tex_top_hi, SDL_SCALEMODE_LINEAR); SDL_SetTextureScaleMode(tex_bot_hi, SDL_SCALEMODE_LINEAR);
+            tex_hi_scale = S;
+        }
+        SDL_UpdateTexture(tex_top_hi, 0, frame_hi, (int)(OUT_W * S * 4));
+        SDL_UpdateTexture(tex_bot_hi, 0, frame_hi + ((size_t)240 * S * OUT_W * S + 40 * S) * 4, (int)(OUT_W * S * 4));
+        tt = tex_top_hi; tb = tex_bot_hi;
+    } else {
+        SDL_UpdateTexture(tex_top, 0, frame_rgba, OUT_W * 4);
+        SDL_UpdateTexture(tex_bot, 0, frame_rgba + ((size_t)240 * OUT_W + 40) * 4, OUT_W * 4);
+    }
     SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
     SDL_RenderClear(ren);
-    if (r_top.w > 0) SDL_RenderTexture(ren, tex_top, 0, &r_top);
-    if (r_bot.w > 0) SDL_RenderTexture(ren, tex_bot, 0, &r_bot);
+    if (r_top.w > 0) SDL_RenderTexture(ren, tt, 0, &r_top);
+    if (r_bot.w > 0) SDL_RenderTexture(ren, tb, 0, &r_bot);
     SDL_RenderPresent(ren);
 }

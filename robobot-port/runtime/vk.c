@@ -41,7 +41,7 @@ static VkSampler sampler;
 static PFN_vkCmdPushDescriptorSetKHR push_desc;
 static VkFormat d24fmt;
 static int recording, in_render;
-static uint64_t t_wait, t_fin, t_tex, t_surf;
+static uint64_t t_wait, t_fin, t_tex;
 static uint64_t vns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
 static uint64_t ring_gen, gen = 1, nsubmits, nsyncs, ndownloads, nuploads, ntexuploads;
 
@@ -89,7 +89,7 @@ static void end_render(void) {
 }
 
 typedef struct Surf Surf;
-typedef struct { Surf *s; VkDeviceSize off, soff; } Pending;
+typedef struct { Surf *s; VkDeviceSize off, soff, hoff; int native, hi; } Pending;
 static Pending pend[64]; static int npend;
 static void finish_downloads(void);
 static uint64_t nstale;
@@ -192,24 +192,45 @@ static uint64_t hash_mem(const uint8_t *p, size_t n) {
 }
 
 /* ---- surfaces ---- */
-struct Surf { int used, depth; uint32_t addr, size, w, h, fmt; Img im; int dirty; uint64_t hash, checked, last; };
+/* Surfaces are rendered at `scale` times the native size (video.scale); guest memory always holds the native
+ * image: write-backs average each scale x scale block (colour) or take its centre sample (depth, stencil). */
+static uint32_t scale = 1;
+struct Surf { int used, depth; uint32_t addr, size, w, h, fmt; Img im; int dirty; uint64_t hash, checked, last;
+              int display; uint8_t *hires; uint64_t hires_gen; Img small; };   /* small: native-size copy target (scale > 1) */   /* display: last download kept at full resolution */
 #define NSURF 64
 static Surf surf[NSURF];
 static int overlaps(uint32_t a, uint32_t an, uint32_t b, uint32_t bn) { return a < b + bn && b < a + an; }
 
 static void queue_download(Surf *s) {
     begin_cmd(); end_render();
-    VkDeviceSize n = (VkDeviceSize)s->w * s->h;
+    uint32_t W = s->w * scale, H = s->h * scale;
+    VkDeviceSize n = (VkDeviceSize)W * H;
     Pending *p = &pend[npend];
+    memset(p, 0, sizeof *p);
     if (s->depth && s->fmt != 0) {
         p->off = ring_alloc(&rbk, n * 4); p->soff = ring_alloc(&rbk, n);
-        VkBufferImageCopy c[2] = { { .bufferOffset = p->off, .imageSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 }, .imageExtent = { s->w, s->h, 1 } },
-                                   { .bufferOffset = p->soff, .imageSubresource = { VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1 }, .imageExtent = { s->w, s->h, 1 } } };
+        VkBufferImageCopy c[2] = { { .bufferOffset = p->off, .imageSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 }, .imageExtent = { W, H, 1 } },
+                                   { .bufferOffset = p->soff, .imageSubresource = { VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1 }, .imageExtent = { W, H, 1 } } };
         vkCmdCopyImageToBuffer(cmd, s->im.img, VK_IMAGE_LAYOUT_GENERAL, rbk.buf, 2, c);
+    } else if (!s->depth && scale > 1) {                          /* colour: average on the GPU, read back native size */
+        if (!s->small.img) mkimg(&s->small, s->w, s->h, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+        VkImageBlit b = { .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .srcOffsets = { { 0, 0, 0 }, { (int32_t)W, (int32_t)H, 1 } },
+                          .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .dstOffsets = { { 0, 0, 0 }, { (int32_t)s->w, (int32_t)s->h, 1 } } };
+        vkCmdBlitImage(cmd, s->im.img, VK_IMAGE_LAYOUT_GENERAL, s->small.img, VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_LINEAR);
+        barrier();
+        p->off = ring_alloc(&rbk, (VkDeviceSize)s->w * s->h * 4); p->native = 1;
+        VkBufferImageCopy c = { .bufferOffset = p->off, .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { s->w, s->h, 1 } };
+        vkCmdCopyImageToBuffer(cmd, s->small.img, VK_IMAGE_LAYOUT_GENERAL, rbk.buf, 1, &c);
+        if (s->display) {                                          /* the window shows this one at full resolution */
+            p->hoff = ring_alloc(&rbk, n * 4); p->hi = 1;
+            VkBufferImageCopy h = { .bufferOffset = p->hoff, .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { W, H, 1 } };
+            vkCmdCopyImageToBuffer(cmd, s->im.img, VK_IMAGE_LAYOUT_GENERAL, rbk.buf, 1, &h);
+        }
     } else {
         p->off = ring_alloc(&rbk, n * 4);
-        VkBufferImageCopy c = { .bufferOffset = p->off, .imageSubresource = { s->depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { s->w, s->h, 1 } };
+        VkBufferImageCopy c = { .bufferOffset = p->off, .imageSubresource = { s->depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { W, H, 1 } };
         vkCmdCopyImageToBuffer(cmd, s->im.img, VK_IMAGE_LAYOUT_GENERAL, rbk.buf, 1, &c);
+        p->hoff = p->off; p->hi = 1;
     }
     p->s = s; npend++;
     ndownloads++;
@@ -220,10 +241,22 @@ static void finish_downloads(void) {
         Surf *s = pend[i].s;
         uint8_t *mem = (uint8_t *)(uintptr_t)s->addr;
         const uint8_t *src = rbk.map + pend[i].off, *st = rbk.map + pend[i].soff;
+        uint32_t S = pend[i].native ? 1 : scale, W = s->w * S, c = S / 2;
         for (uint32_t y = 0; y < s->h; y++)
             for (uint32_t x = 0; x < s->w; x++) {
-                uint32_t k = y * s->w + x;
-                if (!s->depth) { color_write(mem + tile_off(s->w, s->h, x, y, cbpp[s->fmt]), s->fmt, src + 4 * k); continue; }
+                if (!s->depth) {
+                    uint8_t px[4];
+                    if (S == 1) memcpy(px, src + 4 * (y * W + x), 4);
+                    else {
+                        uint32_t acc[4] = { 0, 0, 0, 0 };
+                        for (uint32_t j = 0; j < S; j++)
+                            for (uint32_t i2 = 0; i2 < S; i2++) { const uint8_t *q = src + 4 * ((y * S + j) * W + x * S + i2); for (int k = 0; k < 4; k++) acc[k] += q[k]; }
+                        for (int k = 0; k < 4; k++) px[k] = (uint8_t)((acc[k] + S * S / 2) / (S * S));
+                    }
+                    color_write(mem + tile_off(s->w, s->h, x, y, cbpp[s->fmt]), s->fmt, px);
+                    continue;
+                }
+                uint32_t k = (y * S + c) * W + x * S + c;
                 uint8_t *p = mem + tile_off(s->w, s->h, x, y, dbpp[s->fmt]);
                 if (s->fmt == 0) { memcpy(p, src + 2 * k, 2); continue; }
                 uint32_t d;
@@ -232,6 +265,11 @@ static void finish_downloads(void) {
                 p[0] = (uint8_t)d; p[1] = (uint8_t)(d >> 8); p[2] = (uint8_t)(d >> 16);
                 if (s->fmt == 3) p[3] = st[k];
             }
+        if (s->display && !s->depth && pend[i].hi) {               /* keep the full-resolution image for the window */
+            size_t n = (size_t)s->w * scale * s->h * scale * 4;
+            if (!s->hires) s->hires = malloc(n);
+            if (s->hires) { memcpy(s->hires, rbk.map + pend[i].hoff, n); s->hires_gen++; }
+        }
         s->dirty = 0; s->hash = hash_mem(mem, s->size); s->checked = gen;
         invalidate_textures(s->addr, s->size);
     }
@@ -240,33 +278,44 @@ static void finish_downloads(void) {
 static void upload_surface(Surf *s) {
     begin_cmd(); end_render();
     const uint8_t *mem = (const uint8_t *)(uintptr_t)s->addr;
-    VkDeviceSize n = (VkDeviceSize)s->w * s->h;
+    uint32_t S = scale, W = s->w * S, H = s->h * S;
+    VkDeviceSize n = (VkDeviceSize)W * H;
     VkDeviceSize off = ring_alloc(&ring, n * 4), soff = 0;
     uint8_t *dst = ring.map + off, *sdst = 0;
     if (s->depth && s->fmt != 0) { soff = ring_alloc(&ring, n); sdst = ring.map + soff; }
     for (uint32_t y = 0; y < s->h; y++)
         for (uint32_t x = 0; x < s->w; x++) {
-            uint32_t k = y * s->w + x;
-            if (!s->depth) { color_read(mem + tile_off(s->w, s->h, x, y, cbpp[s->fmt]), s->fmt, dst + 4 * k); continue; }
-            const uint8_t *p = mem + tile_off(s->w, s->h, x, y, dbpp[s->fmt]);
-            if (s->fmt == 0) { memcpy(dst + 2 * k, p, 2); continue; }
-            uint32_t d = (uint32_t)(p[0] | p[1] << 8 | p[2] << 16);
-            if (d24fmt == VK_FORMAT_D24_UNORM_S8_UINT) memcpy(dst + 4 * k, &d, 4);
-            else { float f = (float)d / 16777215.0f; memcpy(dst + 4 * k, &f, 4); }
-            sdst[k] = s->fmt == 3 ? p[3] : 0;
+            uint8_t v[4] = { 0, 0, 0, 0 }, sv = 0; int vb = 4;
+            if (!s->depth) color_read(mem + tile_off(s->w, s->h, x, y, cbpp[s->fmt]), s->fmt, v);
+            else {
+                const uint8_t *p = mem + tile_off(s->w, s->h, x, y, dbpp[s->fmt]);
+                if (s->fmt == 0) { memcpy(v, p, 2); vb = 2; }
+                else {
+                    uint32_t d = (uint32_t)(p[0] | p[1] << 8 | p[2] << 16);
+                    if (d24fmt == VK_FORMAT_D24_UNORM_S8_UINT) memcpy(v, &d, 4);
+                    else { float f = (float)d / 16777215.0f; memcpy(v, &f, 4); }
+                    sv = s->fmt == 3 ? p[3] : 0;
+                }
+            }
+            for (uint32_t j = 0; j < S; j++)
+                for (uint32_t i2 = 0; i2 < S; i2++) {
+                    uint32_t k = (y * S + j) * W + x * S + i2;
+                    memcpy(dst + (size_t)vb * k, v, (size_t)vb);
+                    if (sdst) sdst[k] = sv;
+                }
         }
     if (s->depth && s->fmt != 0) {
-        VkBufferImageCopy c[2] = { { .bufferOffset = off, .imageSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 }, .imageExtent = { s->w, s->h, 1 } },
-                                   { .bufferOffset = soff, .imageSubresource = { VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1 }, .imageExtent = { s->w, s->h, 1 } } };
+        VkBufferImageCopy c[2] = { { .bufferOffset = off, .imageSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 }, .imageExtent = { W, H, 1 } },
+                                   { .bufferOffset = soff, .imageSubresource = { VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1 }, .imageExtent = { W, H, 1 } } };
         vkCmdCopyBufferToImage(cmd, ring.buf, s->im.img, VK_IMAGE_LAYOUT_GENERAL, 2, c);
     } else {
-        VkBufferImageCopy c = { .bufferOffset = off, .imageSubresource = { s->depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { s->w, s->h, 1 } };
+        VkBufferImageCopy c = { .bufferOffset = off, .imageSubresource = { s->depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { W, H, 1 } };
         vkCmdCopyBufferToImage(cmd, ring.buf, s->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
     }
     barrier();
     nuploads++;
 }
-static void drop_surface(Surf *s) { bury(&s->im); s->used = 0; }
+static void drop_surface(Surf *s) { bury(&s->im); if (s->small.img) bury(&s->small); free(s->hires); s->hires = 0; s->used = 0; }
 
 /* Guest bytes in [addr, addr+size) changed behind the texture cache: re-check overlapping textures on next use. */
 
@@ -311,8 +360,8 @@ static Surf *get_surface(uint32_t addr, uint32_t w, uint32_t h, uint32_t fmt, in
     if (depth) {
         VkFormat f = fmt == 0 ? VK_FORMAT_D16_UNORM : d24fmt;
         VkImageAspectFlags a = fmt == 0 ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
-        mkimg(&s->im, w, h, f, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, a);
-    } else mkimg(&s->im, w, h, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+        mkimg(&s->im, w * scale, h * scale, f, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, a);
+    } else mkimg(&s->im, w * scale, h * scale, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                  VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
     s->hash = ~0ull;                                               /* forces the first upload */
     LOG(2, "vulkan: new %s surface %08x %ux%u format %u", depth ? "depth" : "colour", addr, w, h, fmt);
@@ -484,7 +533,7 @@ static void ensure_render(Surf *c, Surf *d, uint32_t w, uint32_t h) {
         .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE };
     VkRenderingAttachmentInfo da = { .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = d ? d->im.view : 0,
         .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE };
-    VkRenderingInfo ri = { .sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = { { 0, 0 }, { w, h } }, .layerCount = 1,
+    VkRenderingInfo ri = { .sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = { { 0, 0 }, { w * scale, h * scale } }, .layerCount = 1,
         .colorAttachmentCount = c ? 1 : 0, .pColorAttachments = &ca, .pDepthAttachment = d ? &da : 0,
         .pStencilAttachment = (d && d->fmt != 0) ? &da : 0 };
     vkCmdBeginRendering(cmd, &ri);
@@ -523,7 +572,7 @@ void vkr_draw(const VkrDraw *d, const void *tris, int ntris, void (*decode)(int,
     }
     Ubo *u = (Ubo *)(ring.map + uoff);
     memcpy(u->R, R, sizeof u->R); memcpy(u->L, d->lights, sizeof u->L); memcpy(u->gamb, d->gamb, sizeof u->gamb);
-    u->misc[0] = d->zscale; u->misc[1] = d->zoff; u->misc[2] = u->misc[3] = 0;
+    u->misc[0] = d->zscale; u->misc[1] = d->zoff; u->misc[2] = (float)scale; u->misc[3] = 0;
     u->flags[0] = d->flat; u->flags[1] = d->flat_color; u->flags[2] = d->nlights;
     u->flags[3] = (tx[0] ? 1 : 0) | (tx[1] ? 2 : 0) | (tx[2] ? 4 : 0);
     VkSampler smp[3] = { sampler, sampler, sampler };
@@ -560,7 +609,7 @@ void vkr_draw(const VkrDraw *d, const void *tris, int ntris, void (*decode)(int,
     float size[2] = { (float)d->width, (float)d->height };
     vkCmdPushConstants(cmd, playout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof size, size);
 
-    VkViewport vp = { 0, 0, (float)d->width, (float)d->height, 0, 1 };
+    VkViewport vp = { 0, 0, (float)(d->width * scale), (float)(d->height * scale), 0, 1 };
     vkCmdSetViewport(cmd, 0, 1, &vp);
     VkRect2D sr = { { 0, 0 }, { d->width, d->height } };
     if ((R[0x065] & 3) == 3) {
@@ -570,6 +619,7 @@ void vkr_draw(const VkrDraw *d, const void *tris, int ntris, void (*decode)(int,
         sr.offset.x = x1; sr.offset.y = y1;
         sr.extent.width = x2 > x1 ? (uint32_t)(x2 - x1) : 0; sr.extent.height = y2 > y1 ? (uint32_t)(y2 - y1) : 0;
     }
+    sr.offset.x *= (int32_t)scale; sr.offset.y *= (int32_t)scale; sr.extent.width *= scale; sr.extent.height *= scale;
     vkCmdSetScissor(cmd, 0, 1, &sr);
     uint32_t kk = R[0x103];
     float bc[4] = { (kk & 255) / 255.0f, ((kk >> 8) & 255) / 255.0f, ((kk >> 16) & 255) / 255.0f, (kk >> 24) / 255.0f };
@@ -605,6 +655,40 @@ void vkr_frame(void) {
             (unsigned long long)nsubmits, (unsigned long long)nsyncs, (unsigned long long)ndownloads, (unsigned long long)nuploads,
             (unsigned long long)ntexuploads, npipes);
     }
+}
+
+/* ---- full-resolution display: a display transfer that copies a rendered surface to a screen buffer is
+ * remembered, so the window can show that surface at the render scale instead of the native copy ---- */
+typedef struct { uint32_t in, out, w, h; int flip; } Link;
+static Link links[8]; static int nlinks;
+void vkr_display_link(uint32_t in, uint32_t out, uint32_t iw, uint32_t ih, uint32_t flags) {
+    if (!vkr_on || scale == 1) return;
+    int plain = !((flags >> 24) & 3) && !((flags >> 1) & 1);          /* no downscaling, tiled input */
+    for (int i = 0; i < nlinks; i++) if (links[i].out == out) { links[i] = links[--nlinks]; break; }
+    if (!plain) return;
+    for (int i = 0; i < NSURF; i++) {
+        Surf *s = &surf[i];
+        if (s->used && !s->depth && s->addr == in && s->w == iw && s->h == ih) {
+            s->display = 1;
+            if (nlinks == 8) links[0] = links[--nlinks];
+            links[nlinks++] = (Link){ in, out, iw, ih, (int)(flags & 1) };
+            return;
+        }
+    }
+}
+const uint8_t *vkr_hires(uint32_t out, uint32_t want_h, uint32_t *w, uint32_t *h, int *flip, uint32_t *sc) {
+    if (!vkr_on || scale == 1) return 0;
+    for (int i = 0; i < nlinks; i++) {
+        if (links[i].out != out || links[i].h != want_h || links[i].w != 240) continue;
+        for (int k = 0; k < NSURF; k++) {
+            Surf *s = &surf[k];
+            if (s->used && !s->depth && s->addr == links[i].in && s->w == links[i].w && s->h == links[i].h && s->hires && !s->dirty) {
+                *w = s->w * scale; *h = s->h * scale; *flip = links[i].flip; *sc = scale;
+                return s->hires;
+            }
+        }
+    }
+    return 0;
 }
 
 /* ---- setup ---- */
@@ -684,7 +768,9 @@ int vkr_init(void) {
     submit_wait();
     const char *fm = getenv("RB_TEX_FILTER");
     filter_mode = !fm || !strcmp(fm, "console") ? 1 : !strcmp(fm, "nearest") ? 0 : !strcmp(fm, "linear") ? 2 : 1;
+    const char *sc = getenv("RB_SCALE");
+    scale = sc ? (uint32_t)atoi(sc) : 1; if (scale < 1) scale = 1; if (scale > 4) scale = 4;
     vkr_on = 1;
-    LOG(1, "vulkan: rendering on %s (depth-stencil format %s)", props.deviceName, d24fmt == VK_FORMAT_D24_UNORM_S8_UINT ? "D24S8" : "D32FS8");
+    LOG(1, "vulkan: rendering on %s at %ux (depth-stencil format %s)", props.deviceName, scale, d24fmt == VK_FORMAT_D24_UNORM_S8_UINT ? "D24S8" : "D32FS8");
     return 1;
 }

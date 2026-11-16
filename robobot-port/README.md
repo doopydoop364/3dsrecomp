@@ -43,7 +43,12 @@ library itself must be installed, since the binary links it; loading it at runti
 - Texture sampling (`video.texture_filter`): `console` (default) uses the game's own bilinear filters and mip levels
   like a real 3DS (and Azahar's GPU renderers; LOD bias ignored, as there); `nearest` matches the software reference
   (used by the regression check); `linear` smooths everything. The software renderer always samples nearest.
-- Not done yet: Vulkan presentation (the window still uses SDL's renderer), resolution scaling, GPU-side display transfers.
+- Resolution scaling (`video.scale` = 1-4, Vulkan only): render targets are drawn at that multiple; guest memory still gets
+  the native image (averaged on the GPU), and a screen that came straight from a rendered surface through a plain display
+  transfer is shown from the full-resolution surface. F12 / `RB_SHOT` also write `_hi` screenshots. Uncapped headless speed
+  in stage 1: about 71 fps at 2x, about 50 fps at 4x (GPU-bound; the CPU waits for the GPU at every sync point).
+- Not done yet: Vulkan presentation (the window still uses SDL's renderer, so full-resolution frames are read back),
+  CPU/GPU overlap, GPU-side display transfers.
 
 ## Audio
 `runtime/dsp.c` decodes the game's 24 DSP voices (PCM8, PCM16, DSP-ADPCM), resamples them linearly, mixes the three

@@ -30,3 +30,6 @@ void vkr_sync_all(void);
 void vkr_new_gen(void);                  /* guest memory may have changed (between GPU submissions) */
 void vkr_frame(void);                    /* end of a video frame */
 extern int vkr_on;
+void vkr_display_link(uint32_t in, uint32_t out, uint32_t iw, uint32_t ih, uint32_t flags);   /* before a display transfer */
+/* Full-resolution RGBA (rows = PICA y, 240*scale wide) of the surface last transferred to `out`, or 0. */
+const uint8_t *vkr_hires(uint32_t out, uint32_t want_h, uint32_t *w, uint32_t *h, int *flip, uint32_t *scale);
