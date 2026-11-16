@@ -148,6 +148,6 @@ This input reaches stage 1 of Patched Plains and walks right with a jump (about 
 Title, file select, data-sharing prompt (No), Story Mode, START skips the intro movie, A on the world map enters Area 1,
 the d-pad walks to door 1, A enters, then the circle pad walks and B jumps.
 The intro movie plays: decoded frames go through the YUV-to-RGB converter service (`runtime/y2r.c`).
-Open question: a save written by an earlier run made the area entry bounce back to the world map (Kirby's star flew
-off again). That save is kept in `build/savesnap_after/`; it may point to a save-write bug or just a different saved state.
+A save with File 1 already started skips the intro movie, so this input script (timed for a fresh save) then
+presses A on the hub's World Map exit; that is the "bounce back", not a save bug. Always use `tests/play.sh`.
 `RB_LOG_READS=1` prints every RomFS read with its frame; `RB_LOG_FROM=<frame>` raises the log level to 3 from that frame.

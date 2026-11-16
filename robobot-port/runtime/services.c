@@ -6,7 +6,10 @@
 #include "input.h"
 #include "pica.h"
 #include <errno.h>
+#include <ctype.h>
+#include <dirent.h>
 #include <fcntl.h>
+#include <ftw.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -203,13 +206,41 @@ static uint32_t file_open(HFile *f) {
     KObject *o = k_session("file"); o->handler = file_session; o->user = f;
     return h_new(o);
 }
+/* Directory handle: Read returns 0x228-byte entries (UTF-16 name, 8.3 name and extension, attributes, size). */
+typedef struct { DIR *d; char path[600]; } HDir;
 static void dir_session(KObject *s, uint32_t *cmd) {
+    HDir *hd = s->user;
     switch (cmd[0] >> 16) {
-    case 0x0801: { uint32_t desc = cmd[2], ptr = cmd[3]; LOG(1, "directory listing is not implemented, returning no entries"); reply(cmd, 2, 2); cmd[2] = 0; cmd[3] = desc; cmd[4] = ptr; break; }
-    case 0x0802: reply(cmd, 1, 0); break;
+    case 0x0801: {                                                     /* Read(count) -> entries */
+        uint32_t count = cmd[1], desc = cmd[2], ptr = cmd[3], n = 0;
+        struct dirent *e;
+        while (hd && hd->d && n < count && (e = readdir(hd->d))) {
+            if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+            uint8_t ent[0x228] = { 0 };
+            char full[900]; struct stat st = { 0 };
+            snprintf(full, sizeof full, "%s/%s", hd->path, e->d_name);
+            stat(full, &st);
+            int isdir = S_ISDIR(st.st_mode);
+            size_t len = strlen(e->d_name);
+            for (size_t i = 0; i < len && i < 261; i++) ent[i * 2] = (uint8_t)e->d_name[i];
+            const char *dot = isdir ? 0 : strrchr(e->d_name, '.');
+            size_t base = dot ? (size_t)(dot - e->d_name) : len;
+            for (int i = 0; i < 8; i++) ent[0x20c + i] = i < (int)base ? (uint8_t)toupper((unsigned char)e->d_name[i]) : ' ';
+            if (base > 8) { ent[0x20c + 6] = '~'; ent[0x20c + 7] = '1'; }
+            for (int i = 0; i < 3; i++) ent[0x216 + i] = dot && dot[1 + i] ? (uint8_t)toupper((unsigned char)dot[1 + i]) : ' ';
+            ent[0x21c] = (uint8_t)isdir; ent[0x21e] = (uint8_t)!isdir;
+            uint64_t size = isdir ? 0 : (uint64_t)st.st_size; memcpy(ent + 0x220, &size, 8);
+            memcpy((uint8_t *)(uintptr_t)ptr + n * 0x228, ent, sizeof ent);
+            n++;
+        }
+        reply(cmd, 2, 2); cmd[2] = n; cmd[3] = desc; cmd[4] = ptr; break;
+    }
+    case 0x0802: if (hd) { if (hd->d) closedir(hd->d); free(hd); s->user = 0; } reply(cmd, 1, 0); break;   /* Close */
     default: stub(s, cmd);
     }
 }
+static int rm_entry(const char *p, const struct stat *st, int flag, struct FTW *ftw) { (void)st; (void)flag; (void)ftw; return remove(p); }
+static int rm_tree(const char *p) { return nftw(p, rm_entry, 16, FTW_DEPTH | FTW_PHYS); }
 static HFile romfs;
 #define FS_NOT_FORMATTED 0xc8a04554u
 #define FS_ARCHIVE_NOT_FOUND 0xc8a04478u
@@ -309,7 +340,31 @@ static void fs_user(KObject *s, uint32_t *cmd) {
         if (a && a->root[0] && fs_path(a->root, cmd[4], cmd[5], cmd[8], path, sizeof path)) res = !mkdir(path, 0755) ? RES_OK : errno == EEXIST ? FS_EXISTS : FS_NOT_FOUND;
         reply(cmd, 1, 0); cmd[1] = res; break;
     }
-    case 0x080b: { KObject *o = k_session("dir"); o->handler = dir_session; reply(cmd, 1, 2); cmd[2] = 0x10; cmd[3] = h_new(o); break; }
+    case 0x0805: case 0x080a: {                                        /* RenameFile, RenameDirectory */
+        HArchive *a = archive_get(cmd[2]), *b = archive_get(cmd[6]); char to[600]; res = FS_NOT_FOUND;
+        if (a && b && a->root[0] && b->root[0] && fs_path(a->root, cmd[4], cmd[5], cmd[11], path, sizeof path) &&
+            fs_path(b->root, cmd[8], cmd[9], cmd[13], to, sizeof to)) {
+            struct stat st;
+            if (!stat(to, &st)) res = FS_EXISTS;
+            else if (!rename(path, to)) res = RES_OK;
+        }
+        LOG(1, "fs: rename %s -> %08x", path, res);
+        reply(cmd, 1, 0); cmd[1] = res; break;
+    }
+    case 0x0806: case 0x0807: {                                        /* DeleteDirectory, DeleteDirectoryRecursively */
+        HArchive *a = archive_get(cmd[2]); res = FS_NOT_FOUND;
+        if (a && a->root[0] && fs_path(a->root, cmd[4], cmd[5], cmd[7], path, sizeof path) && strcmp(path, a->root) &&
+            !(id == 0x0806 ? rmdir(path) : rm_tree(path))) res = RES_OK;
+        LOG(1, "fs: delete directory %s -> %08x", path, res);
+        reply(cmd, 1, 0); cmd[1] = res; break;
+    }
+    case 0x080b: {                                                     /* OpenDirectory */
+        HArchive *a = archive_get(cmd[1]); HDir *hd = calloc(1, sizeof *hd);
+        if (a && a->root[0] && fs_path(a->root, cmd[3], cmd[4], cmd[6], hd->path, sizeof hd->path)) hd->d = opendir(hd->path);
+        if (!hd->d) { free(hd); reply(cmd, 1, 0); cmd[1] = FS_NOT_FOUND; break; }
+        KObject *o = k_session("dir"); o->handler = dir_session; o->user = hd;
+        reply(cmd, 1, 2); cmd[2] = 0x10; cmd[3] = h_new(o); break;
+    }
     case 0x080c: {                                                     /* OpenArchive */
         HArchive *a = 0; uint32_t aid = cmd[1];
         res = archive_open(aid, cmd[3], cmd[5], &a);
@@ -318,6 +373,11 @@ static void fs_user(KObject *s, uint32_t *cmd) {
     }
     case 0x0851: { char root[300]; extdata_root(root, sizeof root, 0, cmd[2], cmd[3]); mkdir(root, 0755);   /* CreateExtSaveData */
                    LOG(1, "fs: created extra data folder %s", root); reply(cmd, 1, 0); break; }
+    case 0x0852: {                                                     /* DeleteExtSaveData(media, low, high) */
+        char root[300]; struct stat st; extdata_root(root, sizeof root, cmd[1] == 0, cmd[2], cmd[3]);
+        res = stat(root, &st) ? FS_ARCHIVE_NOT_FOUND : rm_tree(root) ? FS_NOT_FOUND : RES_OK;
+        LOG(1, "fs: delete extra data %s -> %08x", root, res); reply(cmd, 1, 0); cmd[1] = res; break;
+    }
     case 0x0817: case 0x0818: reply(cmd, 2, 0); cmd[2] = 1; break;     /* IsSdmcDetected / IsSdmcWritable */
     case 0x0845: reply(cmd, 5, 0); cmd[2] = 0x20000; cmd[3] = 8; cmd[4] = 8; cmd[5] = 0; break;   /* GetFormatInfo */
     case 0x0863: reply(cmd, 2, 0); cmd[2] = 0; break;                  /* GetPriority */
