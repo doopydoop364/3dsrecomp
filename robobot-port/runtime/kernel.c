@@ -118,7 +118,8 @@ static Region *region_find(uint32_t addr) {
  * Wall-clock pacing keeps it from running faster than real time (RB_FAST=1 turns pacing off). */
 static uint64_t vclock = 1000000000ull, pace_wall0, pace_v0;
 static int pacing = -1, fast_forward;
-void k_set_fast_forward(int on) { fast_forward = on; }   /* host hotkey: run as fast as the host can */
+void k_set_fast_forward(int on) { fast_forward = on; }
+uint64_t k_paced_ns;                                  /* total time slept for pacing (FPS overlay) */   /* host hotkey: run as fast as the host can */
 static uint64_t wall_ns(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
@@ -131,7 +132,7 @@ static void advance_to(uint64_t t) {
     if (!pacing || fast_forward) return;
     uint64_t target = pace_wall0 + (vclock - pace_v0), w = wall_ns();
     if (target > w + 50000000ull) { pace_wall0 = w - (vclock - pace_v0); return; }   /* paused or debugging: resync */
-    if (target > w) { struct timespec ts = { (time_t)((target - w) / 1000000000ull), (long)((target - w) % 1000000000ull) }; nanosleep(&ts, 0); }
+    if (target > w) { struct timespec ts = { (time_t)((target - w) / 1000000000ull), (long)((target - w) % 1000000000ull) }; nanosleep(&ts, 0); k_paced_ns += wall_ns() - w; }
     else if (w > target + 34000000ull) pace_wall0 = w - (vclock - pace_v0);          /* behind by more than 2 frames: resync instead of
                                                                                         running fast to catch up (audio would be cut) */
 }

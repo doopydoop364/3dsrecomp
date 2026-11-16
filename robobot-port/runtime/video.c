@@ -24,6 +24,8 @@ static int layout, swapped;
 static SDL_FRect r_top, r_bot;                         /* where each screen is drawn, in window pixels */
 static SDL_Scancode ff_key; static int ff_toggle, ff_on;
 static int show_fps;
+static double present_ms, emu_ms, frame_end;
+extern uint64_t k_paced_ns; static uint64_t paced_last;      /* FPS overlay timing: smoothed ms per frame */
 static void menu_init(void);
 /* Touch hotspots from [hotspots] (per-game file or settings.toml): holding the key touches that point. */
 static struct { SDL_Scancode key; uint16_t x, y; } hot[32]; static int nhot;
@@ -135,6 +137,8 @@ void video_init(const char *title) {
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) { fprintf(stderr, "SDL video is not available (%s), running without a window\n", SDL_GetError()); headless = 1; return; }
     win = SDL_CreateWindow(title, OUT_W * 2, OUT_H * 2, SDL_WINDOW_RESIZABLE);
     ren = win ? SDL_CreateRenderer(win, 0) : 0;
+    if (ren) SDL_SetRenderVSync(ren, settings_int("video.vsync", 0) ? 1 : 0);   /* never block the emulation on the monitor
+                                                                                (it may not run at 60 Hz) */
     tex_top = ren ? SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, 400, 240) : 0;
     tex_bot = ren ? SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, 320, 240) : 0;
     if (!tex_top || !tex_bot) fatal("cannot create the window: %s", SDL_GetError());
@@ -402,6 +406,9 @@ void video_frame(uint64_t frame, const uint8_t *top, uint32_t top_stride, uint32
     for (int i = 0; i < nshots; i++) if (shots[i] == frame) want_shot = 1;
     static int prof = -1; if (prof < 0) prof = getenv("RB_PROFILE_PRESENT") != 0;   /* test: time the window path headless */
     if (headless && !want_shot && !prof) return;
+    { struct timespec a; clock_gettime(CLOCK_MONOTONIC, &a); double now = (double)a.tv_sec * 1e3 + (double)a.tv_nsec / 1e6;
+      double slept = (double)(k_paced_ns - paced_last) / 1e6; paced_last = k_paced_ns;
+      if (frame_end > 0) emu_ms = emu_ms * 0.9 + 0.1 * (now - frame_end - slept); }
     memset(frame_rgba, 0, sizeof frame_rgba);
     if (top) blit_screen(top, top_stride, top_fmt, 400, 0, 0);
     if (bot) blit_screen(bot, bot_stride, bot_fmt, 320, 40, 240);
@@ -479,13 +486,15 @@ void video_frame(uint64_t frame, const uint8_t *top, uint32_t top_stride, uint32
             game_fps = (float)((double)(gpu_swaps() - sw_last) / dt); win_fps = (float)((double)presents / dt);
             t_last = now; sw_last = gpu_swaps(); presents = 0;
         }
-        char txt[64]; snprintf(txt, sizeof txt, "game %.0f fps  window %.0f fps%s", game_fps, win_fps, ff_on ? "  >>" : "");
+        char txt[96]; snprintf(txt, sizeof txt, "game %.0f fps  window %.0f fps  emu %.1f ms  present %.1f ms%s", game_fps, win_fps, emu_ms, present_ms, ff_on ? "  >>" : "");
         SDL_SetRenderScale(ren, 2.0f, 2.0f);
         SDL_SetRenderDrawColor(ren, 0, 0, 0, 160); SDL_FRect bg = { 2, 2, (float)strlen(txt) * 8 + 4, 12 }; SDL_RenderFillRect(ren, &bg);
         SDL_SetRenderDrawColor(ren, 255, 255, 80, 255); SDL_RenderDebugText(ren, 4, 4, txt);
         SDL_SetRenderScale(ren, 1.0f, 1.0f);
     }
-    SDL_RenderPresent(ren);
+    { struct timespec a; clock_gettime(CLOCK_MONOTONIC, &a); SDL_RenderPresent(ren); struct timespec b; clock_gettime(CLOCK_MONOTONIC, &b);
+      present_ms = present_ms * 0.9 + 0.1 * ((double)(b.tv_sec - a.tv_sec) * 1e3 + (double)(b.tv_nsec - a.tv_nsec) / 1e6);
+      frame_end = (double)b.tv_sec * 1e3 + (double)b.tv_nsec / 1e6; }
     { static long long at = -2; if (at == -2) { const char *e = getenv("RB_MENU_TEST"); at = e ? atoll(e) : -1; }
       if (at >= 0 && (long long)frame == at) menu_open = 1; }
     if (menu_open) menu_loop(tt, tb);
