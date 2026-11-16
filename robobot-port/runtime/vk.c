@@ -40,7 +40,7 @@ static uint32_t qfam;
  * next frame into the other context (its own command buffer, fence, half of the staging ring and destroy list).
  * Every synchronous wait (submit_wait) still waits for all earlier work, so correctness does not depend on this. */
 typedef struct Img Img;
-typedef struct { VkCommandPool pool; VkCommandBuffer cb; VkFence fen; VkSemaphore acq; int pending; struct ImgList *grave; } Ctx;
+typedef struct { VkCommandPool pool; VkCommandBuffer cb, cb2; VkFence fen; VkSemaphore acq; int pending; struct ImgList *grave; } Ctx;   /* cb2: present pass */
 static Ctx ctxs[2]; static int cur_ctx;
 #define cpool (ctxs[cur_ctx].pool)
 #define cmd (ctxs[cur_ctx].cb)
@@ -906,11 +906,25 @@ void vkr_present(const VkrScreen scr[2], uint32_t win_w, uint32_t win_h, const u
         if (!create_swapchain(win_w, win_h)) return;
     }
     present_pipelines();
+    /* Submit the frame's rendering now, without waiting for a swapchain image: only the small present pass below
+     * waits for one (the compositor may hold images until its next refresh). */
+    if (recording) {
+        end_render();
+        CHK(vkEndCommandBuffer(cmd));
+        VkSubmitInfo gs = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmd };
+        CHK(vkQueueSubmit(queue, 1, &gs, VK_NULL_HANDLE));
+        recording = 0; nsubmits++;
+        VkCommandBuffer t = ctxs[cur_ctx].cb; ctxs[cur_ctx].cb = ctxs[cur_ctx].cb2; ctxs[cur_ctx].cb2 = t;   /* present pass next */
+    }
     uint32_t idx;
     VkSemaphore acq_sem = ctxs[cur_ctx].acq;
     VkResult r = vkAcquireNextImageKHR(dev, swap, UINT64_MAX, acq_sem, VK_NULL_HANDLE, &idx);
-    if (r == VK_ERROR_OUT_OF_DATE_KHR) { need_recreate = 1; return; }
-    if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { LOG(1, "vulkan: acquire failed (%d)", r); return; }
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR)) {
+        if (r != VK_ERROR_OUT_OF_DATE_KHR) LOG(1, "vulkan: acquire failed (%d)", r);
+        need_recreate = 1;
+        CHK(vkQueueWaitIdle(queue));                              /* the submitted buffer must be idle before reuse */
+        return;
+    }
     if (r == VK_SUBOPTIMAL_KHR) need_recreate = 1;
     begin_cmd(); end_render();
     static uint32_t nw[2], nh[2];
@@ -1042,6 +1056,7 @@ int vkr_init(void) {
         CHK(vkCreateCommandPool(dev, &cpi, 0, &x->pool));
         VkCommandBufferAllocateInfo cai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = x->pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
         CHK(vkAllocateCommandBuffers(dev, &cai, &x->cb));
+        CHK(vkAllocateCommandBuffers(dev, &cai, &x->cb2));
         VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
         CHK(vkCreateFence(dev, &fci, 0, &x->fen));
         VkSemaphoreCreateInfo si = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
