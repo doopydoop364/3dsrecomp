@@ -562,11 +562,12 @@ void vkr_frame(void) {
     if (!vkr_on) return;
     submit_wait();
     static uint64_t frames;
-    if (++frames % 300 == 0)
+    if (++frames % 300 == 0) {
         LOG(1, "vulkan: GPU wait %.2f s, write-back %.2f s, textures %.2f s, stale texture catches %llu", t_wait / 1e9, t_fin / 1e9, t_tex / 1e9, (unsigned long long)nstale);
         LOG(1, "vulkan: %llu submissions, %llu sync points, %llu surface downloads, %llu surface uploads, %llu texture uploads, %d pipelines",
             (unsigned long long)nsubmits, (unsigned long long)nsyncs, (unsigned long long)ndownloads, (unsigned long long)nuploads,
             (unsigned long long)ntexuploads, npipes);
+    }
 }
 
 /* ---- setup ---- */
