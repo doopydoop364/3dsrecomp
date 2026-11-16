@@ -9,6 +9,7 @@ typedef struct {
     uint32_t on, addr, w, h, fmt, size;   /* addr: guest virtual; size in bytes */
     uint32_t wrap, border;                /* wrap_s | wrap_t << 8 */
     uint32_t levels, param, lod;          /* mip levels present; raw filter (0x083-style) and LOD registers */
+    uint32_t faces, face_addr[6];         /* 6 for a cube map (unit 0), else 1; face_addr[0] = addr */
 } VkrTex;
 typedef struct {
     uint32_t caddr, daddr;                /* guest virtual, 0 when unmapped */
@@ -23,7 +24,7 @@ typedef struct {
 } VkrDraw;
 
 int vkr_init(void);                      /* 1 when the Vulkan backend is selected and ready */
-void vkr_draw(const VkrDraw *d, const void *tris, int ntris, void (*decode)(int unit, int level, uint8_t *rgba));
+void vkr_draw(const VkrDraw *d, const void *tris, int ntris, void (*decode)(int unit, int face, int level, uint8_t *rgba));
 void vkr_sync_range(uint32_t addr, uint32_t size, int will_write);   /* before anything else touches guest memory */
 int vkr_fill(uint32_t start, uint32_t end, uint32_t value, uint32_t ctl);   /* 1 if done on the GPU */
 void vkr_sync_all(void);

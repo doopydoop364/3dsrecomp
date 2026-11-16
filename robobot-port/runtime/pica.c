@@ -272,7 +272,7 @@ static int compare(uint32_t f, uint32_t a, uint32_t b) {
 /* ---- textures ---- */
 static const uint8_t tex_bits[16] = { 32, 24, 16, 16, 16, 16, 16, 8, 8, 8, 4, 4, 4, 8, 0, 0 };
 static const int etc_mod[8][2] = { { 2, 8 }, { 5, 17 }, { 9, 29 }, { 13, 42 }, { 18, 60 }, { 24, 80 }, { 33, 106 }, { 47, 183 } };
-typedef struct { const uint8_t *base; uint32_t w, h, fmt, wrap_s, wrap_t, border; int on; uint32_t param, lod; } TexUnit;
+typedef struct { const uint8_t *base; uint32_t w, h, fmt, wrap_s, wrap_t, border; int on; uint32_t param, lod; int cube; const uint8_t *face[6]; } TexUnit;
 static int warned_tex[8];
 
 static uint8_t x4(uint32_t v) { return (uint8_t)((v << 4) | v); }
@@ -353,9 +353,19 @@ static void setup_tex(TexUnit *t, int unit) {
     t->wrap_t = (reg[b + 2] >> 8) & 7; t->wrap_s = (reg[b + 2] >> 12) & 7; t->border = reg[b];
     t->param = reg[b + 2]; t->lod = reg[b + 3];   /* filters (bits 1, 2, 24) and mip levels: used by the Vulkan backend */
     uint32_t type = unit == 0 ? (reg[b + 2] >> 28) & 7 : 0;
-    if (type != 0 && type != 3 && !warned_tex[type]) { warned_tex[type] = 1; LOG(1, "pica: texture type %u (cube/shadow) is sampled as 2D", type); }
+    if (type != 0 && type != 1 && type != 3 && type != 4 && !warned_tex[type]) { warned_tex[type] = 1; LOG(1, "pica: texture type %u (cube/shadow) is sampled as 2D", type); }
     t->base = (t->w && t->h && tex_bits[t->fmt]) ? phys((reg[b + 4] & 0x0fffffff) << 3, t->w * t->h * tex_bits[t->fmt] / 8) : 0;
     if (!t->base) t->on = 0;
+    t->cube = 0;
+    if (t->on && (type == 1 || type == 4)) {           /* cube map (unit 0 only): +X at the main address, the other faces at
+                                                          0x86-0x8A (low 22 bits; bits 22-27 shared with the main address) */
+        uint32_t main = reg[b + 4] & 0x0fffffff, size = t->w * t->h * tex_bits[t->fmt] / 8;
+        t->cube = 1; t->face[0] = t->base;
+        for (int f = 1; f < 6; f++) {
+            t->face[f] = phys(((main & ~0x3fffffu) | (reg[0x086 + f - 1] & 0x3fffffu)) << 3, size);
+            if (!t->face[f]) t->cube = 0, t->on = 0;
+        }
+    }
 
 }
 
@@ -662,6 +672,16 @@ static int stencil_op(uint32_t act, int old, int ref) {
     }
 }
 
+/* Cube-map direction (u, v, w) -> face and face coordinates (behaviour per the Azahar software renderer). */
+static int cube_coord(float u, float v, float w, float *ou, float *ov) {
+    float au = fabsf(u), av = fabsf(v), aw = fabsf(w), x, y, z; int face;
+    if (au > av && au > aw) { if (u > 0) { face = 0; y = -v; } else { face = 1; y = v; } x = -w; z = u; }
+    else if (av > aw) { if (v > 0) { face = 2; x = u; } else { face = 3; x = -u; } y = w; z = v; }
+    else { if (w > 0) { face = 4; y = -v; } else { face = 5; y = v; } x = u; z = w; }
+    *ou = x / z * 0.5f + 0.5f; *ov = y / z * 0.5f + 0.5f;
+    return face;
+}
+
 /* Interpolated fragment colour; returns 0 if the fragment is discarded by the alpha test. */
 static int fragment(const Vtx *v0, const Vtx *v1, const Vtx *v2, float b0, float b1, float b2, uint8_t out[4]) {
     if (flat_mode) { memcpy(out, flat, 4); return 1; }
@@ -672,8 +692,11 @@ static int fragment(const Vtx *v0, const Vtx *v1, const Vtx *v2, float b0, float
     uint8_t tex[4][4] = { { 0 } };
     if (tu[0].on) {
         float u = I(S_TC0), v = I(S_TC0 + 1);
-        if (((reg[0x083] >> 28) & 7) == 3) { float w = I(S_TC0W); u /= w; v /= w; }
-        sample(&tu[0], u, v, tex[0]);
+        if (tu[0].cube) { float cu, cv; TexUnit t = tu[0]; t.base = t.face[cube_coord(u, v, I(S_TC0W), &cu, &cv)]; sample(&t, cu, cv, tex[0]); }
+        else {
+            if (((reg[0x083] >> 28) & 7) == 3) { float w = I(S_TC0W); u /= w; v /= w; }
+            sample(&tu[0], u, v, tex[0]);
+        }
     }
     if (tu[1].on) sample(&tu[1], I(S_TC1), I(S_TC1 + 1), tex[1]);
     if (tu[2].on) {
@@ -981,8 +1004,9 @@ static uint32_t tex_bytes(const TexUnit *t, uint32_t levels) {
     for (uint32_t l = 0; l < levels; l++) n += (t->w >> l) * (t->h >> l) * tex_bits[t->fmt] / 8;
     return n;
 }
-static void vk_decode(int unit, int level, uint8_t *rgba) {
+static void vk_decode(int unit, int face, int level, uint8_t *rgba) {
     TexUnit t = tu[unit];
+    if (t.cube) t.base = t.face[face];
     t.base += tex_bytes(&tu[unit], (uint32_t)level); t.w >>= level; t.h >>= level;
     for (uint32_t y = 0; y < t.h; y++)
         for (uint32_t x = 0; x < t.w; x++) texel(&t, x, y, rgba + 4 * (y * t.w + x));
@@ -1010,9 +1034,48 @@ static void vk_submit(const Fb *fb, uint32_t caddr, uint32_t daddr) {
         uint32_t lv = tex_levels(t);
         if (!mem_valid(d.tex[u].addr, tex_bytes(t, lv))) lv = 1;
         d.tex[u].levels = lv; d.tex[u].size = tex_bytes(t, lv); d.tex[u].wrap = t->wrap_s | t->wrap_t << 8; d.tex[u].border = t->border;
-        d.tex[u].param = t->param; d.tex[u].lod = t->lod;
+        d.tex[u].param = t->param; d.tex[u].lod = t->lod; d.tex[u].faces = t->cube ? 6 : 1;
+        for (int f = 0; f < 6; f++) d.tex[u].face_addr[f] = t->cube ? (uint32_t)(uintptr_t)t->face[f] : d.tex[u].addr;
+        if (t->cube) for (int f = 0; f < 6 && lv > 1; f++) if (!mem_valid(d.tex[u].face_addr[f], tex_bytes(t, lv))) { lv = 1; d.tex[u].levels = 1; d.tex[u].size = tex_bytes(t, 1); }
     }
     vkr_draw(&d, tris, ntris, vk_decode);
+}
+
+/* Feature audit: how often draws use PICA features that are missing or approximated here, so it is clear
+ * which ones a game actually needs. Printed by pica_report(); first use is logged with its frame. */
+enum { A_PROCTEX, A_TEX_CUBE, A_TEX_SHADOW, A_TEX_SHADOWCUBE, A_GAS_FOG, A_FRAG_GAS, A_FRAG_SHADOW, A_MINMAX_FACTORS,
+       A_LOGIC_OP, A_WRAP_ODD, A_LOD_BIAS, A_TARGET_16BIT_BLEND, A_COUNT };
+static const char *audit_name[A_COUNT] = { "procedural texture (unit 3)", "cube-map texture", "shadow texture", "shadow cube texture",
+    "gas fog mode", "gas fragment mode", "shadow-map rendering mode", "blend min/max with non-one factors", "logic op other than copy",
+    "wrap modes 4-7", "texture LOD bias", "blending into a 16-bit colour target" };
+static uint64_t audit[A_COUNT];
+static void audit_hit(int k) { if (!audit[k]++) LOG(1, "pica: audit: first draw using %s at frame %llu", audit_name[k], (unsigned long long)gpu_frame()); }
+static void audit_draw(void) {
+    uint32_t tc = reg[0x080];
+    if ((tc >> 10) & 1) {
+        for (int i = 0; i < 6; i++) { uint32_t src = reg[tev_reg[i]]; int hit = 0;
+            for (int j = 0; j < 3; j++) if (((src >> (4 * j)) & 15) == 6 || ((src >> (16 + 4 * j)) & 15) == 6) hit = 1;
+            if (hit) { audit_hit(A_PROCTEX); break; } }
+    }
+    if (tc & 1) { uint32_t type = (reg[0x083] >> 28) & 7;
+        if (type == 1) audit_hit(A_TEX_CUBE); else if (type == 2) audit_hit(A_TEX_SHADOW); else if (type == 4) audit_hit(A_TEX_SHADOWCUBE); }
+    if ((reg[0x0e0] & 7) == 7) audit_hit(A_GAS_FOG);
+    if ((reg[0x100] & 3) == 1) audit_hit(A_FRAG_GAS);
+    if ((reg[0x100] & 3) == 3) audit_hit(A_FRAG_SHADOW);
+    uint32_t bl = reg[0x101];
+    if (reg[0x100] & 0x100) {
+        int rgb = (bl & 7) == 3 || (bl & 7) == 4, a = ((bl >> 8) & 7) == 3 || ((bl >> 8) & 7) == 4;
+        if ((rgb && (((bl >> 16) & 15) != 1 || ((bl >> 20) & 15) != 1)) || (a && (((bl >> 24) & 15) != 1 || ((bl >> 28) & 15) != 1))) audit_hit(A_MINMAX_FACTORS);
+        uint32_t cf = (reg[0x117] >> 16) & 7;
+        if (cf >= 2 && cf <= 4) audit_hit(A_TARGET_16BIT_BLEND);
+    } else if ((reg[0x102] & 15) != 3) audit_hit(A_LOGIC_OP);
+    static const uint32_t base_reg[3] = { 0x081, 0x091, 0x099 };
+    for (int u = 0; u < 3; u++) {
+        if (!((tc >> u) & 1)) continue;
+        uint32_t prm = reg[base_reg[u] + 2], lod = reg[base_reg[u] + 3];
+        if (((prm >> 8) & 7) >= 4 || ((prm >> 12) & 7) >= 4) audit_hit(A_WRAP_ODD);
+        if ((lod & 0x1fff) && ((lod >> 16) & 15)) audit_hit(A_LOD_BIAS);
+    }
 }
 
 static void draw(int indexed) {
@@ -1040,6 +1103,7 @@ static void draw(int indexed) {
     for (int u = 0; u < 3; u++) setup_tex(&tu[u], u);
     setup_tev();
     setup_lighting();
+    audit_draw();
     if ((reg[0x0e0] & 7) == 5) { if (!n_fog_draws++) LOG(1, "pica: first fog draw at frame %llu", (unsigned long long)gpu_frame()); }
     if ((reg[0x0e0] & 7) == 7 && !warned_tex[7]) { warned_tex[7] = 1; LOG(1, "pica: gas rendering (fog mode 7) is not implemented"); }
     uint32_t h = draw_in_frame * 2654435761u;                       /* colour depends only on the position in the frame */
@@ -1165,6 +1229,8 @@ void pica_report(void) {
     for (int r = 0x229; r < 0x260; r++) if (reg_writes[r]) fprintf(stderr, " %03x:%llu", r, (unsigned long long)reg_writes[r]);
     fputc('\n', stderr);
     fprintf(stderr, "pica: %llu draws with fog\n", (unsigned long long)n_fog_draws);
+    fprintf(stderr, "pica: audit of missing or approximated features (draws using each):\n");
+    for (int k = 0; k < A_COUNT; k++) fprintf(stderr, "  %-40s %llu\n", audit_name[k], (unsigned long long)audit[k]);
     fprintf(stderr, "pica: %llu command lists, %llu draws, %llu triangles rasterised, %llu pixels written, %llu geometry-shader draws skipped\n",
             (unsigned long long)n_lists, (unsigned long long)n_draws, (unsigned long long)n_tris, (unsigned long long)n_pixels, (unsigned long long)n_skipped_gs);
 }

@@ -123,9 +123,11 @@ static VkDeviceSize ring_alloc(Ring *r, VkDeviceSize n) {
     return off;
 }
 
-static void mkimg_levels(Img *im, uint32_t w, uint32_t h, uint32_t levels, VkFormat f, VkImageUsageFlags use, VkImageAspectFlags aspect) {
+/* layers > 0: a 2D-array image and view with that many layers (textures); 0: a plain 2D image (surfaces). */
+static void mkimg_full(Img *im, uint32_t w, uint32_t h, uint32_t levels, uint32_t layers, VkFormat f, VkImageUsageFlags use, VkImageAspectFlags aspect) {
+    uint32_t nl = layers ? layers : 1;
     VkImageCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = f,
-        .extent = { w, h, 1 }, .mipLevels = levels, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
+        .extent = { w, h, 1 }, .mipLevels = levels, .arrayLayers = nl, .samples = VK_SAMPLE_COUNT_1_BIT,
         .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = use, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
     CHK(vkCreateImage(dev, &ci, 0, &im->img));
     VkMemoryRequirements mr; vkGetImageMemoryRequirements(dev, im->img, &mr);
@@ -133,18 +135,18 @@ static void mkimg_levels(Img *im, uint32_t w, uint32_t h, uint32_t levels, VkFor
         .memoryTypeIndex = memtype(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) };
     CHK(vkAllocateMemory(dev, &ai, 0, &im->mem));
     CHK(vkBindImageMemory(dev, im->img, im->mem, 0));
-    VkImageViewCreateInfo vi = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = im->img, .viewType = VK_IMAGE_VIEW_TYPE_2D,
-        .format = f, .subresourceRange = { aspect, 0, levels, 0, 1 } };
+    VkImageViewCreateInfo vi = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = im->img, .viewType = layers ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D,
+        .format = f, .subresourceRange = { aspect, 0, levels, 0, nl } };
     CHK(vkCreateImageView(dev, &vi, 0, &im->view));
     im->aspect = aspect;
     begin_cmd(); end_render();
     VkImageMemoryBarrier b = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
         .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = im->img, .subresourceRange = { aspect, 0, levels, 0, 1 } };
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = im->img, .subresourceRange = { aspect, 0, levels, 0, nl } };
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, 0, 0, 0, 1, &b);
 }
 static void mkimg(Img *im, uint32_t w, uint32_t h, VkFormat f, VkImageUsageFlags use, VkImageAspectFlags aspect) {
-    mkimg_levels(im, w, h, 1, f, use, aspect);
+    mkimg_full(im, w, h, 1, 0, f, use, aspect);
 }
 static void bury(Img *im) {
     if (ngrave == 1024) submit_wait();
@@ -403,7 +405,7 @@ int vkr_fill(uint32_t start, uint32_t end, uint32_t value, uint32_t ctl) {
 }
 
 /* ---- textures ---- */
-typedef struct { int used; uint32_t addr, size, w, h, fmt, levels; Img im; uint64_t hash, checked, last; } Tex;
+typedef struct { int used; uint32_t addr, size, w, h, fmt, levels, faces, face_addr[6]; Img im; uint64_t hash, checked, last; } Tex;
 #define NTEX 768
 static Tex texs[NTEX];
 static Img dummy;
@@ -411,31 +413,33 @@ static void invalidate_textures(uint32_t addr, uint32_t size) {
     for (int i = 0; i < NTEX; i++)
         if (texs[i].used && overlaps(addr, size, texs[i].addr, texs[i].size)) { if (texs[i].checked == gen) nstale++; texs[i].checked = 0; }
 }
-static Tex *get_texture(const VkrTex *t, int unit, void (*decode)(int, int, uint8_t *)) {
-    vkr_sync_range(t->addr, t->size, 0);                          /* render-to-texture: the bytes must be current */
+static Tex *get_texture(const VkrTex *t, int unit, void (*decode)(int, int, int, uint8_t *)) {
+    for (uint32_t f = 0; f < t->faces; f++) vkr_sync_range(t->face_addr[f], t->size, 0);   /* render-to-texture: the bytes must be current */
     Tex *e = 0, *lru = &texs[0];
     for (int i = 0; i < NTEX; i++) {
         Tex *x = &texs[i];
-        if (x->used && x->addr == t->addr && x->w == t->w && x->h == t->h && x->fmt == t->fmt && x->levels == t->levels) { e = x; break; }
+        if (x->used && x->addr == t->addr && x->w == t->w && x->h == t->h && x->fmt == t->fmt && x->levels == t->levels && x->faces == t->faces &&
+            !memcmp(x->face_addr, t->face_addr, sizeof x->face_addr)) { e = x; break; }
         if (!x->used) { if (lru->used) lru = x; }
         else if (lru->used && x->last < lru->last) lru = x;
     }
     if (e && e->checked == gen) { e->last = gen; return e; }
-    uint64_t h = hash_mem((const uint8_t *)(uintptr_t)t->addr, t->size);
+    uint64_t h = 0;
+    for (uint32_t f = 0; f < t->faces; f++) h = h * 31 + hash_mem((const uint8_t *)(uintptr_t)t->face_addr[f], t->size);
     if (e && e->hash == h) { e->checked = gen; e->last = gen; return e; }
     if (!e) {
         e = lru;
         if (e->used) bury(&e->im);
         memset(e, 0, sizeof *e);
-        e->used = 1; e->addr = t->addr; e->w = t->w; e->h = t->h; e->fmt = t->fmt; e->size = t->size; e->levels = t->levels;
-        mkimg_levels(&e->im, t->w, t->h, t->levels, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+        e->used = 1; e->addr = t->addr; e->w = t->w; e->h = t->h; e->fmt = t->fmt; e->size = t->size; e->levels = t->levels; e->faces = t->faces; memcpy(e->face_addr, t->face_addr, sizeof e->face_addr);
+        mkimg_full(&e->im, t->w, t->h, t->levels, t->faces, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
     }
     begin_cmd(); end_render();
-    for (uint32_t l = 0; l < t->levels; l++) {
+    for (uint32_t f = 0; f < t->faces; f++) for (uint32_t l = 0; l < t->levels; l++) {
         uint32_t w = t->w >> l, h = t->h >> l;
         VkDeviceSize off = ring_alloc(&ring, (VkDeviceSize)w * h * 4);
-        decode(unit, (int)l, ring.map + off);
-        VkBufferImageCopy c = { .bufferOffset = off, .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, l, 0, 1 }, .imageExtent = { w, h, 1 } };
+        decode(unit, (int)f, (int)l, ring.map + off);
+        VkBufferImageCopy c = { .bufferOffset = off, .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, l, f, 1 }, .imageExtent = { w, h, 1 } };
         vkCmdCopyBufferToImage(cmd, ring.buf, e->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
     }
     barrier();
@@ -446,7 +450,7 @@ static Tex *get_texture(const VkrTex *t, int unit, void (*decode)(int, int, uint
 
 /* ---- samplers: the game's filters and mip range (texture_filter = "console"), or forced settings ---- */
 static int filter_mode = -1;                       /* 0 nearest (reference), 1 console, 2 force linear */
-typedef struct { uint8_t mag, min, mip, as, at, minl, maxl; } SKey;
+typedef struct { uint8_t mag, min, mip, as, at, minl, maxl; int16_t bias; } SKey;
 static struct { SKey k; VkSampler s; } samplers[256]; static int nsamplers;
 static VkSampler get_sampler(const VkrTex *t, int *hw) {
     SKey k = { 0 };
@@ -454,6 +458,7 @@ static VkSampler get_sampler(const VkrTex *t, int *hw) {
     if (filter_mode == 2) k.mag = k.min = k.mip = 1;
     k.minl = (uint8_t)((t->lod >> 24) & 15); k.maxl = (uint8_t)(t->levels - 1);
     if (k.minl > k.maxl) k.minl = k.maxl;
+    k.bias = (int16_t)((int32_t)(t->lod << 19) >> 19);             /* signed 1.4.8 fixed point, bits 0-12 */
     *hw = filter_mode != 0 && (k.mag || k.min || t->levels > 1);
     static const VkSamplerAddressMode am[8] = { VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
         VK_SAMPLER_ADDRESS_MODE_REPEAT, VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
@@ -464,7 +469,7 @@ static VkSampler get_sampler(const VkrTex *t, int *hw) {
     VkSamplerCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = k.mag ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
         .minFilter = k.min ? VK_FILTER_LINEAR : VK_FILTER_NEAREST, .mipmapMode = k.mip ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST,
         .addressModeU = am[k.as], .addressModeV = am[k.at], .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        .minLod = (float)k.minl, .maxLod = (float)k.maxl };   /* LOD bias left at 0, as Azahar does */
+        .minLod = (float)k.minl, .maxLod = (float)k.maxl, .mipLodBias = (float)k.bias / 256.0f };   /* Azahar leaves the bias at 0 */
     CHK(vkCreateSampler(dev, &ci, 0, &samplers[nsamplers].s));
     samplers[nsamplers].k = k;
     return samplers[nsamplers++].s;
@@ -546,7 +551,7 @@ typedef struct {
 } Ubo;
 static VkDeviceSize lut_off; static uint64_t lut_ver = ~0ull, lut_ring_gen = ~0ull;
 
-void vkr_draw(const VkrDraw *d, const void *tris, int ntris, void (*decode)(int, int, uint8_t *)) {
+void vkr_draw(const VkrDraw *d, const void *tris, int ntris, void (*decode)(int, int, int, uint8_t *)) {
     if (!ntris) return;
     begin_cmd();
     const uint32_t *R = d->regs;
@@ -579,7 +584,7 @@ void vkr_draw(const VkrDraw *d, const void *tris, int ntris, void (*decode)(int,
     for (int k = 0; k < 3; k++) {
         int hw = 0;
         if (tx[k]) smp[k] = get_sampler(&d->tex[k], &hw);
-        u->texinfo[k][0] = d->tex[k].w; u->texinfo[k][1] = d->tex[k].h; u->texinfo[k][2] = d->tex[k].wrap | (uint32_t)hw << 16; u->texinfo[k][3] = d->tex[k].border;
+        u->texinfo[k][0] = d->tex[k].w; u->texinfo[k][1] = d->tex[k].h; u->texinfo[k][2] = d->tex[k].wrap | (uint32_t)hw << 16 | (d->tex[k].faces == 6 ? 1u << 17 : 0); u->texinfo[k][3] = d->tex[k].border;
     }
 
     ensure_render(sc, sd, d->width, d->height);
@@ -764,7 +769,7 @@ int vkr_init(void) {
     VkSamplerCreateInfo sci = { .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = VK_FILTER_NEAREST, .minFilter = VK_FILTER_NEAREST,
         .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE };
     CHK(vkCreateSampler(dev, &sci, 0, &sampler));
-    mkimg(&dummy, 1, 1, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+    mkimg_full(&dummy, 1, 1, 1, 1, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
     submit_wait();
     const char *fm = getenv("RB_TEX_FILTER");
     filter_mode = !fm || !strcmp(fm, "console") ? 1 : !strcmp(fm, "nearest") ? 0 : !strcmp(fm, "linear") ? 2 : 1;

@@ -242,3 +242,11 @@ These follow Azahar's software renderer on purpose; revisit them if output diffe
 - After the alpha test: index = clamped fragment depth * 128 (or (1 - depth) * 128 if flipped); i = clamp(floor, 0, 127);
   factor = clamp(value + difference * (index - i), 0, 1); rgb = (u8)(factor * rgb + (1 - factor) * fog colour); alpha unchanged.
 - Gas mode is not implemented.
+
+## Cube maps (Azahar software renderer)
+- Unit 0 type 1 (cube) or 4 (shadow cube). +X face at the texture address (0x085); the other faces at 0x086-0x08A
+  (-X, +Y, -Y, +Z, -Z): low 22 bits from the face register, bits 22-27 from 0x085; times 8.
+- Direction (u, v, w) = (tc0.u, tc0.v, tc0.w): the largest |component| picks the face; +X: (x, y, z) = (-w, -v, u);
+  -X: (-w, v, u); +Y: (u, w, v); -Y: (-u, w, v); +Z: (u, -v, w); -Z: (u, v, w); face coords = (x/z, y/z) * 0.5 + 0.5.
+## Texture LOD (0x084 etc.): bias bits 0-12 signed 1.4.8, max level bits 16-19, min level bits 24-27.
+  Azahar's Vulkan renderer ignores the bias; this port applies it in the Vulkan "console" filter mode.
