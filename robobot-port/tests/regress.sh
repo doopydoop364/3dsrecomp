@@ -25,7 +25,7 @@ if [ "$1" != "--no-shots" ]; then
     done
     # Vulkan renderer: edges rasterise slightly differently, so allow under 1% of pixels to differ
     rm -f build/shot_000120.png build/shot_000300.png
-    RB_RENDERER=vulkan RB_FAST=1 RB_HEADLESS=1 RB_SHOT=120,300 RB_EXIT_FRAME=301 timeout 1800 ./build/robobot game >/dev/null 2>&1
+    RB_RENDERER=vulkan RB_TEX_FILTER=nearest RB_FAST=1 RB_HEADLESS=1 RB_SHOT=120,300 RB_EXIT_FRAME=301 timeout 1800 ./build/robobot game >/dev/null 2>&1
     for f in 000120 000300; do
         pct=$(.venv/bin/python tests/imgdiff.py build/baseline/shot_$f.png build/shot_$f.png 8 2>/dev/null | cut -d% -f1)
         if [ -n "$pct" ] && [ "$(echo "$pct < 1" | bc)" = 1 ]; then echo "ok   vulkan screenshot $f ($pct% differ)"; else echo "FAIL vulkan screenshot $f: ${pct:-no image}% differ"; fail=1; fi

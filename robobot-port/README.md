@@ -40,8 +40,10 @@ library itself must be installed, since the binary links it; loading it at runti
 - Accuracy: screenshots differ from the software renderer in under 0.3% of pixels (triangle edges); blending is
   done in floating point, so blended pixels can be 1 step off the hardware's integer result.
 - `RB_VK_VALIDATE=1` turns on the Khronos validation layer (the full path to stage 1 runs with 0 validation errors); `RB_VK_DEVICE=n` picks a GPU.
-- Not done yet: Vulkan presentation (the window still uses SDL's renderer), resolution scaling, texture filtering
-  (both renderers sample nearest), GPU-side display transfers.
+- Texture sampling (`video.texture_filter`): `console` (default) uses the game's own bilinear filters and mip levels
+  like a real 3DS (and Azahar's GPU renderers; LOD bias ignored, as there); `nearest` matches the software reference
+  (used by the regression check); `linear` smooths everything. The software renderer always samples nearest.
+- Not done yet: Vulkan presentation (the window still uses SDL's renderer), resolution scaling, GPU-side display transfers.
 
 ## Audio
 `runtime/dsp.c` decodes the game's 24 DSP voices (PCM8, PCM16, DSP-ADPCM), resamples them linearly, mixes the three

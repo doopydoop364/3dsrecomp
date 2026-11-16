@@ -15,7 +15,7 @@ layout(std140, set = 0, binding = 0) uniform Draw {
     vec4 gamb;             // global ambient
     vec4 misc;             // zscale, zoff, -, -
     uvec4 flags;           // x: flat mode, y: flat colour, z: light count, w: texture units on (bits)
-    uvec4 texinfo[3];      // width, height, wrap_s | wrap_t << 8, border colour
+    uvec4 texinfo[3];      // width, height, wrap_s | wrap_t << 8 | filtered << 16, border colour
 } D;
 layout(std430, set = 0, binding = 1) readonly buffer Lut { uint lut[24 * 256 + 128]; };   // lighting, then fog
 layout(set = 0, binding = 2) uniform sampler2D tex0;
@@ -38,6 +38,17 @@ int wrapc(int v, int size, uint mode) {
     case 4u: return v < 0 ? int(uint(v) % uint(size)) : (v >= size ? size - 1 : v);
     default: return int(uint(v) % uint(size));
     }
+}
+// Filtered path (the game's filters / mip levels through a Vulkan sampler). Border modes are handled here;
+// image row 0 holds the top texel row (t = height-1), so v is flipped.
+ivec4 sampleFiltered(int u, vec2 uv, vec2 dx, vec2 dy) {
+    uvec4 ti = D.texinfo[u];
+    uint ws = ti.z & 7u, wt = (ti.z >> 8) & 7u;
+    bool border = (ws == 1u && (uv.x < 0.0 || uv.x > 1.0)) || (wt == 1u && (uv.y < 0.0 || uv.y > 1.0)) || (ws == 5u && uv.x > 1.0) || (wt == 5u && uv.y > 1.0);
+    if (border) return ivec4(ti.w & 255u, (ti.w >> 8) & 255u, (ti.w >> 16) & 255u, ti.w >> 24);
+    vec2 c = vec2(uv.x, 1.0 - uv.y), f = vec2(1.0, -1.0);
+    vec4 r = u == 0 ? textureGrad(tex0, c, dx * f, dy * f) : u == 1 ? textureGrad(tex1, c, dx * f, dy * f) : textureGrad(tex2, c, dx * f, dy * f);
+    return ivec4(round(r * 255.0));
 }
 ivec4 sampleTex(int u, vec2 uv) {
     uvec4 ti = D.texinfo[u];
@@ -239,6 +250,12 @@ void lighting(vec4 qin, vec3 view, ivec4 t0, ivec4 t1, ivec4 t2, out ivec4 prim,
 }
 
 void main() {
+    // texture coordinates and their screen derivatives, before anything can discard
+    float iw0 = 1.0 / iz.x;
+    vec2 uv0 = i3.xy * iw0;
+    if (((reg(0x083u) >> 28) & 7u) == 3u) uv0 /= i4.x * iw0;
+    vec2 uv1 = i3.zw * iw0, uv2 = (((reg(0x080u) >> 13) & 1u) != 0u ? i3.zw : i5.zw) * iw0;
+    vec2 dx0 = dFdx(uv0), dy0 = dFdy(uv0), dx1 = dFdx(uv1), dy1 = dFdy(uv1), dx2 = dFdx(uv2), dy2 = dFdy(uv2);
     ivec2 px = ivec2(gl_FragCoord.xy);
     uint sc = reg(0x065u) & 3u;
     if (sc == 1u) {
@@ -254,13 +271,9 @@ void main() {
     ivec4 vcol = ivec4(clamp(roundEven(i2 * iw * 255.0), 0.0, 255.0));
     ivec4 t0 = ivec4(0), t1 = ivec4(0), t2 = ivec4(0);
     uint on = D.flags.w;
-    if ((on & 1u) != 0u) {
-        vec2 uv = i3.xy * iw;
-        if (((reg(0x083u) >> 28) & 7u) == 3u) uv /= i4.x * iw;
-        t0 = sampleTex(0, uv);
-    }
-    if ((on & 2u) != 0u) t1 = sampleTex(1, i3.zw * iw);
-    if ((on & 4u) != 0u) t2 = sampleTex(2, (((reg(0x080u) >> 13) & 1u) != 0u ? i3.zw : i5.zw) * iw);
+    if ((on & 1u) != 0u) t0 = ((D.texinfo[0].z >> 16) & 1u) != 0u ? sampleFiltered(0, uv0, dx0, dy0) : sampleTex(0, uv0);
+    if ((on & 2u) != 0u) t1 = ((D.texinfo[1].z >> 16) & 1u) != 0u ? sampleFiltered(1, uv1, dx1, dy1) : sampleTex(1, uv1);
+    if ((on & 4u) != 0u) t2 = ((D.texinfo[2].z >> 16) & 1u) != 0u ? sampleFiltered(2, uv2, dx2, dy2) : sampleTex(2, uv2);
     ivec4 prim = ivec4(0), sec = ivec4(0);
     if ((reg(0x1c6u) & 1u) == 0u) lighting(i1 * iw, vec3(i4.zw, i5.x) * iw, t0, t1, t2, prim, sec);
     ivec4 o = combine(vcol, t0, t1, t2, prim, sec);

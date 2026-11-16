@@ -123,9 +123,9 @@ static VkDeviceSize ring_alloc(Ring *r, VkDeviceSize n) {
     return off;
 }
 
-static void mkimg(Img *im, uint32_t w, uint32_t h, VkFormat f, VkImageUsageFlags use, VkImageAspectFlags aspect) {
+static void mkimg_levels(Img *im, uint32_t w, uint32_t h, uint32_t levels, VkFormat f, VkImageUsageFlags use, VkImageAspectFlags aspect) {
     VkImageCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = f,
-        .extent = { w, h, 1 }, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
+        .extent = { w, h, 1 }, .mipLevels = levels, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
         .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = use, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
     CHK(vkCreateImage(dev, &ci, 0, &im->img));
     VkMemoryRequirements mr; vkGetImageMemoryRequirements(dev, im->img, &mr);
@@ -134,14 +134,17 @@ static void mkimg(Img *im, uint32_t w, uint32_t h, VkFormat f, VkImageUsageFlags
     CHK(vkAllocateMemory(dev, &ai, 0, &im->mem));
     CHK(vkBindImageMemory(dev, im->img, im->mem, 0));
     VkImageViewCreateInfo vi = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = im->img, .viewType = VK_IMAGE_VIEW_TYPE_2D,
-        .format = f, .subresourceRange = { aspect, 0, 1, 0, 1 } };
+        .format = f, .subresourceRange = { aspect, 0, levels, 0, 1 } };
     CHK(vkCreateImageView(dev, &vi, 0, &im->view));
     im->aspect = aspect;
     begin_cmd(); end_render();
     VkImageMemoryBarrier b = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
         .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = im->img, .subresourceRange = { aspect, 0, 1, 0, 1 } };
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = im->img, .subresourceRange = { aspect, 0, levels, 0, 1 } };
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, 0, 0, 0, 1, &b);
+}
+static void mkimg(Img *im, uint32_t w, uint32_t h, VkFormat f, VkImageUsageFlags use, VkImageAspectFlags aspect) {
+    mkimg_levels(im, w, h, 1, f, use, aspect);
 }
 static void bury(Img *im) {
     if (ngrave == 1024) submit_wait();
@@ -351,7 +354,7 @@ int vkr_fill(uint32_t start, uint32_t end, uint32_t value, uint32_t ctl) {
 }
 
 /* ---- textures ---- */
-typedef struct { int used; uint32_t addr, size, w, h, fmt; Img im; uint64_t hash, checked, last; } Tex;
+typedef struct { int used; uint32_t addr, size, w, h, fmt, levels; Img im; uint64_t hash, checked, last; } Tex;
 #define NTEX 768
 static Tex texs[NTEX];
 static Img dummy;
@@ -359,12 +362,12 @@ static void invalidate_textures(uint32_t addr, uint32_t size) {
     for (int i = 0; i < NTEX; i++)
         if (texs[i].used && overlaps(addr, size, texs[i].addr, texs[i].size)) { if (texs[i].checked == gen) nstale++; texs[i].checked = 0; }
 }
-static Tex *get_texture(const VkrTex *t, int unit, void (*decode)(int, uint8_t *)) {
+static Tex *get_texture(const VkrTex *t, int unit, void (*decode)(int, int, uint8_t *)) {
     vkr_sync_range(t->addr, t->size, 0);                          /* render-to-texture: the bytes must be current */
     Tex *e = 0, *lru = &texs[0];
     for (int i = 0; i < NTEX; i++) {
         Tex *x = &texs[i];
-        if (x->used && x->addr == t->addr && x->w == t->w && x->h == t->h && x->fmt == t->fmt) { e = x; break; }
+        if (x->used && x->addr == t->addr && x->w == t->w && x->h == t->h && x->fmt == t->fmt && x->levels == t->levels) { e = x; break; }
         if (!x->used) { if (lru->used) lru = x; }
         else if (lru->used && x->last < lru->last) lru = x;
     }
@@ -375,19 +378,47 @@ static Tex *get_texture(const VkrTex *t, int unit, void (*decode)(int, uint8_t *
         e = lru;
         if (e->used) bury(&e->im);
         memset(e, 0, sizeof *e);
-        e->used = 1; e->addr = t->addr; e->w = t->w; e->h = t->h; e->fmt = t->fmt; e->size = t->size;
-        mkimg(&e->im, t->w, t->h, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+        e->used = 1; e->addr = t->addr; e->w = t->w; e->h = t->h; e->fmt = t->fmt; e->size = t->size; e->levels = t->levels;
+        mkimg_levels(&e->im, t->w, t->h, t->levels, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
     }
-    VkDeviceSize n = (VkDeviceSize)t->w * t->h * 4;
     begin_cmd(); end_render();
-    VkDeviceSize off = ring_alloc(&ring, n);
-    decode(unit, ring.map + off);
-    VkBufferImageCopy c = { .bufferOffset = off, .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { t->w, t->h, 1 } };
-    vkCmdCopyBufferToImage(cmd, ring.buf, e->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    for (uint32_t l = 0; l < t->levels; l++) {
+        uint32_t w = t->w >> l, h = t->h >> l;
+        VkDeviceSize off = ring_alloc(&ring, (VkDeviceSize)w * h * 4);
+        decode(unit, (int)l, ring.map + off);
+        VkBufferImageCopy c = { .bufferOffset = off, .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, l, 0, 1 }, .imageExtent = { w, h, 1 } };
+        vkCmdCopyBufferToImage(cmd, ring.buf, e->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    }
     barrier();
     e->hash = h; e->checked = gen; e->last = gen;
     ntexuploads++;
     return e;
+}
+
+/* ---- samplers: the game's filters and mip range (texture_filter = "console"), or forced settings ---- */
+static int filter_mode = -1;                       /* 0 nearest (reference), 1 console, 2 force linear */
+typedef struct { uint8_t mag, min, mip, as, at, minl, maxl; } SKey;
+static struct { SKey k; VkSampler s; } samplers[256]; static int nsamplers;
+static VkSampler get_sampler(const VkrTex *t, int *hw) {
+    SKey k = { 0 };
+    k.mag = (t->param >> 1) & 1; k.min = (t->param >> 2) & 1; k.mip = (t->param >> 24) & 1;
+    if (filter_mode == 2) k.mag = k.min = k.mip = 1;
+    k.minl = (uint8_t)((t->lod >> 24) & 15); k.maxl = (uint8_t)(t->levels - 1);
+    if (k.minl > k.maxl) k.minl = k.maxl;
+    *hw = filter_mode != 0 && (k.mag || k.min || t->levels > 1);
+    static const VkSamplerAddressMode am[8] = { VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        VK_SAMPLER_ADDRESS_MODE_REPEAT, VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_REPEAT, VK_SAMPLER_ADDRESS_MODE_REPEAT };
+    k.as = (uint8_t)(t->wrap & 7); k.at = (uint8_t)((t->wrap >> 8) & 7);   /* border modes are resolved in the shader */
+    for (int i = 0; i < nsamplers; i++) if (!memcmp(&samplers[i].k, &k, sizeof k)) return samplers[i].s;
+    if (nsamplers == 256) return sampler;
+    VkSamplerCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = k.mag ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
+        .minFilter = k.min ? VK_FILTER_LINEAR : VK_FILTER_NEAREST, .mipmapMode = k.mip ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST,
+        .addressModeU = am[k.as], .addressModeV = am[k.at], .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .minLod = (float)k.minl, .maxLod = (float)k.maxl };   /* LOD bias left at 0, as Azahar does */
+    CHK(vkCreateSampler(dev, &ci, 0, &samplers[nsamplers].s));
+    samplers[nsamplers].k = k;
+    return samplers[nsamplers++].s;
 }
 
 /* ---- pipelines ---- */
@@ -466,7 +497,7 @@ typedef struct {
 } Ubo;
 static VkDeviceSize lut_off; static uint64_t lut_ver = ~0ull, lut_ring_gen = ~0ull;
 
-void vkr_draw(const VkrDraw *d, const void *tris, int ntris, void (*decode)(int, uint8_t *)) {
+void vkr_draw(const VkrDraw *d, const void *tris, int ntris, void (*decode)(int, int, uint8_t *)) {
     if (!ntris) return;
     begin_cmd();
     const uint32_t *R = d->regs;
@@ -495,7 +526,12 @@ void vkr_draw(const VkrDraw *d, const void *tris, int ntris, void (*decode)(int,
     u->misc[0] = d->zscale; u->misc[1] = d->zoff; u->misc[2] = u->misc[3] = 0;
     u->flags[0] = d->flat; u->flags[1] = d->flat_color; u->flags[2] = d->nlights;
     u->flags[3] = (tx[0] ? 1 : 0) | (tx[1] ? 2 : 0) | (tx[2] ? 4 : 0);
-    for (int k = 0; k < 3; k++) { u->texinfo[k][0] = d->tex[k].w; u->texinfo[k][1] = d->tex[k].h; u->texinfo[k][2] = d->tex[k].wrap; u->texinfo[k][3] = d->tex[k].border; }
+    VkSampler smp[3] = { sampler, sampler, sampler };
+    for (int k = 0; k < 3; k++) {
+        int hw = 0;
+        if (tx[k]) smp[k] = get_sampler(&d->tex[k], &hw);
+        u->texinfo[k][0] = d->tex[k].w; u->texinfo[k][1] = d->tex[k].h; u->texinfo[k][2] = d->tex[k].wrap | (uint32_t)hw << 16; u->texinfo[k][3] = d->tex[k].border;
+    }
 
     ensure_render(sc, sd, d->width, d->height);
 
@@ -513,7 +549,7 @@ void vkr_draw(const VkrDraw *d, const void *tris, int ntris, void (*decode)(int,
 
     VkDescriptorBufferInfo ub = { ring.buf, uoff, sizeof(Ubo) }, lb = { ring.buf, lut_off, LUT_BYTES };
     VkDescriptorImageInfo ii[3];
-    for (int t = 0; t < 3; t++) ii[t] = (VkDescriptorImageInfo){ sampler, tx[t] ? tx[t]->im.view : dummy.view, VK_IMAGE_LAYOUT_GENERAL };
+    for (int t = 0; t < 3; t++) ii[t] = (VkDescriptorImageInfo){ smp[t], tx[t] ? tx[t]->im.view : dummy.view, VK_IMAGE_LAYOUT_GENERAL };
     VkWriteDescriptorSet w[5] = {
         { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &ub },
         { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 1, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &lb } };
@@ -646,6 +682,8 @@ int vkr_init(void) {
     CHK(vkCreateSampler(dev, &sci, 0, &sampler));
     mkimg(&dummy, 1, 1, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
     submit_wait();
+    const char *fm = getenv("RB_TEX_FILTER");
+    filter_mode = !fm || !strcmp(fm, "console") ? 1 : !strcmp(fm, "nearest") ? 0 : !strcmp(fm, "linear") ? 2 : 1;
     vkr_on = 1;
     LOG(1, "vulkan: rendering on %s (depth-stencil format %s)", props.deviceName, d24fmt == VK_FORMAT_D24_UNORM_S8_UINT ? "D24S8" : "D32FS8");
     return 1;

@@ -272,7 +272,7 @@ static int compare(uint32_t f, uint32_t a, uint32_t b) {
 /* ---- textures ---- */
 static const uint8_t tex_bits[16] = { 32, 24, 16, 16, 16, 16, 16, 8, 8, 8, 4, 4, 4, 8, 0, 0 };
 static const int etc_mod[8][2] = { { 2, 8 }, { 5, 17 }, { 9, 29 }, { 13, 42 }, { 18, 60 }, { 24, 80 }, { 33, 106 }, { 47, 183 } };
-typedef struct { const uint8_t *base; uint32_t w, h, fmt, wrap_s, wrap_t, border; int on; } TexUnit;
+typedef struct { const uint8_t *base; uint32_t w, h, fmt, wrap_s, wrap_t, border; int on; uint32_t param, lod; } TexUnit;
 static int warned_tex[8];
 
 static uint8_t x4(uint32_t v) { return (uint8_t)((v << 4) | v); }
@@ -351,6 +351,7 @@ static void setup_tex(TexUnit *t, int unit) {
     if (!t->on) return;
     t->h = reg[b + 1] & 0x7ff; t->w = (reg[b + 1] >> 16) & 0x7ff; t->fmt = reg[fmt_reg[unit]] & 15;
     t->wrap_t = (reg[b + 2] >> 8) & 7; t->wrap_s = (reg[b + 2] >> 12) & 7; t->border = reg[b];
+    t->param = reg[b + 2]; t->lod = reg[b + 3];   /* filters (bits 1, 2, 24) and mip levels: used by the Vulkan backend */
     uint32_t type = unit == 0 ? (reg[b + 2] >> 28) & 7 : 0;
     if (type != 0 && type != 3 && !warned_tex[type]) { warned_tex[type] = 1; LOG(1, "pica: texture type %u (cube/shadow) is sampled as 2D", type); }
     t->base = (t->w && t->h && tex_bits[t->fmt]) ? phys((reg[b + 4] & 0x0fffffff) << 3, t->w * t->h * tex_bits[t->fmt] / 8) : 0;
@@ -969,10 +970,22 @@ static void flush_tris(const Fb *fb) {
 }
 
 /* ---- Vulkan backend hand-off (vk.c): the GPU rasterises the triangles queued for this draw ---- */
-static void vk_decode(int unit, uint8_t *rgba) {
-    const TexUnit *t = &tu[unit];
-    for (uint32_t y = 0; y < t->h; y++)
-        for (uint32_t x = 0; x < t->w; x++) texel(t, x, y, rgba + 4 * (y * t->w + x));
+/* Mip level l of a texture follows level l-1 in memory, each a quarter of the size; levels stop at 8x8 tiles. */
+static uint32_t tex_levels(const TexUnit *t) {
+    uint32_t n = ((t->lod >> 16) & 15) + 1, l = 1;
+    while (l < n && (t->w >> l) >= 8 && (t->h >> l) >= 8) l++;
+    return l;
+}
+static uint32_t tex_bytes(const TexUnit *t, uint32_t levels) {
+    uint32_t n = 0;
+    for (uint32_t l = 0; l < levels; l++) n += (t->w >> l) * (t->h >> l) * tex_bits[t->fmt] / 8;
+    return n;
+}
+static void vk_decode(int unit, int level, uint8_t *rgba) {
+    TexUnit t = tu[unit];
+    t.base += tex_bytes(&tu[unit], (uint32_t)level); t.w >>= level; t.h >>= level;
+    for (uint32_t y = 0; y < t.h; y++)
+        for (uint32_t x = 0; x < t.w; x++) texel(&t, x, y, rgba + 4 * (y * t.w + x));
 }
 static void vk_submit(const Fb *fb, uint32_t caddr, uint32_t daddr) {
     static VkrDraw d;
@@ -994,7 +1007,10 @@ static void vk_submit(const Fb *fb, uint32_t caddr, uint32_t daddr) {
         d.tex[u].on = (uint32_t)t->on;
         if (!t->on) continue;
         d.tex[u].addr = (uint32_t)(uintptr_t)t->base; d.tex[u].w = t->w; d.tex[u].h = t->h; d.tex[u].fmt = t->fmt;
-        d.tex[u].size = t->w * t->h * tex_bits[t->fmt] / 8; d.tex[u].wrap = t->wrap_s | t->wrap_t << 8; d.tex[u].border = t->border;
+        uint32_t lv = tex_levels(t);
+        if (!mem_valid(d.tex[u].addr, tex_bytes(t, lv))) lv = 1;
+        d.tex[u].levels = lv; d.tex[u].size = tex_bytes(t, lv); d.tex[u].wrap = t->wrap_s | t->wrap_t << 8; d.tex[u].border = t->border;
+        d.tex[u].param = t->param; d.tex[u].lod = t->lod;
     }
     vkr_draw(&d, tris, ntris, vk_decode);
 }

@@ -30,6 +30,9 @@ layout = "stacked"
 fullscreen = false
 # vulkan (GPU, falls back to software if Vulkan 1.3 is missing) or software
 renderer = "vulkan"
+# Vulkan texture sampling: console (the game's own filtering and mipmaps, like a real 3DS), nearest (the
+# reference software renderer's look), linear (smooth everything; can blur pixel-art UI)
+texture_filter = "console"
 
 # Hotkeys: F1 next layout, F2 swap screens, F3 show bottom screen (top_only), F11 fullscreen,
 # F12 screenshot, Escape quit. Gamepads use the Nintendo button positions automatically.
