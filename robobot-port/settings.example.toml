@@ -35,6 +35,10 @@ layout = "stacked"
 fullscreen = false
 # vulkan (GPU, falls back to software if Vulkan 1.3 is missing) or software
 renderer = "vulkan"
+# window drawing: vulkan (fast, needed for anti-aliasing; falls back to sdl automatically) or sdl
+present = "vulkan"
+# anti-aliasing for the 3D screen (Vulkan window): off or fxaa
+antialias = "off"
 # Vulkan texture sampling: console (the game's own filtering and mipmaps, like a real 3DS), nearest (the
 # reference software renderer's look), linear (smooth everything; can blur pixel-art UI)
 texture_filter = "console"

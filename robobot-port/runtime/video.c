@@ -205,7 +205,7 @@ void video_init(const char *title) {
     if (headless) return;
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) { fprintf(stderr, "SDL video is not available (%s), running without a window\n", SDL_GetError()); headless = 1; return; }
     const char *rend = getenv("RB_RENDERER");
-    int want_vk = !strcmp(settings_get("video.present", "sdl"), "vulkan") && (!rend || !strcmp(rend, "vulkan"));
+    int want_vk = !strcmp(settings_get("video.present", "vulkan"), "vulkan") && (!rend || !strcmp(rend, "vulkan"));
     fxaa_on = !strcmp(settings_get("video.antialias", "off"), "fxaa");
     if (want_vk) {
         win = SDL_CreateWindow(title, OUT_W * 2, OUT_H * 2, SDL_WINDOW_RESIZABLE | SDL_WINDOW_VULKAN);
@@ -368,7 +368,7 @@ static void text(float x, float y, float sc, const char *t, uint8_t r, uint8_t g
     SDL_SetRenderScale(ren, sc, sc); SDL_SetRenderDrawColor(ren, r, g, b, 255);
     SDL_RenderDebugText(ren, x / sc, y / sc, t); SDL_SetRenderScale(ren, 1, 1);
 }
-enum { MI_RESUME, MI_LAYOUT, MI_SWAP, MI_FULL, MI_VOLUME, MI_FPS, MI_FFMODE, MI_SCALE, MI_FILTER, MI_ANISO, MI_RENDERER,
+enum { MI_RESUME, MI_LAYOUT, MI_SWAP, MI_FULL, MI_VOLUME, MI_FPS, MI_FFMODE, MI_AA, MI_SCALE, MI_FILTER, MI_ANISO, MI_RENDERER,
        MI_CONTROLS, MI_SAVE, MI_QUIT, MI_N };
 static void item_text(int i, char *o, size_t n) {
     int full = (SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN) != 0;
@@ -380,6 +380,7 @@ static void item_text(int i, char *o, size_t n) {
     case MI_VOLUME: snprintf(o, n, "Volume          < %d%% >", m_volume); break;
     case MI_FPS: snprintf(o, n, "FPS counter     < %s >", show_fps ? "on" : "off"); break;
     case MI_FFMODE: snprintf(o, n, "Fast-forward    < %s >", ff_toggle ? "toggle" : "hold"); break;
+    case MI_AA: snprintf(o, n, vkpresent ? "Anti-aliasing   < %s >" : "Anti-aliasing   < %s >  (Vulkan window only)", fxaa_on ? "fxaa" : "off"); break;
     case MI_SCALE: snprintf(o, n, "Resolution      < %dx >  (restart)", m_scale); break;
     case MI_FILTER: snprintf(o, n, "Textures        < %s >  (restart)", filters[m_filter]); break;
     case MI_ANISO: snprintf(o, n, "Anisotropy      < %dx >  (restart)", anisos[m_aniso]); break;
@@ -397,6 +398,7 @@ static void item_change(int i, int d) {
     case MI_VOLUME: m_volume += 10 * d; if (m_volume < 0) m_volume = 0; if (m_volume > 200) m_volume = 200; audio_set_volume(m_volume); break;
     case MI_FPS: show_fps = !show_fps; break;
     case MI_FFMODE: ff_toggle = !ff_toggle; ff_on = 0; k_set_fast_forward(0); break;
+    case MI_AA: fxaa_on = !fxaa_on; break;
     case MI_SCALE: m_scale += d; if (m_scale < 1) m_scale = 4; if (m_scale > 4) m_scale = 1; break;
     case MI_FILTER: m_filter = (m_filter + d + 3) % 3; break;
     case MI_ANISO: m_aniso = (m_aniso + d + 5) % 5; break;
@@ -411,6 +413,7 @@ static void menu_save(void) {
     settings_save("video.fullscreen", (SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN) ? "true" : "false");
     snprintf(v, sizeof v, "%d", m_volume); settings_save("audio.volume", v);
     settings_save("video.show_fps", show_fps ? "true" : "false");
+    settings_save("video.antialias", fxaa_on ? "fxaa" : "off");
     settings_save("controls.fast_forward_mode", ff_toggle ? "toggle" : "hold");
     snprintf(v, sizeof v, "%d", m_scale); settings_save("video.scale", v);
     settings_save("video.texture_filter", filters[m_filter]);
