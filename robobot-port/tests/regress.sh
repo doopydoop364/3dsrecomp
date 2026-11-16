@@ -18,14 +18,16 @@ done
 run build/replay/state_02.bin $C3/before_0_vram.bin $C3/before_0_linear.bin 300ebdd0 20 $C3/after_0_vram.bin 864
 run build/replay/state_16.bin $C3/before_1_vram.bin $C3/before_1_linear.bin 300ebdd0 20 $C3/after_1_vram.bin 2
 if [ "$1" != "--no-shots" ]; then
+    tests/testgame.sh || exit 1
     rm -f build/shot_000120.png build/shot_000300.png
-    RB_RENDERER=software RB_FAST=1 RB_HEADLESS=1 RB_SHOT=120,300 RB_EXIT_FRAME=301 timeout 1800 ./build/robobot game >/dev/null 2>&1
+    RB_RENDERER=software RB_FAST=1 RB_HEADLESS=1 RB_SHOT=120,300 RB_EXIT_FRAME=301 timeout 1800 ./build/robobot build/testgame >/dev/null 2>&1
     for f in 000120 000300; do
         if cmp -s build/shot_$f.png build/baseline/shot_$f.png; then echo "ok   screenshot $f"; else echo "FAIL screenshot $f differs from baseline"; fail=1; fi
     done
     # Vulkan renderer: edges rasterise slightly differently, so allow under 1% of pixels to differ
     rm -f build/shot_000120.png build/shot_000300.png
-    RB_RENDERER=vulkan RB_TEX_FILTER=nearest RB_FAST=1 RB_HEADLESS=1 RB_SHOT=120,300 RB_EXIT_FRAME=301 timeout 1800 ./build/robobot game >/dev/null 2>&1
+    tests/testgame.sh || exit 1
+    RB_RENDERER=vulkan RB_TEX_FILTER=nearest RB_FAST=1 RB_HEADLESS=1 RB_SHOT=120,300 RB_EXIT_FRAME=301 timeout 1800 ./build/robobot build/testgame >/dev/null 2>&1
     for f in 000120 000300; do
         pct=$(.venv/bin/python tests/imgdiff.py build/baseline/shot_$f.png build/shot_$f.png 8 2>/dev/null | cut -d% -f1)
         if [ -n "$pct" ] && [ "$(echo "$pct < 1" | bc)" = 1 ]; then echo "ok   vulkan screenshot $f ($pct% differ)"; else echo "FAIL vulkan screenshot $f: ${pct:-no image}% differ"; fail=1; fi

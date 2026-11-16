@@ -152,7 +152,8 @@ static void quiet_ok(KObject *s, uint32_t *cmd) {
 /* ---- fs:USER: RomFS comes from the user's dump, save data lives in plain host folders ---- */
 #define FS_NOT_FOUND 0xc8804478u
 #define FS_EXISTS    0xc82044beu
-typedef struct { int fd; uint64_t base, size; int fixed; } HFile;
+typedef struct { int fd; uint64_t base, size; int fixed, virt; } HFile;   /* virt: the game RomFS (romfs.c) */
+uint64_t romfs_open(const char *dir); int64_t romfs_read(uint64_t off, uint32_t size, uint8_t *dst);
 typedef struct { uint32_t id; char root[300]; } HArchive;
 static HArchive archives[32];
 static int narchives;
@@ -175,7 +176,7 @@ static void file_session(KObject *s, uint32_t *cmd) {
         uint64_t off = cmd[1] | ((uint64_t)cmd[2] << 32); uint32_t size = cmd[3], desc = cmd[4], ptr = cmd[5];
         if (off > f->size) off = f->size;
         if (f->fixed && size > f->size - off) size = (uint32_t)(f->size - off);
-        ssize_t n = pread(f->fd, (void *)(uintptr_t)ptr, size, (off_t)(f->base + off));
+        ssize_t n = f->virt ? (ssize_t)romfs_read(off, size, (uint8_t *)(uintptr_t)ptr) : pread(f->fd, (void *)(uintptr_t)ptr, size, (off_t)(f->base + off));
         LOG(3, "file read off %llx size %x -> %zd", (unsigned long long)off, size, n);
         { static int trace = -1; if (trace < 0) trace = getenv("RB_LOG_READS") != 0;
           if (trace) fprintf(stderr, "read frame %llu off %llx size %x -> %zd\n", (unsigned long long)gpu_frame(), (unsigned long long)off, size, n); }
@@ -571,9 +572,7 @@ void services_init(const char *dir) {
     char path[512];
     game_dir = dir;
     nfc_set_dir(dir);
-    snprintf(path, sizeof path, "%s/romfs.bin", dir);
-    romfs.fd = open(path, O_RDONLY);
-    struct stat st;
-    if (romfs.fd < 0 || fstat(romfs.fd, &st)) fatal("cannot open %s", path);
-    romfs.base = 0x1000; romfs.size = (uint64_t)st.st_size - 0x1000; romfs.fixed = 1;   /* skip the IVFC hash header */
+    romfs.size = romfs_open(dir);
+    if (!romfs.size) fatal("cannot open %s/romfs.bin", dir);
+    romfs.fixed = 1; romfs.virt = 1;
 }

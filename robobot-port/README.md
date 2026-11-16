@@ -60,6 +60,11 @@ library itself must be installed, since the binary links it; loading it at runti
 - Not done yet: Vulkan presentation (the window still uses SDL's renderer, so full-resolution frames are read back),
   CPU/GPU overlap, GPU-side display transfers.
 
+## RomFS override (mods, replacement files)
+Put a file at `game/romfs_override/<path inside the RomFS>` and the game loads it instead of its own copy (any size;
+`romfs.bin` is never modified). `python3 tools/romfs_list.py game/romfs.bin files.tsv` lists the paths. Example:
+`game/romfs_override/snd/stream/Title.dspadpcm.bcstm` replaces the title music.
+
 ## amiibo
 Put amiibo dumps (540-byte `.bin` files read from your figures) in `game/amiibo/`. When the game asks for an amiibo,
 F5 taps the next one and F6 takes it away (it is also removed 3 seconds after the game stops reading it, as in Azahar).
