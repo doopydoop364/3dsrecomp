@@ -8,3 +8,6 @@
 *.tmd
 aes_keys.txt
 *.bin.enc
+
+# compatibility link to the old folder name
+robobot-port

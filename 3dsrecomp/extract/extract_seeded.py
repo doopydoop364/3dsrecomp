@@ -2,15 +2,14 @@
 """Fully decrypt + extract content 0 (the game NCCH) of an original CIA, with seed crypto.
 
 Usage: extract_seeded.py <original.cia> <outdir> <seed-hex>
-Reuses key tables/helpers from the repo's decrypt_cia.py (import only, not modified).
+Reuses key tables/helpers from decrypt_cia.py next to it (import only, not modified).
 """
 import hashlib, os, struct, sys
-sys.path.insert(0, "/home/iuselinuxbtw/3DS-Decrypt")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import decrypt_cia as D
 from Crypto.Cipher import AES
 from Crypto.Util import Counter
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from extract_ncch import blz_decode
 
 u32 = lambda b, o=0: struct.unpack_from("<I", b, o)[0]

@@ -82,7 +82,7 @@ static void apt(KObject *s, uint32_t *cmd) {
             if (f) fclose(f);
             if (n) LOG(1, "apt: shared system font loaded from %s (%zu bytes)", fp, n);
             else fatal("the game needs the shared system font, and %s is missing.\n"
-                       "Build it with tools/make_shared_font.py from the font system archive dumped from your console\n"
+                       "Build it with extract/make_shared_font.py from the font system archive dumped from your console\n"
                        "(title 0004009b00014002 on USA/EUR/JPN consoles).", fp);
         }
         reply(cmd, 2, 2); cmd[2] = 0x18000000; cmd[3] = 0; cmd[4] = h_new(font);

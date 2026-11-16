@@ -13,7 +13,7 @@ never what it produces.
 
 | Stage | Input | Output | State today |
 |---|---|---|---|
-| 1 extract | CIA (+ seeddb.bin) | code image, ExHeader, RomFS | works (`tools/extract_seeded.py`), seed passed by hand |
+| 1 extract | CIA (+ seeddb.bin) | code image, ExHeader, RomFS | works (`extract/extract_seeded.py`), seed passed by hand |
 | 2 analyze | code image, ExHeader | function entry list, special-case list | REA/Ghidra list + pointer scans, partly manual |
 | 3 recompile | code image, lists | C files | works, Robobot layout hard-coded |
 | 4 compile + link | C files, shared runtime | executable | works (Makefile) |
@@ -29,7 +29,7 @@ Currently fixed for Robobot, to be read from the ExHeader or the per-game file i
 - `recomp/armrecomp.py`: `BASE`, `TEXT_END`, `RO_END`, and `NONLOCAL_RETURN = {0x232cf4: ...}`
 - `runtime/recomp.h`: `RECOMP_TEXT_BASE`, `RECOMP_TEXT_SIZE`
 - `runtime/host.h`: `LINEAR_BASE` (depends on kernel version in the ExHeader), stack size, main thread priority
-- `tools/find_pointer_functions.py`: static-initialiser table range `0x675158..0x6784e0`
+- `analyze/find_pointer_functions.py`: static-initialiser table range `0x675158..0x6784e0`
 - `runtime/services.c`: title id in the APT reply, save folder name
 - `tests/`: region addresses
 
@@ -144,7 +144,7 @@ No interpreter and no JIT: the fallback is still ahead-of-time compiled code.
 
 State: Robobot plays through at 60 fps (Vulkan renderer, audio, video, amiibo, menu). Section 2's hard-coded values are
 gone: the layout comes from the ExHeader, special cases from idiom detectors. What still needs a person: decrypting
-and extracting the CIA (separate scripts, seed by hand) and the REA-made function list (`recomp/functions_rea.txt`).
+and extracting the CIA (separate scripts, seed by hand) and the REA-made function list (`games/<title id>/functions_rea.txt`).
 
 Each phase ends with a check that runs without a person. Robobot stays the regression game throughout: every phase
 must still build it and pass `tests/regress.sh` plus the scripted stage-1 run.

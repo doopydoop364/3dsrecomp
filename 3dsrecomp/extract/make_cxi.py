@@ -5,7 +5,7 @@ Handles the title-key CBC layer, the NCCH AES-CTR layers and seed crypto, then m
 NoCrypto. Usage: make_cxi.py <original.cia> <out.cxi> <seed-hex>
 """
 import hashlib, os, struct, sys
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import decrypt_cia as D
 from Crypto.Cipher import AES
 from Crypto.Util import Counter

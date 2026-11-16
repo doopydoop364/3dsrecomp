@@ -23,15 +23,17 @@ static void on_fault(int sig, siginfo_t *si, void *uc) {
 }
 static uint32_t rd32le(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
 
+static const char *prog_name = "game";
 static void usage(void) {
-    fprintf(stderr, "usage: robobot [game folder] [options]\n"
+    fprintf(stderr, "usage: %s [game folder] [options]\n"
         "  --scale N            internal resolution 1-4          --layout NAME   stacked, large_top, top_only, side_by_side\n"
         "  --renderer NAME      vulkan or software               --filter NAME   console, nearest, linear\n"
-        "  --fullscreen         start in fullscreen              --set SECTION.KEY=VALUE   any settings.toml value\n");
+        "  --fullscreen         start in fullscreen              --set SECTION.KEY=VALUE   any settings.toml value\n", prog_name);
     exit(1);
 }
 int main(int argc, char **argv) {
     const char *dir = "game";
+    prog_name = argv[0];
     static const char *cli[64][2]; int ncli = 0;
     for (int i = 1; i < argc; i++) {                     /* flags are applied after the settings files are read */
         const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : 0;
@@ -110,7 +112,7 @@ int main(int argc, char **argv) {
     if (!getenv("RB_ANISOTROPY")) setenv("RB_ANISOTROPY", settings_get("video.anisotropy", "1"), 1);
     if (!getenv("RB_TEX_FILTER")) setenv("RB_TEX_FILTER", settings_get("video.texture_filter", "console"), 1);
     if (!getenv("RB_RENDERER")) setenv("RB_RENDERER", settings_get("video.renderer", "vulkan"), 1);   /* vk.c reads it */
-    video_init("robobot-port");
+    video_init("3dsrecomp");
     input_init();
     audio_init();
     services_init(dir);

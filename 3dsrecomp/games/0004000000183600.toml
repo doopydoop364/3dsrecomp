@@ -31,3 +31,9 @@ circle_up = "W"
 circle_down = "S"
 circle_left = "A"
 circle_right = "D"
+
+# ---- scripted smoke test (tests/smoke.sh 0004000000183600): from a fresh save to stage 1 gameplay ----
+[tests]
+input = "1250-1255:A;1330-1335:A;1410-1415:A;1490-1495:A;1570-1575:A;1650-1655:A;1700-1705:START;1760-1765:A;1850-1855:A;2300-2305:A;2800-2870:RIGHT;2950-2955:A;3200-3500:circle=154/0;3300-3320:A"
+shots = "600,1500,2100,3450"
+frames = 3460

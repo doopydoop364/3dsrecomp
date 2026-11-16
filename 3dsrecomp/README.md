@@ -1,24 +1,28 @@
-# Robobot native port (work in progress)
+# 3dsrecomp (work in progress)
 
-Native Linux port of Kirby: Planet Robobot (CTR-P-AT3A) by static recompilation: the game's ARM11
-code is translated to C ahead of time and compiled for x86-64. No emulated CPU. Game data is read
-from your own dump in `game/` and is never committed (this folder is git-excluded).
+Native Linux ports of 3DS games by static recompilation: a game's ARM11 code is translated to C ahead of time and
+compiled for x86-64, with no emulated CPU. Game data is read from your own dump in `game/` and is never committed.
+The first (and so far only) game is Kirby: Planet Robobot (CTR-P-AT3A), which is fully playable. The plan towards a
+one-command tool for any CIA is in `docs/general_tool_design.md` (section 10).
 
 ## Layout
-- `tools/` extraction: `extract_seeded.py` (CIA -> `game/`, needs the title seed), `romfs_list.py`, `svc_scan.py`,
-  `find_pointer_functions.py` (finds code only reachable through stored pointers)
-- `recomp/armrecomp.py` the recompiler (ARMv6K + VFPv2, ARM mode -> C)
-- `recomp/layout.py` reads the memory layout and title id from `game/exheader.bin`; also writes `build/gen/layout.h`
-- `recomp/idioms.py` pattern detectors (inline-data dispatcher, relative static-initialiser array); results go to `build/gen/specials.json`
-- `games/<title id>.toml` hand-written per-game settings (`[functions] extra` and `not_code`)
-- `recomp/functions_rea.txt` function entries from REA/Ghidra; `functions_extra.txt` entries found by pointer scan
-- `runtime/recomp.h`, `runtime/vfp.c` CPU state, memory access, flag/shift/VFP helpers
-- `tests/difftest.py`, `tests/runner.c` differential test against a reference ARM11 emulator (Unicorn, test-only)
-- `docs/phase1_recon.md` recon report; `build/` generated C, objects, test binary
+- `extract/` CIA and NCCH handling: `decrypt_cia.py` / `decrypt_3ds.py` (the original decryption tool this repository
+  started from, by aszuraz), `extract_seeded.py` (CIA -> `game/`, needs the title seed), `extract_ncch.py`,
+  `romfs_list.py`, `make_cxi.py`, `make_shared_font.py`
+- `analyze/` code discovery: `find_pointer_functions.py` (code only reachable through stored pointers), `svc_scan.py`
+- `recomp/armrecomp.py` the recompiler (ARMv6K + VFPv2, ARM mode -> C); `recomp/layout.py` reads the memory layout
+  and title id from `game/exheader.bin` and writes `build/gen/layout.h`; `recomp/idioms.py` pattern detectors
+  (inline-data dispatcher, relative static-initialiser array), results in `build/gen/specials.json`
+- `runtime/` kernel, services, PICA200 renderers (software and Vulkan), audio, input, window: nothing game-specific
+- `games/<title id>.toml` per-game settings (function hints, PC defaults such as controls and layout);
+  `games/<title id>/` per-game data: `functions_rea.txt` (REA/Ghidra function list), `functions_extra.txt` (pointer scan)
+- `tests/` differential CPU test (`difftest.py`, `runner.c`), renderer replays and screenshots (`regress.sh`),
+  scripted runs (`play.sh`, in `build/testgame/`)
+- `tools/` debugging helpers: `disasm.py`, framebuffer/texture dumps, `shader_trace.py`, `azahar_capture.gdb`
+- `docs/` design notes, PICA facts, Robobot gameplay notes; `build/` generated C, objects and binaries
 
 ## Rebuild
-    python3 recomp/armrecomp.py game/code_decompressed.bin recomp/functions_rea.txt build/gen
-    make -j12
+    ./build.sh            # or: python3 recomp/armrecomp.py game/code_decompressed.bin games/<title id>/functions_rea.txt build/gen; make -j12
     .venv/bin/python tests/difftest.py --variants 6 --seed 1
 
 ## Controls and settings
@@ -84,7 +88,7 @@ held (320x240, origin top left). Robobot needs none yet (its touch buttons have 
 
 ## RomFS override (mods, replacement files)
 Put a file at `game/romfs_override/<path inside the RomFS>` and the game loads it instead of its own copy (any size;
-`romfs.bin` is never modified). `python3 tools/romfs_list.py game/romfs.bin files.tsv` lists the paths. Example:
+`romfs.bin` is never modified). `python3 extract/romfs_list.py game/romfs.bin files.tsv` lists the paths. Example:
 `game/romfs_override/snd/stream/Title.dspadpcm.bcstm` replaces the title music.
 
 ## amiibo
@@ -143,7 +147,7 @@ Azahar on its own memory and compares the render target pixel for pixel. Capture
 take the matching PICA state from the port with `RB_GX_LOG=<frame>` (build/replay/state_NN.bin), then
 `build/gpu_replay <state> <vram> <linear> <list> <size> <out> <reference vram>`. Captures in build/ref/capture*
 match exactly for the 2D lists and the top 3D pass (2 px), bottom 3D pass differs only by lighting.
-Helpers: `tools/dump_framebuffer.py`, `tools/dump_texture.py`, `tools/make_cxi.py`.
+Helpers: `tools/dump_framebuffer.py`, `tools/dump_texture.py`, `extract/make_cxi.py`.
 
 Debug switches: `RB_FLAT=1` one flat colour per draw call; `RB_PICA_LOG=n` and `RB_PICA_LOG_FROM=k` log draws
 k+1..k+n with clip extents, rejected fragments and bone matrices; `RB_PICA_DUMP=n` writes the shader and
@@ -154,14 +158,14 @@ procedural textures, geometry shaders, input, audio.
 
 Hand-written code (the video decoder around 0x363000-0x372000) uses jump tables of self-relative offsets,
 hand-made return addresses built in one or two steps, and returns into the middle of other functions.
-The recompiler compiles `add pc, rX, rTable` tables as switches; `tools/find_pointer_functions.py` adds
+The recompiler compiles `add pc, rX, rTable` tables as switches; `analyze/find_pointer_functions.py` adds
 table targets, two-step addresses and missed prologues as entries; a call that comes back to an
 unexpected known address continues there (`recomp_continue`). GE flags and SEL are implemented.
 
 System data the game needs besides its own dump (all under `game/sysarchives/`):
 - `0004009b00010202.romfs`: shared Mii data, from the user's console. In place.
 - `shared_font.bin`: the shared system font image. Currently a STAND-IN made from the game's own font:
-      python3 tools/make_shared_font.py game/romfs.bin game/sysarchives/shared_font.bin font/ALL/CommonStd.bcfnt.cmp
+      python3 extract/make_shared_font.py game/romfs.bin game/sysarchives/shared_font.bin font/ALL/CommonStd.bcfnt.cmp
   For the real one, run the same tool on the font system archive from the console (title 0004009b00014002).
   Without any font file the runtime stops with a clear error; an empty font crashes the game.
 - `0004009b00010602.romfs`: requested once, not supplied; the game carries on without it so far.
@@ -187,7 +191,7 @@ emulator; enhancements never change game timing (virtual clock); per-game data b
 - Stubbed and answering "success" during boot: act:u (accounts), boss:U (SpotPass), nfc:u, cecd:u (StreetPass),
   cfg:u commands 0x8 and 0xa, APT command 0x58, fs DeleteExtSaveData. Config blocks 00170000 and 000c0000 return zeros.
 - Shared extra data f000000b is created empty; the game creates CFL_DB.dat and gamecoin.dat in it itself.
-- The function lists `recomp/functions_rea.txt` and `recomp/functions_extra.txt` are Robobot data stored in the
+- The function lists `games/<title id>/functions_rea.txt` and `games/<title id>/functions_extra.txt` are Robobot data stored in the
   tool folder; for the general tool they belong in per-game storage.
 - `game/missing_functions.txt` only records misses from indirect calls and unknown direct branches. A computed
   jump (`IJUMP`) to an unknown address inside .text is treated as a return to an outer frame and not recorded,
