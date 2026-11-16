@@ -28,6 +28,11 @@ Defaults: WASD circle pad, arrow keys d-pad, I/J/K/L = X/Y/B/A (a diamond like t
 Hotkeys: F1 next layout (stacked, large top, top only, side by side), F2 swap screens, F3 show the bottom
 screen in top-only mode, F11 fullscreen, F12 screenshot, Escape quit. `RB_INPUT` scripts input for tests.
 
+## Robobot controls (games/0004000000183600.toml)
+WASD move (double-tap to dash) · Space jump/hover · J inhale/attack/armor punch · K drop ability / reset specs ·
+L use Assist Star · Left Shift or Q guard (+direction dodge) · E = R · Enter pause · Backspace select · arrows d-pad ·
+S+Space slide · Tab fast-forward · F5/F6 amiibo tap/remove. A control can list several keys: `l = "Left Shift, Q"`.
+
 ## Settings layers and command line
 `games/<title id>.toml` holds per-game defaults (Robobot: large-top layout); your `settings.toml` overrides them, and
 command-line flags override both: `./build/robobot game --scale 2 --layout stacked --set video.texture_filter=linear`

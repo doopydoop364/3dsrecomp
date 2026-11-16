@@ -29,25 +29,38 @@ static const struct { const char *name, *def; uint32_t bit; } binds_def[] = {
     { "dpad_up", "Up", BTN_UP }, { "dpad_down", "Down", BTN_DOWN }, { "dpad_left", "Left", BTN_LEFT }, { "dpad_right", "Right", BTN_RIGHT },
     { "circle_up", "W", 0 }, { "circle_down", "S", 0 }, { "circle_left", "A", 0 }, { "circle_right", "D", 0 } };
 #define NBINDS (sizeof binds_def / sizeof *binds_def)
-static SDL_Scancode binds[NBINDS];
+#define NALT 4                                          /* keys per control: "Left Shift, Q" binds both */
+static SDL_Scancode binds[NBINDS][NALT];
 static void load_binds(void) {
     for (unsigned i = 0; i < NBINDS; i++) {
         char key[64]; snprintf(key, sizeof key, "controls.%s", binds_def[i].name);
-        const char *name = settings_get(key, binds_def[i].def);
-        binds[i] = SDL_GetScancodeFromName(name);
-        if (binds[i] == SDL_SCANCODE_UNKNOWN) { fprintf(stderr, "settings: unknown key name '%s' for %s, using %s\n", name, key, binds_def[i].def); binds[i] = SDL_GetScancodeFromName(binds_def[i].def); }
+        char list[64]; snprintf(list, sizeof list, "%s", settings_get(key, binds_def[i].def));
+        int n = 0;
+        for (char *t = strtok(list, ","); t && n < NALT; t = strtok(0, ",")) {
+            while (*t == ' ') t++;
+            char *e = t + strlen(t); while (e > t && e[-1] == ' ') *--e = 0;
+            SDL_Scancode sc = SDL_GetScancodeFromName(t);
+            if (sc == SDL_SCANCODE_UNKNOWN) fprintf(stderr, "settings: unknown key name '%s' for %s\n", t, key);
+            else binds[i][n++] = sc;
+        }
+        if (!n) binds[i][n++] = SDL_GetScancodeFromName(binds_def[i].def);
+        while (n < NALT) binds[i][n++] = SDL_SCANCODE_UNKNOWN;
     }
+}
+static int bind_down(const bool *k, unsigned i) {
+    for (int j = 0; j < NALT; j++) if (binds[i][j] != SDL_SCANCODE_UNKNOWN && k[binds[i][j]]) return 1;
+    return 0;
 }
 
 static void poll_host_input(void) {
     InputState s; memset(&s, 0, sizeof s);
     const bool *k = SDL_GetKeyboardState(0);
-    for (unsigned i = 0; i < 12; i++) if (k[binds[i]]) s.buttons |= binds_def[i].bit;
+    for (unsigned i = 0; i < 12; i++) if (bind_down(k, i)) s.buttons |= binds_def[i].bit;
     int cx = 0, cy = 0;
-    if (k[binds[12]]) cy += 154;
-    if (k[binds[13]]) cy -= 154;
-    if (k[binds[14]]) cx -= 154;
-    if (k[binds[15]]) cx += 154;
+    if (bind_down(k, 12)) cy += 154;
+    if (bind_down(k, 13)) cy -= 154;
+    if (bind_down(k, 14)) cx -= 154;
+    if (bind_down(k, 15)) cx += 154;
     if (pad) {                                         /* positional (Nintendo) layout: east = A, south = B */
         static const struct { SDL_GamepadButton b; uint32_t bit; } pb[] = {
             { SDL_GAMEPAD_BUTTON_EAST, BTN_A }, { SDL_GAMEPAD_BUTTON_SOUTH, BTN_B }, { SDL_GAMEPAD_BUTTON_NORTH, BTN_X },

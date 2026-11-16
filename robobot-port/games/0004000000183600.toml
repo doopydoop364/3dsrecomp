@@ -14,3 +14,19 @@ not_code = [0x2eb3b4, 0x48db68]    # strings that scans mistake for code (found 
 # ---- PC defaults for this game (the user's settings.toml and command-line flags override these) ----
 [video]
 layout = "large_top"   # the bottom screen is mostly menus here: show it as a corner overlay (F1 cycles layouts)
+
+# Keyboard layout tuned for Robobot (manual: A jump/hover, B inhale/attack/armor punch, X drop ability / reset specs,
+# Y use Assist Star, L or R guard + direction to dodge, Start pause; Down + A slides; double-tap a direction to dash).
+[controls]
+a = "Space"              # jump, hold or tap in the air to hover
+b = "J"                  # inhale / spit / attack; Robobot Armor punch (mash for a slam)
+x = "K"                  # drop copy ability; armor: reset specs
+y = "L"                  # use the Assist Star item
+l = "Left Shift, Q"      # guard (with a direction: dodge; in the air: air dodge)
+r = "E"
+start = "Return"         # pause
+select = "Backspace"
+circle_up = "W"
+circle_down = "S"
+circle_left = "A"
+circle_right = "D"
