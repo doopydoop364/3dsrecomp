@@ -33,3 +33,17 @@ Ludo.guide (stage 1-1 walkthrough, controls & copy abilities), Nintendo's electr
 ## Not yet confirmed from sources
 - Exact input to enter a tube (walking into it vs pressing a direction) and Warp Stars (touching them).
 - What looks normal on screen at each transition; compare with real footage before calling a bug.
+
+## Bottom screen during stages (manual, "Stage Screen")
+- Current copy ability / specs, health, lives; **amiibo icon** (touch to use an amiibo; appears only after progressing
+  some way through the story); Code Cubes found; stars; **Miiverse icon** (the green figures button, top right);
+  current Assist Star item (touch to use). "Drop Ability" and "Pause" are buttons too.
+
+## amiibo (manual, "amiibo Inhale" and "About amiibo")
+- Unlocked after progressing through the game: the amiibo icon appears on the touch screen; touch it, then tap an amiibo
+  and Kirby inhales it for an item and a copy ability (not while in the Robobot Armor; up to ten per stage).
+- Kirby, Meta Knight and King Dedede amiibo give better items and special-design abilities; other series map to
+  abilities (e.g. Smash Bros. Kirby; Meta Knight/Link/Marth Sword; King Dedede Hammer; Mario/Luigi Fire; Peach Parasol...).
+- New 3DS reads amiibo under the touch screen; older models need the NFC Reader/Writer accessory.
+- Port: nfc:u in runtime/nfc.c; amiibo .bin dumps in <game>/amiibo/, F5 taps the next one, F6 removes it.
+  Not yet verified in-game (our test save has not unlocked the icon).

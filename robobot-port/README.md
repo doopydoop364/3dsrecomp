@@ -50,6 +50,13 @@ library itself must be installed, since the binary links it; loading it at runti
 - Not done yet: Vulkan presentation (the window still uses SDL's renderer, so full-resolution frames are read back),
   CPU/GPU overlap, GPU-side display transfers.
 
+## amiibo
+Put amiibo dumps (540-byte `.bin` files read from your figures) in `game/amiibo/`. When the game asks for an amiibo,
+F5 taps the next one and F6 takes it away (it is also removed 3 seconds after the game stops reading it, as in Azahar).
+The game gets the figure's ID and serial number, which need no console keys; the figure's own save area is not
+available, and nothing is written back to the file. In Robobot the amiibo icon appears only after some story progress.
+Not yet tested in-game.
+
 ## Audio
 `runtime/dsp.c` decodes the game's 24 DSP voices (PCM8, PCM16, DSP-ADPCM), resamples them linearly, mixes the three
 intermediate mixes down to stereo and reports voice status back to the game; `runtime/audio.c` plays it through SDL at

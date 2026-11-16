@@ -6,6 +6,7 @@
 #include "input.h"
 #include "settings.h"
 #include "vkr.h"
+void nfc_host_tap(void); void nfc_host_remove(void);   /* nfc.c */
 
 #define OUT_W 400
 #define OUT_H 480
@@ -212,6 +213,8 @@ void video_frame(uint64_t frame, const uint8_t *top, uint32_t top_stride, uint32
         if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat) {
             if (e.key.key == SDLK_F1) layout = (layout + 1) % L_COUNT;
             if (e.key.key == SDLK_F2) swapped = !swapped;
+            if (e.key.key == SDLK_F5) nfc_host_tap();             /* amiibo: tap the next dump from <game>/amiibo */
+            if (e.key.key == SDLK_F6) nfc_host_remove();
             if (e.key.key == SDLK_F11) SDL_SetWindowFullscreen(win, !(SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN));
             if (e.key.key == SDLK_F12) { char p[64]; snprintf(p, sizeof p, "screenshot_%06llu.png", (unsigned long long)frame);
                                          if (hi) write_png_buf(p, frame_hi, OUT_W * hi_scale, OUT_H * hi_scale); else write_png(p); }
