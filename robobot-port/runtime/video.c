@@ -4,31 +4,47 @@
 #include <SDL3/SDL.h>
 #include <zlib.h>
 #include "input.h"
+#include "settings.h"
 
 #define OUT_W 400
 #define OUT_H 480
 static SDL_Window *win;
 static SDL_Renderer *ren;
-static SDL_Texture *tex;
 static uint8_t frame_rgba[OUT_W * OUT_H * 4];
 static int headless;
 static uint64_t shots[16]; static int nshots;
 static SDL_Gamepad *pad;
+static SDL_Texture *tex_top, *tex_bot;
+enum { L_STACKED, L_LARGE_TOP, L_TOP_ONLY, L_SIDE, L_COUNT };
+static int layout, swapped;
+static SDL_FRect r_top, r_bot;                         /* where each screen is drawn, in window pixels */
 
-/* Keyboard defaults: WASD circle pad, arrows D-pad, K/J/I/U = A/B/X/Y, Q/E = L/R, Enter Start, Backspace Select. */
+/* Controls from settings.toml [controls]; defaults follow the usual 3DS emulator layout. */
+static const struct { const char *name, *def; uint32_t bit; } binds_def[] = {
+    { "a", "X", BTN_A }, { "b", "Z", BTN_B }, { "x", "S", BTN_X }, { "y", "A", BTN_Y }, { "l", "Q", BTN_L }, { "r", "W", BTN_R },
+    { "start", "Return", BTN_START }, { "select", "Backspace", BTN_SELECT },
+    { "dpad_up", "I", BTN_UP }, { "dpad_down", "K", BTN_DOWN }, { "dpad_left", "J", BTN_LEFT }, { "dpad_right", "L", BTN_RIGHT },
+    { "circle_up", "Up", 0 }, { "circle_down", "Down", 0 }, { "circle_left", "Left", 0 }, { "circle_right", "Right", 0 } };
+#define NBINDS (sizeof binds_def / sizeof *binds_def)
+static SDL_Scancode binds[NBINDS];
+static void load_binds(void) {
+    for (unsigned i = 0; i < NBINDS; i++) {
+        char key[64]; snprintf(key, sizeof key, "controls.%s", binds_def[i].name);
+        const char *name = settings_get(key, binds_def[i].def);
+        binds[i] = SDL_GetScancodeFromName(name);
+        if (binds[i] == SDL_SCANCODE_UNKNOWN) { fprintf(stderr, "settings: unknown key name '%s' for %s, using %s\n", name, key, binds_def[i].def); binds[i] = SDL_GetScancodeFromName(binds_def[i].def); }
+    }
+}
+
 static void poll_host_input(void) {
     InputState s; memset(&s, 0, sizeof s);
     const bool *k = SDL_GetKeyboardState(0);
-    static const struct { SDL_Scancode key; uint32_t bit; } keys[] = {
-        { SDL_SCANCODE_K, BTN_A }, { SDL_SCANCODE_J, BTN_B }, { SDL_SCANCODE_I, BTN_X }, { SDL_SCANCODE_U, BTN_Y },
-        { SDL_SCANCODE_Q, BTN_L }, { SDL_SCANCODE_E, BTN_R }, { SDL_SCANCODE_RETURN, BTN_START }, { SDL_SCANCODE_BACKSPACE, BTN_SELECT },
-        { SDL_SCANCODE_UP, BTN_UP }, { SDL_SCANCODE_DOWN, BTN_DOWN }, { SDL_SCANCODE_LEFT, BTN_LEFT }, { SDL_SCANCODE_RIGHT, BTN_RIGHT } };
-    for (unsigned i = 0; i < sizeof keys / sizeof *keys; i++) if (k[keys[i].key]) s.buttons |= keys[i].bit;
+    for (unsigned i = 0; i < 12; i++) if (k[binds[i]]) s.buttons |= binds_def[i].bit;
     int cx = 0, cy = 0;
-    if (k[SDL_SCANCODE_A]) cx -= 154;
-    if (k[SDL_SCANCODE_D]) cx += 154;
-    if (k[SDL_SCANCODE_W]) cy += 154;
-    if (k[SDL_SCANCODE_S]) cy -= 154;
+    if (k[binds[12]]) cy += 154;
+    if (k[binds[13]]) cy -= 154;
+    if (k[binds[14]]) cx -= 154;
+    if (k[binds[15]]) cx += 154;
     if (pad) {                                         /* positional (Nintendo) layout: east = A, south = B */
         static const struct { SDL_GamepadButton b; uint32_t bit; } pb[] = {
             { SDL_GAMEPAD_BUTTON_EAST, BTN_A }, { SDL_GAMEPAD_BUTTON_SOUTH, BTN_B }, { SDL_GAMEPAD_BUTTON_NORTH, BTN_X },
@@ -41,13 +57,37 @@ static void poll_host_input(void) {
     }
     s.cx = (int16_t)(cx < -154 ? -154 : cx > 154 ? 154 : cx); s.cy = (int16_t)(cy < -154 ? -154 : cy > 154 ? 154 : cy);
     float mx, my;
-    if (SDL_GetMouseState(&mx, &my) & SDL_BUTTON_LMASK) {   /* stylus: left mouse button on the bottom screen */
-        float lx, ly;
-        SDL_RenderCoordinatesFromWindow(ren, mx, my, &lx, &ly);
-        int bx = (int)lx - 40, by = (int)ly - 240;
+    if (r_bot.w > 0 && (SDL_GetMouseState(&mx, &my) & SDL_BUTTON_LMASK)) {   /* stylus: left mouse on the bottom screen */
+        float bx = (mx - r_bot.x) * 320.0f / r_bot.w, by = (my - r_bot.y) * 240.0f / r_bot.h;
         if (bx >= 0 && bx < 320 && by >= 0 && by < 240) { s.touch = 1; s.tx = (uint16_t)bx; s.ty = (uint16_t)by; }
     }
     input_set_host(&s);
+}
+
+/* Place the screens for the current layout in a window of size w x h, keeping 3DS proportions. */
+static SDL_FRect fit(float x, float y, float w, float h, float sw, float sh) {
+    float sc = w / sw < h / sh ? w / sw : h / sh;
+    SDL_FRect r = { x + (w - sw * sc) / 2, y + (h - sh * sc) / 2, sw * sc, sh * sc };
+    return r;
+}
+static void place_screens(int w, int h, int show_bottom) {
+    float W = (float)w, H = (float)h;
+    SDL_FRect none = { 0, 0, 0, 0 };
+    switch (layout) {
+    case L_STACKED: { SDL_FRect all = fit(0, 0, W, H, 400, 480);
+        float sc = all.w / 400; r_top = (SDL_FRect){ all.x, all.y, 400 * sc, 240 * sc };
+        r_bot = (SDL_FRect){ all.x + 40 * sc, all.y + 240 * sc, 320 * sc, 240 * sc }; break; }
+    case L_SIDE: { SDL_FRect all = fit(0, 0, W, H, 720, 240);
+        float sc = all.w / 720; r_top = (SDL_FRect){ all.x, all.y, 400 * sc, 240 * sc };
+        r_bot = (SDL_FRect){ all.x + 400 * sc, all.y, 320 * sc, 240 * sc }; break; }
+    case L_LARGE_TOP: { r_top = fit(0, 0, W, H, 400, 240);
+        float bw = r_top.w * 0.3f, bh = bw * 0.75f;      /* bottom screen as a corner overlay */
+        r_bot = (SDL_FRect){ r_top.x + r_top.w - bw, r_top.y + r_top.h - bh, bw, bh }; break; }
+    default: r_top = fit(0, 0, W, H, 400, 240); r_bot = show_bottom ? fit(W * 0.2f, H * 0.2f, W * 0.6f, H * 0.6f, 320, 240) : none;
+    }
+    if (swapped && layout != L_TOP_ONLY) {              /* swap which screen gets which place (sizes follow the place) */
+        SDL_FRect t = r_top; r_top = r_bot; r_bot = t;
+    }
 }
 
 void video_init(const char *title) {
@@ -58,10 +98,15 @@ void video_init(const char *title) {
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) { fprintf(stderr, "SDL video is not available (%s), running without a window\n", SDL_GetError()); headless = 1; return; }
     win = SDL_CreateWindow(title, OUT_W * 2, OUT_H * 2, SDL_WINDOW_RESIZABLE);
     ren = win ? SDL_CreateRenderer(win, 0) : 0;
-    tex = ren ? SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, OUT_W, OUT_H) : 0;
-    if (!tex) fatal("cannot create the window: %s", SDL_GetError());
-    SDL_SetTextureScaleMode(tex, SDL_SCALEMODE_NEAREST);
-    SDL_SetRenderLogicalPresentation(ren, OUT_W, OUT_H, SDL_LOGICAL_PRESENTATION_LETTERBOX);
+    tex_top = ren ? SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, 400, 240) : 0;
+    tex_bot = ren ? SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, 320, 240) : 0;
+    if (!tex_top || !tex_bot) fatal("cannot create the window: %s", SDL_GetError());
+    SDL_SetTextureScaleMode(tex_top, SDL_SCALEMODE_NEAREST); SDL_SetTextureScaleMode(tex_bot, SDL_SCALEMODE_NEAREST);
+    load_binds();
+    const char *lname = settings_get("video.layout", "stacked");
+    static const char *lnames[L_COUNT] = { "stacked", "large_top", "top_only", "side_by_side" };
+    for (int i = 0; i < L_COUNT; i++) if (!strcmp(lname, lnames[i])) layout = i;
+    if (settings_int("video.fullscreen", 0)) SDL_SetWindowFullscreen(win, true);
 }
 
 /* LCD framebuffers are stored rotated: 240 pixels per memory row, one memory row per screen column. */
@@ -121,10 +166,24 @@ void video_frame(uint64_t frame, const uint8_t *top, uint32_t top_stride, uint32
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
         if (e.type == SDL_EVENT_QUIT || (e.type == SDL_EVENT_KEY_DOWN && e.key.key == SDLK_ESCAPE)) { fprintf(stderr, "window closed\n"); exit(0); }
+        if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat) {
+            if (e.key.key == SDLK_F1) layout = (layout + 1) % L_COUNT;
+            if (e.key.key == SDLK_F2) swapped = !swapped;
+            if (e.key.key == SDLK_F11) SDL_SetWindowFullscreen(win, !(SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN));
+            if (e.key.key == SDLK_F12) { char p[64]; snprintf(p, sizeof p, "screenshot_%06llu.png", (unsigned long long)frame); write_png(p); }
+        }
         if (e.type == SDL_EVENT_GAMEPAD_ADDED && !pad) { pad = SDL_OpenGamepad(e.gdevice.which); if (pad) fprintf(stderr, "gamepad: %s\n", SDL_GetGamepadName(pad)); }
         if (e.type == SDL_EVENT_GAMEPAD_REMOVED && pad && e.gdevice.which == SDL_GetGamepadID(pad)) { SDL_CloseGamepad(pad); pad = 0; }
     }
+    int w, h;
+    SDL_GetWindowSizeInPixels(win, &w, &h);
+    place_screens(w, h, SDL_GetKeyboardState(0)[SDL_SCANCODE_F3]);
     poll_host_input();
-    SDL_UpdateTexture(tex, 0, frame_rgba, OUT_W * 4);
-    SDL_RenderClear(ren); SDL_RenderTexture(ren, tex, 0, 0); SDL_RenderPresent(ren);
+    SDL_UpdateTexture(tex_top, 0, frame_rgba, OUT_W * 4);
+    SDL_UpdateTexture(tex_bot, 0, frame_rgba + ((size_t)240 * OUT_W + 40) * 4, OUT_W * 4);
+    SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+    SDL_RenderClear(ren);
+    if (r_top.w > 0) SDL_RenderTexture(ren, tex_top, 0, &r_top);
+    if (r_bot.w > 0) SDL_RenderTexture(ren, tex_bot, 0, &r_bot);
+    SDL_RenderPresent(ren);
 }

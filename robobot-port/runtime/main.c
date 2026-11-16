@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #include "host.h"
 #include "input.h"
+#include "settings.h"
 #include <signal.h>
 #include <sys/mman.h>
 #include <time.h>
@@ -79,6 +80,7 @@ int main(int argc, char **argv) {
     signal(SIGTERM, on_stop); signal(SIGINT, on_stop);
     sigaction(SIGSEGV, &sa, 0); sigaction(SIGBUS, &sa, 0); sigaction(SIGFPE, &sa, 0); sigaction(SIGILL, &sa, 0);
 
+    settings_load();
     video_init("robobot-port");
     input_init();
     services_init(dir);

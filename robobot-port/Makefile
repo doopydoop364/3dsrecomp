@@ -18,7 +18,7 @@ $(OBJ):
 build/runner: tests/runner.c runtime/vfp.c runtime/recomp.h $(OBJS)
 	$(CC) -O1 -g -Iruntime -I$(GEN) tests/runner.c runtime/vfp.c $(OBJS) -o $@ -lz -lm
 
-RT := runtime/kernel.c runtime/services.c runtime/gpu.c runtime/pica.c runtime/pica_shader.c runtime/video.c runtime/input.c runtime/main.c runtime/vfp.c
+RT := runtime/kernel.c runtime/services.c runtime/gpu.c runtime/pica.c runtime/pica_shader.c runtime/video.c runtime/input.c runtime/settings.c runtime/main.c runtime/vfp.c
 build/robobot: $(RT) runtime/host.h runtime/pica.h runtime/recomp.h $(OBJS)
 	$(CC) -O3 -g -Wall -Iruntime -I$(GEN) $(shell pkg-config --cflags sdl3) $(RT) $(OBJS) -o $@ $(shell pkg-config --libs sdl3) -lz -lm
 

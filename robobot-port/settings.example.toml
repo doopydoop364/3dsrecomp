@@ -1,0 +1,33 @@
+# Copy to settings.toml (in the folder you run the game from) and edit.
+# Key names are SDL key names: letters, "Up", "Down", "Left", "Right", "Return", "Backspace",
+# "Space", "Left Shift", "Right Shift", "Tab", "1".."9", "F1".. and so on.
+
+[controls]
+# face buttons sit like the 3DS: Y left, X top, A right, B bottom
+a = "X"
+b = "Z"
+x = "S"
+y = "A"
+l = "Q"
+r = "W"
+start = "Return"
+select = "Backspace"
+# circle pad (movement)
+circle_up = "Up"
+circle_down = "Down"
+circle_left = "Left"
+circle_right = "Right"
+# d-pad
+dpad_up = "I"
+dpad_down = "K"
+dpad_left = "J"
+dpad_right = "L"
+
+[video]
+# stacked (like the console), large_top (bottom screen as a corner overlay),
+# top_only (bottom screen shown while F3 is held), side_by_side
+layout = "stacked"
+fullscreen = false
+
+# Hotkeys: F1 next layout, F2 swap screens, F3 show bottom screen (top_only), F11 fullscreen,
+# F12 screenshot, Escape quit. Gamepads use the Nintendo button positions automatically.

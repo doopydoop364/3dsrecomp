@@ -21,6 +21,13 @@ from your own dump in `game/` and is never committed (this folder is git-exclude
     make -j12
     .venv/bin/python tests/difftest.py --variants 6 --seed 1
 
+## Controls and settings
+Copy `settings.example.toml` to `settings.toml` in the folder you run from (or point `RB_SETTINGS` at it).
+Defaults: arrow keys circle pad, X/Z = A/B, S/A = X/Y, Q/W = L/R, I/J/K/L d-pad, Enter Start,
+Backspace Select; gamepads by Nintendo button position; left mouse on the bottom screen is the stylus.
+Hotkeys: F1 next layout (stacked, large top, top only, side by side), F2 swap screens, F3 show the bottom
+screen in top-only mode, F11 fullscreen, F12 screenshot, Escape quit. `RB_INPUT` scripts input for tests.
+
 ## Rule for new code
 No address or size of a specific game in `.c`, `.h` or `.py` files. Layout comes from the ExHeader
 (`layout.h` for C code), idioms from detectors, and anything a person decides goes in `games/<id>.toml`.
