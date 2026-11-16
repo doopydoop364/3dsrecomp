@@ -141,7 +141,7 @@ static void run_queue(void) {
             if (c[1]) irq(IRQ_PSC0); else if (c[4]) irq(IRQ_PSC1);
             break;
         case 3: { uint32_t ib = bpp_of[(c[5] >> 8) & 7], ob = bpp_of[(c[5] >> 12) & 7];
-                  if (vkr_display_link(c[1], c[2], c[3] & 0xffff, c[3] >> 16, c[5])) { irq(IRQ_PPF); break; }   /* shown from the GPU */
+                  if (vkr_display_link(c[1], c[2], c[3] & 0xffff, c[3] >> 16, c[4] & 0xffff, c[4] >> 16, c[5])) { irq(IRQ_PPF); break; }   /* shown from the GPU */
                   vkr_why = 3; vkr_sync_range(c[1], (c[3] & 0xffff) * (c[3] >> 16) * ib, 0); vkr_why = 3; vkr_sync_range(c[2], (c[4] & 0xffff) * (c[4] >> 16) * ob, 1); }
                 { uint64_t t0 = host_ns(); display_transfer(c[1], c[2], c[3], c[4], c[5]); ns_transfer += host_ns() - t0; irq(IRQ_PPF); break; }
         case 4: { uint32_t span = c[3] * 2 + 0x100000; vkr_why = 4; vkr_sync_range(c[1], span, 0); vkr_why = 4; vkr_sync_range(c[2], span, 1); }   /* gaps: generous span */

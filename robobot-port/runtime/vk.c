@@ -58,7 +58,7 @@ static int (*mk_surface)(void *instance, uint64_t *surface);
 static VkSurfaceKHR vsurf;
 static int presenting, init_done;
 
-static uint64_t t_wait, t_fin, t_tex, t_pipe;   /* t_pipe: time building pipeline variants */
+static uint64_t t_wait, t_fin, t_tex, t_pipe, nskipped;   /* t_pipe: time building pipeline variants */
 static VkPipelineCache pcache;
 uint64_t gpu_frame(void);
 static uint64_t vns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
@@ -385,7 +385,10 @@ void vkr_sync_range(uint32_t addr, uint32_t size, int will_write) {
     for (int i = 0; i < NSURF; i++) {
         Surf *s = &surf[i];
         if (!s->used || !overlaps(addr, size, s->addr, s->size)) continue;
-        if (s->dirty) { queue_download(s); any = 1; dl_by[why]++; }
+        if (s->dirty) { queue_download(s); any = 1; dl_by[why]++;
+            static int ls = -1; if (ls < 0) ls = getenv("RB_LOG_SYNC") != 0;
+            if (ls) fprintf(stderr, "sync: frame %llu cause %d range %08x+%x surface %08x %ux%u fmt %u%s\n", (unsigned long long)gpu_frame(), why,
+                            addr, size, s->addr, s->w, s->h, s->fmt, s->depth ? " depth" : ""); }
         if (will_write) s->checked = 0;
     }
     if (any) { submit_wait(); nsyncs++; sync_by[why]++; }
@@ -719,9 +722,9 @@ void vkr_frame(void) {
     static uint64_t frames;
     if (++frames % 300 == 0) {
         LOG(1, "vulkan: GPU wait %.2f s, write-back %.2f s, textures %.2f s, pipeline builds %.2f s, stale texture catches %llu", t_wait / 1e9, t_fin / 1e9, t_tex / 1e9, t_pipe / 1e9, (unsigned long long)nstale);
-        LOG(1, "vulkan: %llu submissions, %llu sync points, %llu surface downloads, %llu surface uploads, %llu texture uploads, %d pipelines",
+        LOG(1, "vulkan: %llu submissions, %llu sync points, %llu surface downloads, %llu surface uploads, %llu texture uploads, %d pipelines, %llu frames not presented",
             (unsigned long long)nsubmits, (unsigned long long)nsyncs, (unsigned long long)ndownloads, (unsigned long long)nuploads,
-            (unsigned long long)ntexuploads, npipes);
+            (unsigned long long)ntexuploads, npipes, (unsigned long long)nskipped);
     }
 }
 
@@ -729,24 +732,41 @@ void vkr_frame(void) {
  * remembered, so the window can show that surface at the render scale instead of the native copy ---- */
 typedef struct { uint32_t in, out, w, h; int flip; } Link;
 static Link links[8]; static int nlinks;
-static void disp_snapshot(Surf *s, uint32_t out, int flip);
+static void disp_snapshot(Surf *s, uint32_t out, int flip, uint32_t y0, uint32_t rows);
 static void disp_invalidate(uint32_t out);
-int vkr_display_link(uint32_t in, uint32_t out, uint32_t iw, uint32_t ih, uint32_t flags) {
+int vkr_display_link(uint32_t in, uint32_t out, uint32_t iw, uint32_t ih, uint32_t ow, uint32_t oh, uint32_t flags) {
     if (!vkr_on || (scale == 1 && !presenting)) return 0;
     if (presenting) disp_invalidate(out);
     int plain = !((flags >> 24) & 3) && !((flags >> 1) & 1);          /* no downscaling, tiled input */
     for (int i = 0; i < nlinks; i++) if (links[i].out == out) { links[i] = links[--nlinks]; break; }
-    if (!plain) return 0;
-    for (int i = 0; i < NSURF; i++) {
-        Surf *s = &surf[i];
-        if (s->used && !s->depth && s->addr == in && s->w == iw && s->h == ih) {
-            if (presenting) { disp_snapshot(s, out, (int)(flags & 1)); return !getenv("RB_DISPLAY_COPY"); }   /* the window samples
-                                                                          the GPU copy: the CPU copy is skipped */
-            s->display = 1;
-            if (nlinks == 8) links[0] = links[--nlinks];
-            links[nlinks++] = (Link){ in, out, iw, ih, (int)(flags & 1) };
-            return 0;
+    /* The source may be a whole rendered surface, or tile-row-aligned rows inside one (some games render both screens
+     * into one buffer and transfer each part). Memory row r holds PICA y = h-1-r. */
+    Surf *src = 0; uint32_t row0 = 0, rows = oh ? oh : ih;
+    if (plain)
+        for (int i = 0; i < NSURF && !src; i++) {
+            Surf *s = &surf[i];
+            if (!s->used || s->depth || s->w != iw || in < s->addr || in >= s->addr + s->size) continue;
+            uint32_t rowb = s->w * cbpp[s->fmt], off = in - s->addr;
+            if (off % (rowb * 8) || off / rowb + rows > s->h) continue;
+            src = s; row0 = off / rowb;
         }
+    if (presenting) {                                              /* why a transfer still goes through the CPU (log once each) */
+        static uint32_t seen[16][3]; static int nseen;
+        int known = 0; for (int i = 0; i < nseen; i++) if (seen[i][0] == in && seen[i][1] == out && seen[i][2] == flags) known = 1;
+        if (!known && nseen < 16 && !src && gen > 1000) {
+            seen[nseen][0] = in; seen[nseen][1] = out; seen[nseen][2] = flags; nseen++;
+            LOG(1, "vulkan: display transfer %08x -> %08x (%ux%u -> %ux%u, flags %08x) goes through the CPU: %s", in, out, iw, ih, ow, oh, flags,
+                !plain ? "scaled or linear input" : "source is not a rendered surface");
+        }
+    }
+    if (!src) return 0;
+    uint32_t y0 = src->h - row0 - rows;                            /* PICA y of the lowest row taken */
+    if (presenting) { disp_snapshot(src, out, (int)(flags & 1), y0, rows); return !getenv("RB_DISPLAY_COPY"); }   /* the window samples
+                                                                          the GPU copy: the CPU copy is skipped */
+    if (row0 == 0 && rows == src->h) {                             /* full-resolution readback path (SDL window) */
+        src->display = 1;
+        if (nlinks == 8) links[0] = links[--nlinks];
+        links[nlinks++] = (Link){ in, out, iw, ih, (int)(flags & 1) };
     }
     return 0;
 }
@@ -770,34 +790,41 @@ const uint8_t *vkr_hires(uint32_t out, uint32_t want_h, uint32_t *w, uint32_t *h
  * per-output display image: a snapshot, so later rendering into the same target cannot show early. vkr_present
  * draws each screen from its snapshot (or from the native image the CPU composed, when there is none), then the
  * overlay (menu, FPS) with alpha, into the swapchain. Present never waits for the monitor (MAILBOX or IMMEDIATE). */
-typedef struct { uint32_t out, w, h; int flip, valid; Img im; } Disp;
-static Disp disp[4];
-static void disp_invalidate(uint32_t out) { for (int i = 0; i < 4; i++) if (disp[i].out == out) disp[i].valid = 0; }
-static void disp_snapshot(Surf *s, uint32_t out, int flip) {
+#define NDISP 8                                            /* screens x double buffers x stereo eyes */
+typedef struct { uint32_t out, w, h; int flip, valid; uint64_t last; Img im; } Disp;
+static Disp disp[NDISP]; static uint64_t disp_clock;
+static void disp_invalidate(uint32_t out) { for (int i = 0; i < NDISP; i++) if (disp[i].out == out) disp[i].valid = 0; }
+static void disp_snapshot(Surf *s, uint32_t out, int flip, uint32_t y0, uint32_t rows) {
     Disp *d = 0;
-    for (int i = 0; i < 4 && !d; i++) if (disp[i].out == out) d = &disp[i];
-    for (int i = 0; i < 4 && !d; i++) if (!disp[i].im.img) d = &disp[i];
-    if (!d) d = &disp[0];
-    uint32_t W = s->w * scale, H = s->h * scale;
+    for (int i = 0; i < NDISP && !d; i++) if (disp[i].out == out) d = &disp[i];
+    for (int i = 0; i < NDISP && !d; i++) if (!disp[i].im.img) d = &disp[i];
+    if (!d) { d = &disp[0]; for (int i = 1; i < NDISP; i++) if (disp[i].last < d->last) d = &disp[i]; }   /* least recently used */
+    d->last = ++disp_clock;
+    uint32_t W = s->w * scale, H = rows * scale;                  /* rows y0..y0+rows of the surface (PICA y) */
     if (d->im.img && (d->w != W || d->h != H)) bury(&d->im);
     if (!d->im.img) mkimg(&d->im, W, H, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
     begin_cmd(); end_render(); barrier();
-    VkImageCopy c = { .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .extent = { W, H, 1 } };
+    VkImageCopy c = { .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .srcOffset = { 0, (int32_t)(y0 * scale), 0 },
+        .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .extent = { W, H, 1 } };
     vkCmdCopyImage(cmd, s->im.img, VK_IMAGE_LAYOUT_GENERAL, d->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
     barrier();
     d->out = out; d->w = W; d->h = H; d->flip = flip; d->valid = 1;
+    { static int ls = -1; if (ls < 0) ls = getenv("RB_LOG_SNAP") != 0;
+      if (ls) fprintf(stderr, "snap: frame %llu surface %08x -> out %08x rows %u..%u flip %d slot %d\n", (unsigned long long)gpu_frame(), s->addr, out, y0, y0 + rows, flip, (int)(d - disp)); }
 }
 
 static VkSwapchainKHR swap;
 static VkImage simg[8]; static VkImageView sview[8]; static uint32_t nsimg;
 static VkExtent2D sext; static VkFormat sfmt;
 static VkSemaphore rel_sem[8];
+static VkFence acq_fence; static int pend_idx = -1;   /* acquired image not yet free */
 static VkPipeline ppipe[2]; static VkPipelineLayout pplayout; static VkDescriptorSetLayout pdsl;
 static VkSampler lin_sampler;
 static Img nat[2], ovl; static uint32_t ovw, ovh; static int need_recreate;
 
 static void destroy_swapchain(void) {
     vkDeviceWaitIdle(dev);
+    if (pend_idx >= 0) { vkWaitForFences(dev, 1, &acq_fence, VK_TRUE, 100000000ull); vkResetFences(dev, 1, &acq_fence); pend_idx = -1; }
     for (uint32_t i = 0; i < nsimg; i++) { vkDestroyImageView(dev, sview[i], 0); vkDestroySemaphore(dev, rel_sem[i], 0); }
     nsimg = 0;
 }
@@ -906,26 +933,33 @@ void vkr_present(const VkrScreen scr[2], uint32_t win_w, uint32_t win_h, const u
         if (!create_swapchain(win_w, win_h)) return;
     }
     present_pipelines();
-    /* Submit the frame's rendering now, without waiting for a swapchain image: only the small present pass below
-     * waits for one (the compositor may hold images until its next refresh). */
-    if (recording) {
+    /* The GPU queue never waits for the compositor: a window image is requested without blocking and drawn into only
+     * once it is free (CPU-side fence check). Until then the frame's rendering is submitted on its own and the window
+     * keeps showing the previous frame. */
+    if (!acq_fence) { VkFenceCreateInfo fi = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO }; CHK(vkCreateFence(dev, &fi, 0, &acq_fence)); }
+    VkResult r = VK_SUCCESS;
+    if (pend_idx < 0) {
+        uint32_t i2;
+        r = vkAcquireNextImageKHR(dev, swap, 0, VK_NULL_HANDLE, acq_fence, &i2);
+        if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) { pend_idx = (int)i2; if (r == VK_SUBOPTIMAL_KHR) need_recreate = 1; }
+        else if (r != VK_NOT_READY && r != VK_TIMEOUT) { if (r != VK_ERROR_OUT_OF_DATE_KHR) LOG(1, "vulkan: acquire failed (%d)", r); need_recreate = 1; }
+    }
+    if (pend_idx < 0 || vkGetFenceStatus(dev, acq_fence) != VK_SUCCESS) {
+        nskipped++;
+        begin_cmd(); submit_async(VK_NULL_HANDLE, VK_NULL_HANDLE);     /* rendering only; present a later frame */
+        return;
+    }
+    CHK(vkResetFences(dev, 1, &acq_fence));
+    uint32_t idx = (uint32_t)pend_idx; pend_idx = -1;
+    VkSemaphore acq_sem = VK_NULL_HANDLE;
+    if (recording) {                                              /* rendering first, then the present pass */
         end_render();
         CHK(vkEndCommandBuffer(cmd));
         VkSubmitInfo gs = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmd };
         CHK(vkQueueSubmit(queue, 1, &gs, VK_NULL_HANDLE));
         recording = 0; nsubmits++;
-        VkCommandBuffer t = ctxs[cur_ctx].cb; ctxs[cur_ctx].cb = ctxs[cur_ctx].cb2; ctxs[cur_ctx].cb2 = t;   /* present pass next */
+        VkCommandBuffer t = ctxs[cur_ctx].cb; ctxs[cur_ctx].cb = ctxs[cur_ctx].cb2; ctxs[cur_ctx].cb2 = t;
     }
-    uint32_t idx;
-    VkSemaphore acq_sem = ctxs[cur_ctx].acq;
-    VkResult r = vkAcquireNextImageKHR(dev, swap, UINT64_MAX, acq_sem, VK_NULL_HANDLE, &idx);
-    if (r == VK_ERROR_OUT_OF_DATE_KHR || (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR)) {
-        if (r != VK_ERROR_OUT_OF_DATE_KHR) LOG(1, "vulkan: acquire failed (%d)", r);
-        need_recreate = 1;
-        CHK(vkQueueWaitIdle(queue));                              /* the submitted buffer must be idle before reuse */
-        return;
-    }
-    if (r == VK_SUBOPTIMAL_KHR) need_recreate = 1;
     begin_cmd(); end_render();
     static uint32_t nw[2], nh[2];
     for (int k = 0; k < 2; k++) if (scr[k].native) upload_rgba(&nat[k], &nw[k], &nh[k], scr[k].nw, 240, scr[k].native, scr[k].stride);
@@ -947,7 +981,7 @@ void vkr_present(const VkrScreen scr[2], uint32_t win_w, uint32_t win_h, const u
         if (k < 2) {
             if (scr[k].rect[2] <= 0) continue;
             Disp *d = 0;
-            for (int i = 0; i < 4; i++) if (disp[i].valid && disp[i].out == scr[k].fb && scr[k].fb) d = &disp[i];
+            for (int i = 0; i < NDISP; i++) if (disp[i].valid && disp[i].out == scr[k].fb && scr[k].fb) d = &disp[i];
             if (d && d->h == scr[k].nw * scale && d->w == 240 * scale) { view = d->im.view; pc[4] = 1; pc[5] = (float)d->flip; pc[6] = fxaa ? 1.0f : 0.0f; }
             else if (scr[k].native) { view = nat[k].view; pc[4] = 0; }
             else continue;

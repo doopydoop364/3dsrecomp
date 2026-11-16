@@ -556,6 +556,8 @@ void video_frame(uint64_t frame, const uint8_t *top, uint32_t top_stride, uint32
         cur_scr[1].fb = (uint32_t)(uintptr_t)bot; cur_scr[1].native = frame_rgba + ((size_t)240 * OUT_W + 40) * 4; cur_scr[1].nw = 320; cur_scr[1].stride = OUT_W * 4;
         float rr[2][4] = { { r_top.x, r_top.y, r_top.w, r_top.h }, { r_bot.x, r_bot.y, r_bot.w, r_bot.h } };
         for (int k = 0; k < 2; k++) memcpy(cur_scr[k].rect, rr[k], sizeof rr[k]);
+        { static int ls = -1; if (ls < 0) ls = getenv("RB_LOG_SNAP") != 0;
+          if (ls && frame % 50 == 0) fprintf(stderr, "present: frame %llu top fb %08x bottom fb %08x\n", (unsigned long long)frame, cur_scr[0].fb, cur_scr[1].fb); }
         vkr_present(cur_scr, 1280, 720, 0, 0, 0, 0, fxaa_on);
     }
     if (headless) return;
