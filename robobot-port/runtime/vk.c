@@ -36,9 +36,15 @@ static VkPhysicalDevice pdev;
 static VkDevice dev;
 static VkQueue queue;
 static uint32_t qfam;
-static VkCommandPool cpool;
-static VkCommandBuffer cmd;
-static VkFence fence;
+/* Two frame contexts: with Vulkan presentation, a frame's work is submitted without waiting and the CPU records the
+ * next frame into the other context (its own command buffer, fence, half of the staging ring and destroy list).
+ * Every synchronous wait (submit_wait) still waits for all earlier work, so correctness does not depend on this. */
+typedef struct Img Img;
+typedef struct { VkCommandPool pool; VkCommandBuffer cb; VkFence fen; VkSemaphore acq; int pending; struct ImgList *grave; } Ctx;
+static Ctx ctxs[2]; static int cur_ctx;
+#define cpool (ctxs[cur_ctx].pool)
+#define cmd (ctxs[cur_ctx].cb)
+#define fence (ctxs[cur_ctx].fen)
 static VkPhysicalDeviceMemoryProperties memprops;
 static VkDescriptorSetLayout dsl;
 static VkPipelineLayout playout;
@@ -79,15 +85,22 @@ static void mkbuf(Ring *r, VkDeviceSize size, VkBufferUsageFlags use, VkMemoryPr
     r->size = size; r->used = 0;
 }
 
-typedef struct { VkImage img; VkDeviceMemory mem; VkImageView view; VkImageAspectFlags aspect; } Img;
-static Img grave[1024]; static int ngrave;     /* destroyed after the GPU is idle */
+struct Img { VkImage img; VkDeviceMemory mem; VkImageView view; VkImageAspectFlags aspect; };
+struct ImgList { Img img[1024]; int n; };
+static struct ImgList graves[2];                   /* per context: destroyed once that context's GPU work is done */
+static void destroy_list(struct ImgList *g) {
+    for (int i = 0; i < g->n; i++) { vkDestroyImageView(dev, g->img[i].view, 0); vkDestroyImage(dev, g->img[i].img, 0); vkFreeMemory(dev, g->img[i].mem, 0); }
+    g->n = 0;
+}
 
 /* ---- command recording ---- */
+static void barrier(void);
 static void begin_cmd(void) {
     if (recording) return;
     VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
     CHK(vkBeginCommandBuffer(cmd, &bi));
     recording = 1;
+    barrier();                         /* order after the other frame context's work, which may still be running */
 }
 static void barrier(void) {
     VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -116,24 +129,49 @@ static void submit_wait(void) {
     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmd };
     CHK(vkQueueSubmit(queue, 1, &si, fence));
     uint64_t t0 = vns();
-    CHK(vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX));
+    CHK(vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX));      /* queue order: the other context is done too */
     t_wait += vns() - t0;
     CHK(vkResetFences(dev, 1, &fence));
     CHK(vkResetCommandPool(dev, cpool, 0));
+    Ctx *o = &ctxs[cur_ctx ^ 1];
+    if (o->pending) { CHK(vkResetFences(dev, 1, &o->fen)); o->pending = 0; }
     recording = 0; nsubmits++;
     ring.used = 0; rbk.used = 0; ring_gen++;
     t0 = vns(); finish_downloads(); t_fin += vns() - t0;
-    for (int i = 0; i < ngrave; i++) { vkDestroyImageView(dev, grave[i].view, 0); vkDestroyImage(dev, grave[i].img, 0); vkFreeMemory(dev, grave[i].mem, 0); }
-    ngrave = 0;
+    destroy_list(&graves[0]); destroy_list(&graves[1]);
+}
+/* Submit the current context without waiting (signal/wait semaphores for presentation) and switch to the other one,
+ * waiting only for the work submitted two frames ago. */
+static void submit_async(VkSemaphore wait_sem, VkSemaphore signal_sem) {
+    end_render();
+    CHK(vkEndCommandBuffer(cmd));
+    VkPipelineStageFlags ws = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .waitSemaphoreCount = wait_sem ? 1 : 0, .pWaitSemaphores = &wait_sem,
+        .pWaitDstStageMask = &ws, .commandBufferCount = 1, .pCommandBuffers = &cmd, .signalSemaphoreCount = signal_sem ? 1 : 0, .pSignalSemaphores = &signal_sem };
+    CHK(vkQueueSubmit(queue, 1, &si, fence));
+    ctxs[cur_ctx].pending = 1; nsubmits++;
+    cur_ctx ^= 1;
+    if (ctxs[cur_ctx].pending) {
+        uint64_t t0 = vns();
+        CHK(vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX));
+        t_wait += vns() - t0;
+        CHK(vkResetFences(dev, 1, &fence));
+        ctxs[cur_ctx].pending = 0;
+    }
+    CHK(vkResetCommandPool(dev, cpool, 0));
+    destroy_list(&graves[cur_ctx]);
+    recording = 0; ring.used = 0; ring_gen++;
 }
 static VkDeviceSize ring_alloc(Ring *r, VkDeviceSize n) {
-    VkDeviceSize off = (r->used + 255) & ~(VkDeviceSize)255;
-    if (off + n > r->size) {
-        if (n > r->size) fatal("vulkan: %llu bytes do not fit the staging ring", (unsigned long long)n);
+    VkDeviceSize half = r == &ring ? r->size / 2 : r->size, base = r == &ring ? half * (VkDeviceSize)cur_ctx : 0;
+    VkDeviceSize off = (r->used + 255) & ~(VkDeviceSize)255;      /* the staging ring is split between the two contexts */
+    if (off + n > half) {
+        if (n > half) fatal("vulkan: %llu bytes do not fit the staging ring", (unsigned long long)n);
         submit_wait(); begin_cmd(); off = 0;
+        base = r == &ring ? half * (VkDeviceSize)cur_ctx : 0;
     }
     r->used = off + n;
-    return off;
+    return base + off;
 }
 
 /* layers > 0: a 2D-array image and view with that many layers (textures); 0: a plain 2D image (surfaces). */
@@ -162,8 +200,9 @@ static void mkimg(Img *im, uint32_t w, uint32_t h, VkFormat f, VkImageUsageFlags
     mkimg_full(im, w, h, 1, 0, f, use, aspect);
 }
 static void bury(Img *im) {
-    if (ngrave == 1024) submit_wait();
-    grave[ngrave++] = *im; memset(im, 0, sizeof *im);
+    struct ImgList *g = &graves[cur_ctx];
+    if (g->n == 1024) submit_wait();
+    g->img[g->n++] = *im; memset(im, 0, sizeof *im);
 }
 
 /* ---- guest pixel formats ---- */
@@ -586,7 +625,7 @@ void vkr_draw(const VkrDraw *d, const void *tris, int ntris, void (*decode)(int,
 
     /* staging space for this draw: vertices, uniforms and (if changed) the lighting LUT, all in one go */
     VkDeviceSize vbytes = (VkDeviceSize)ntris * 3 * 112, need = vbytes + sizeof(Ubo) + LUT_BYTES + 1024;
-    if (((ring.used + 255) & ~(VkDeviceSize)255) + need > ring.size) { submit_wait(); begin_cmd(); }
+    if (((ring.used + 255) & ~(VkDeviceSize)255) + need > ring.size / 2) { submit_wait(); begin_cmd(); }
     VkDeviceSize voff = ring_alloc(&ring, vbytes), uoff = ring_alloc(&ring, sizeof(Ubo));
     memcpy(ring.map + voff, tris, vbytes);
     if (d->lut_version != lut_ver || lut_ring_gen != ring_gen) {
@@ -672,7 +711,7 @@ void vkr_new_gen(void) { gen++; }
 void vkr_counters(uint64_t out[4]) { out[0] = t_wait; out[1] = t_fin; out[2] = t_tex; out[3] = ntexuploads; }
 void vkr_frame(void) {
     if (!vkr_on) return;
-    submit_wait();
+    if (!presenting) submit_wait();                               /* with presentation, vkr_present submits the frame */
     static uint64_t frames;
     if (++frames % 300 == 0) {
         LOG(1, "vulkan: GPU wait %.2f s, write-back %.2f s, textures %.2f s, pipeline builds %.2f s, stale texture catches %llu", t_wait / 1e9, t_fin / 1e9, t_tex / 1e9, t_pipe / 1e9, (unsigned long long)nstale);
@@ -688,22 +727,24 @@ typedef struct { uint32_t in, out, w, h; int flip; } Link;
 static Link links[8]; static int nlinks;
 static void disp_snapshot(Surf *s, uint32_t out, int flip);
 static void disp_invalidate(uint32_t out);
-void vkr_display_link(uint32_t in, uint32_t out, uint32_t iw, uint32_t ih, uint32_t flags) {
-    if (!vkr_on || (scale == 1 && !presenting)) return;
+int vkr_display_link(uint32_t in, uint32_t out, uint32_t iw, uint32_t ih, uint32_t flags) {
+    if (!vkr_on || (scale == 1 && !presenting)) return 0;
     if (presenting) disp_invalidate(out);
     int plain = !((flags >> 24) & 3) && !((flags >> 1) & 1);          /* no downscaling, tiled input */
     for (int i = 0; i < nlinks; i++) if (links[i].out == out) { links[i] = links[--nlinks]; break; }
-    if (!plain) return;
+    if (!plain) return 0;
     for (int i = 0; i < NSURF; i++) {
         Surf *s = &surf[i];
         if (s->used && !s->depth && s->addr == in && s->w == iw && s->h == ih) {
-            if (presenting) { disp_snapshot(s, out, (int)(flags & 1)); return; }   /* the window samples the GPU copy */
+            if (presenting) { disp_snapshot(s, out, (int)(flags & 1)); return !getenv("RB_DISPLAY_COPY"); }   /* the window samples
+                                                                          the GPU copy: the CPU copy is skipped */
             s->display = 1;
             if (nlinks == 8) links[0] = links[--nlinks];
             links[nlinks++] = (Link){ in, out, iw, ih, (int)(flags & 1) };
-            return;
+            return 0;
         }
     }
+    return 0;
 }
 const uint8_t *vkr_hires(uint32_t out, uint32_t want_h, uint32_t *w, uint32_t *h, int *flip, uint32_t *sc) {
     if (!vkr_on || scale == 1) return 0;
@@ -736,7 +777,7 @@ static void disp_snapshot(Surf *s, uint32_t out, int flip) {
     uint32_t W = s->w * scale, H = s->h * scale;
     if (d->im.img && (d->w != W || d->h != H)) bury(&d->im);
     if (!d->im.img) mkimg(&d->im, W, H, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
-    begin_cmd(); end_render();
+    begin_cmd(); end_render(); barrier();
     VkImageCopy c = { .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .extent = { W, H, 1 } };
     vkCmdCopyImage(cmd, s->im.img, VK_IMAGE_LAYOUT_GENERAL, d->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
     barrier();
@@ -746,7 +787,7 @@ static void disp_snapshot(Surf *s, uint32_t out, int flip) {
 static VkSwapchainKHR swap;
 static VkImage simg[8]; static VkImageView sview[8]; static uint32_t nsimg;
 static VkExtent2D sext; static VkFormat sfmt;
-static VkSemaphore acq_sem, rel_sem[8];
+static VkSemaphore rel_sem[8];
 static VkPipeline ppipe[2]; static VkPipelineLayout pplayout; static VkDescriptorSetLayout pdsl;
 static VkSampler lin_sampler;
 static Img nat[2], ovl; static uint32_t ovw, ovh; static int need_recreate;
@@ -856,14 +897,13 @@ int vkr_init_present(const char *const *exts, uint32_t n, int (*mksurf)(void *in
 }
 void vkr_present(const VkrScreen scr[2], uint32_t win_w, uint32_t win_h, const uint8_t *overlay, uint32_t ow, uint32_t oh, int overlay_dirty, int fxaa) {
     if (!presenting) return;
-    submit_wait();
     if (!swap || need_recreate || sext.width != win_w || sext.height != win_h) {
         need_recreate = 0;
         if (!create_swapchain(win_w, win_h)) return;
     }
     present_pipelines();
     uint32_t idx;
-    if (!acq_sem) { VkSemaphoreCreateInfo si = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO }; CHK(vkCreateSemaphore(dev, &si, 0, &acq_sem)); }
+    VkSemaphore acq_sem = ctxs[cur_ctx].acq;
     VkResult r = vkAcquireNextImageKHR(dev, swap, UINT64_MAX, acq_sem, VK_NULL_HANDLE, &idx);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) { need_recreate = 1; return; }
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { LOG(1, "vulkan: acquire failed (%d)", r); return; }
@@ -925,26 +965,17 @@ void vkr_present(const VkrScreen scr[2], uint32_t win_w, uint32_t win_h, const u
     b.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT; b.dstAccessMask = 0;
     b.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, 0, 0, 0, 1, &b);
-    CHK(vkEndCommandBuffer(cmd));
-    VkPipelineStageFlags ws = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .waitSemaphoreCount = 1, .pWaitSemaphores = &acq_sem, .pWaitDstStageMask = &ws,
-        .commandBufferCount = 1, .pCommandBuffers = &cmd, .signalSemaphoreCount = 1, .pSignalSemaphores = &rel_sem[idx] };
-    CHK(vkQueueSubmit(queue, 1, &si, fence));
+    submit_async(acq_sem, rel_sem[idx]);                          /* the CPU goes on with the next frame */
     VkPresentInfoKHR pi = { .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1, .pWaitSemaphores = &rel_sem[idx],
         .swapchainCount = 1, .pSwapchains = &swap, .pImageIndices = &idx };
     r = vkQueuePresentKHR(queue, &pi);
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) need_recreate = 1;
-    CHK(vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX));
-    if (dumping) {
+    if (dumping) {                                                /* test only: wait for this frame and save it */
+        CHK(vkQueueWaitIdle(queue));
         FILE *f = fopen("build/present_dump.raw", "wb");
         if (f) { fwrite(rbk.map + dump_off, 4, (size_t)sext.width * sext.height, f); fclose(f); }
         LOG(1, "vulkan: presented frame written to build/present_dump.raw (%ux%u, format %d)", sext.width, sext.height, sfmt);
     }
-    CHK(vkResetFences(dev, 1, &fence));
-    CHK(vkResetCommandPool(dev, cpool, 0));
-    recording = 0; ring.used = 0; rbk.used = 0; ring_gen++;
-    for (int i = 0; i < ngrave; i++) { vkDestroyImageView(dev, grave[i].view, 0); vkDestroyImage(dev, grave[i].img, 0); vkFreeMemory(dev, grave[i].mem, 0); }
-    ngrave = 0;
 }
 
 /* ---- setup ---- */
@@ -1001,12 +1032,17 @@ int vkr_init(void) {
     push_desc = (PFN_vkCmdPushDescriptorSetKHR)vkGetDeviceProcAddr(dev, "vkCmdPushDescriptorSetKHR");
     if (!push_desc) fatal("vulkan: vkCmdPushDescriptorSetKHR missing");
 
-    VkCommandPoolCreateInfo cpi = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = qfam };
-    CHK(vkCreateCommandPool(dev, &cpi, 0, &cpool));
-    VkCommandBufferAllocateInfo cai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = cpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
-    CHK(vkAllocateCommandBuffers(dev, &cai, &cmd));
-    VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-    CHK(vkCreateFence(dev, &fci, 0, &fence));
+    for (int c = 0; c < 2; c++) {
+        Ctx *x = &ctxs[c];
+        VkCommandPoolCreateInfo cpi = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = qfam };
+        CHK(vkCreateCommandPool(dev, &cpi, 0, &x->pool));
+        VkCommandBufferAllocateInfo cai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = x->pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
+        CHK(vkAllocateCommandBuffers(dev, &cai, &x->cb));
+        VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+        CHK(vkCreateFence(dev, &fci, 0, &x->fen));
+        VkSemaphoreCreateInfo si = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+        CHK(vkCreateSemaphore(dev, &si, 0, &x->acq));
+    }
     mkbuf(&ring, 128u << 20, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 0);
     mkbuf(&rbk, 64u << 20, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
 
