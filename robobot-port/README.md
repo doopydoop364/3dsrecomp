@@ -129,3 +129,10 @@ emulator; enhancements never change game timing (virtual clock); per-game data b
   only through pointers computed at run time. A missing entry stops the run and prints the address.
 - Calls to the fplib NaN/Inf dispatcher (0x232cf4), hand-made return addresses and the static-initialiser
   table (0x675158) are special-cased.
+
+## Scripted path to gameplay (RB_FAST=1 RB_HEADLESS=1, about 1 min for 3600 frames)
+`RB_INPUT="1250-1255:A;1330-1335:A;1410-1415:A;1490-1495:A;1570-1575:A;1650-1655:A;1700-1705:START;1760-1765:A;1850-1855:A;2100-2105:A;2300-2305:A"`
+goes title, file select, data-sharing prompt (the first A picks No), Story Mode, then skips the intro movie with START and
+reaches the Area 1 world map and the Patched Plains hub, where Kirby is on screen and the lower screen menu draws correctly.
+Known bug: the intro movie (video decoder in 0x363000..0x372000) draws garbage, so START skips it for now.
+Moving Kirby with `circle=` entries has not been tested enough to reach the first stage; timings after frame 2300 are fragile.
