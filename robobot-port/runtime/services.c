@@ -569,7 +569,6 @@ ServiceFn service_lookup(const char *name) {
     return stub;
 }
 void services_init(const char *dir) {
-    char path[512];
     game_dir = dir;
     nfc_set_dir(dir);
     romfs.size = romfs_open(dir);

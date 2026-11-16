@@ -3,6 +3,7 @@
 #include "host.h"
 #include <SDL3/SDL.h>
 #include <zlib.h>
+#include <time.h>
 #include "input.h"
 #include "settings.h"
 #include "vkr.h"
@@ -20,7 +21,9 @@ static SDL_Texture *tex_top, *tex_bot;
 enum { L_STACKED, L_LARGE_TOP, L_TOP_ONLY, L_SIDE, L_COUNT };
 static int layout, swapped;
 static SDL_FRect r_top, r_bot;                         /* where each screen is drawn, in window pixels */
-static SDL_Scancode ff_key; static int ff_toggle, ff_on;   /* fast-forward: hold (or toggle) a key */
+static SDL_Scancode ff_key; static int ff_toggle, ff_on;
+static int show_fps;                                   /* F9: game frames/s and window frames/s, top left */
+uint64_t gpu_swaps(void);   /* fast-forward: hold (or toggle) a key */
 
 /* Controls from settings.toml [controls]; defaults follow the usual 3DS emulator layout. */
 static const struct { const char *name, *def; uint32_t bit; } binds_def[] = {
@@ -121,6 +124,7 @@ void video_init(const char *title) {
     load_binds();
     ff_key = SDL_GetScancodeFromName(settings_get("controls.fast_forward", "Tab"));
     ff_toggle = !strcmp(settings_get("controls.fast_forward_mode", "hold"), "toggle");
+    show_fps = settings_int("video.show_fps", 0);
     const char *lname = settings_get("video.layout", "stacked");
     static const char *lnames[L_COUNT] = { "stacked", "large_top", "top_only", "side_by_side" };
     for (int i = 0; i < L_COUNT; i++) if (!strcmp(lname, lnames[i])) layout = i;
@@ -213,11 +217,16 @@ void video_frame(uint64_t frame, const uint8_t *top, uint32_t top_stride, uint32
                  const uint8_t *bot, uint32_t bot_stride, uint32_t bot_fmt) {
     int want_shot = 0;
     for (int i = 0; i < nshots; i++) if (shots[i] == frame) want_shot = 1;
-    if (headless && !want_shot) return;
+    static int prof = -1; if (prof < 0) prof = getenv("RB_PROFILE_PRESENT") != 0;   /* test: time the window path headless */
+    if (headless && !want_shot && !prof) return;
     memset(frame_rgba, 0, sizeof frame_rgba);
     if (top) blit_screen(top, top_stride, top_fmt, 400, 0, 0);
     if (bot) blit_screen(bot, bot_stride, bot_fmt, 320, 40, 240);
+    struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
     int hi = compose_hires(top, bot);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    if (prof) { static double acc; static int n; acc += (double)(t1.tv_sec - t0.tv_sec) * 1e3 + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
+                if (++n == 300) { fprintf(stderr, "present: compose %.2f ms/frame\n", acc / n); acc = 0; n = 0; } }
     if (want_shot) {
         char p[64]; snprintf(p, sizeof p, "build/shot_%06llu.png", (unsigned long long)frame); write_png(p);
         if (hi) { snprintf(p, sizeof p, "build/shot_%06llu_hi.png", (unsigned long long)frame); write_png_buf(p, frame_hi, OUT_W * hi_scale, OUT_H * hi_scale); }
@@ -230,6 +239,7 @@ void video_frame(uint64_t frame, const uint8_t *top, uint32_t top_stride, uint32
             if (e.key.key == SDLK_F1) layout = (layout + 1) % L_COUNT;
             if (e.key.key == SDLK_F2) swapped = !swapped;
             if (ff_toggle && e.key.scancode == ff_key) { ff_on = !ff_on; k_set_fast_forward(ff_on); }
+            if (e.key.key == SDLK_F9) show_fps = !show_fps;
             if (e.key.key == SDLK_F5) nfc_host_tap();             /* amiibo: tap the next dump from <game>/amiibo */
             if (e.key.key == SDLK_F6) nfc_host_remove();
             if (e.key.key == SDLK_F11) SDL_SetWindowFullscreen(win, !(SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN));
@@ -266,5 +276,22 @@ void video_frame(uint64_t frame, const uint8_t *top, uint32_t top_stride, uint32
     SDL_RenderClear(ren);
     if (r_top.w > 0) SDL_RenderTexture(ren, tt, 0, &r_top);
     if (r_bot.w > 0) SDL_RenderTexture(ren, tb, 0, &r_bot);
+    if (show_fps) {                                    /* counts over the last half second of wall time */
+        static uint64_t t_last, sw_last, presents; static float game_fps, win_fps;
+        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+        uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+        presents++;
+        if (!t_last) { t_last = now; sw_last = gpu_swaps(); presents = 0; }
+        else if (now - t_last >= 500000000ull) {
+            double dt = (double)(now - t_last) / 1e9;
+            game_fps = (float)((double)(gpu_swaps() - sw_last) / dt); win_fps = (float)((double)presents / dt);
+            t_last = now; sw_last = gpu_swaps(); presents = 0;
+        }
+        char txt[64]; snprintf(txt, sizeof txt, "game %.0f fps  window %.0f fps%s", game_fps, win_fps, ff_on ? "  >>" : "");
+        SDL_SetRenderScale(ren, 2.0f, 2.0f);
+        SDL_SetRenderDrawColor(ren, 0, 0, 0, 160); SDL_FRect bg = { 2, 2, (float)strlen(txt) * 8 + 4, 12 }; SDL_RenderFillRect(ren, &bg);
+        SDL_SetRenderDrawColor(ren, 255, 255, 80, 255); SDL_RenderDebugText(ren, 4, 4, txt);
+        SDL_SetRenderScale(ren, 1.0f, 1.0f);
+    }
     SDL_RenderPresent(ren);
 }

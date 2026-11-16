@@ -18,7 +18,6 @@ static uint8_t *fmeta, *dmeta;
 static Override *ovr; static int novr;
 
 static uint32_t rd32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
-static uint64_t rd64(const uint8_t *p) { uint64_t v; memcpy(&v, p, 8); return v; }
 static void name_utf8(const uint8_t *p, uint32_t len, char *out, size_t n) {
     size_t k = 0;
     for (uint32_t i = 0; i + 1 < len && k + 1 < n; i += 2) { uint16_t c = (uint16_t)(p[i] | p[i + 1] << 8); out[k++] = c < 0x80 ? (char)c : '_'; }

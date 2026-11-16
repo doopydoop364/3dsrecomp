@@ -40,6 +40,8 @@ renderer = "vulkan"
 texture_filter = "console"
 # internal resolution for 3D (Vulkan): 1 = native 400x240, 2, 3 or 4 = sharper
 scale = 1
+# frame-rate counter (F9 toggles): game frames per second and window frames per second
+show_fps = false
 
 # Hotkeys: F1 next layout, F2 swap screens, F3 show bottom screen (top_only), F11 fullscreen,
 # F12 screenshot, Escape quit. Gamepads use the Nintendo button positions automatically.
