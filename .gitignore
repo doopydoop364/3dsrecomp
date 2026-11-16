@@ -1,0 +1,10 @@
+# Game dumps and keys must never be committed: they are the user's own copies.
+*.cia
+*.3ds
+*.cci
+*.cxi
+*.app
+*.tik
+*.tmd
+aes_keys.txt
+*.bin.enc
