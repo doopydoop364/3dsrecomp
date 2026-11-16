@@ -4,3 +4,8 @@ build/
 .venv/
 __pycache__/
 docs/romfs_files.tsv
+
+# the user's own files in the run folder
+settings.toml
+profile_*.txt
+screenshot_*.png

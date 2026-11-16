@@ -68,8 +68,9 @@ library itself must be installed, since the binary links it; loading it at runti
   transfer is shown from the full-resolution surface. F12 / `RB_SHOT` also write `_hi` screenshots. Uncapped headless speed
   in stage 1: about 71 fps at 2x, about 50 fps at 4x (GPU-bound; the CPU waits for the GPU at every sync point).
 - Vulkan presentation (default, `video.present = "vulkan"`; `video.antialias = "fxaa"` or the Esc menu for FXAA): the
-  window is drawn by Vulkan from snapshots of the rendered surfaces; falls back to SDL if it cannot start. Took a lag
-  spot from 50 to 60 fps at 2x.
+  window is drawn by Vulkan from snapshots of the rendered surfaces; falls back to SDL if it cannot start. Two frames
+  in flight, the GPU queue never waits for the compositor, and displayed frames are never copied back to the CPU: at
+  the slowest spot found so far (2x, ~550 draws/frame) a frame needs ~8.6 ms of the 16.7 ms budget (20 ms before).
 - Not done yet:
   CPU/GPU overlap, GPU-side display transfers.
 
