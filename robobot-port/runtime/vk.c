@@ -92,6 +92,8 @@ typedef struct Surf Surf;
 typedef struct { Surf *s; VkDeviceSize off, soff; } Pending;
 static Pending pend[64]; static int npend;
 static void finish_downloads(void);
+static uint64_t nstale;
+static void invalidate_textures(uint32_t addr, uint32_t size);
 
 /* Submit everything recorded and wait for the GPU. */
 static void submit_wait(void) {
@@ -228,6 +230,7 @@ static void finish_downloads(void) {
                 if (s->fmt == 3) p[3] = st[k];
             }
         s->dirty = 0; s->hash = hash_mem(mem, s->size); s->checked = gen;
+        invalidate_textures(s->addr, s->size);
     }
     npend = 0;
 }
@@ -262,6 +265,8 @@ static void upload_surface(Surf *s) {
 }
 static void drop_surface(Surf *s) { bury(&s->im); s->used = 0; }
 
+/* Guest bytes in [addr, addr+size) changed behind the texture cache: re-check overlapping textures on next use. */
+
 /* Write back every dirty surface overlapping [addr, addr+size). will_write: the caller is about to change
  * those bytes, so clean surfaces there must be re-checked before their next use. */
 void vkr_sync_range(uint32_t addr, uint32_t size, int will_write) {
@@ -274,6 +279,7 @@ void vkr_sync_range(uint32_t addr, uint32_t size, int will_write) {
         if (will_write) s->checked = 0;
     }
     if (any) { submit_wait(); nsyncs++; }
+    if (will_write) invalidate_textures(addr, size);
 }
 void vkr_sync_all(void) { if (vkr_on) vkr_sync_range(0, 0xffffffffu, 0); }
 
@@ -349,6 +355,10 @@ typedef struct { int used; uint32_t addr, size, w, h, fmt; Img im; uint64_t hash
 #define NTEX 768
 static Tex texs[NTEX];
 static Img dummy;
+static void invalidate_textures(uint32_t addr, uint32_t size) {
+    for (int i = 0; i < NTEX; i++)
+        if (texs[i].used && overlaps(addr, size, texs[i].addr, texs[i].size)) { if (texs[i].checked == gen) nstale++; texs[i].checked = 0; }
+}
 static Tex *get_texture(const VkrTex *t, int unit, void (*decode)(int, uint8_t *)) {
     vkr_sync_range(t->addr, t->size, 0);                          /* render-to-texture: the bytes must be current */
     Tex *e = 0, *lru = &texs[0];
@@ -461,9 +471,11 @@ void vkr_draw(const VkrDraw *d, const void *tris, int ntris, void (*decode)(int,
     const uint32_t *R = d->regs;
     Tex *tx[3] = { 0, 0, 0 };
     { uint64_t t0 = vns(); for (int u = 0; u < 3; u++) if (d->tex[u].on) tx[u] = get_texture(&d->tex[u], u, decode); t_tex += vns() - t0; }
+    uint32_t daddr = d->daddr;
+    if (d->caddr && daddr && overlaps(d->caddr, d->width * d->height * cbpp[d->cfmt & 7], daddr, d->width * d->height * dbpp[d->dfmt & 3]))
+        daddr = 0;                                                 /* depth aimed at the colour buffer: draw without depth */
     Surf *sc = d->caddr ? get_surface(d->caddr, d->width, d->height, d->cfmt, 0) : 0;
-    Surf *sd = d->daddr ? get_surface(d->daddr, d->width, d->height, d->dfmt, 1) : 0;
-    if (sc && sd && overlaps(sc->addr, sc->size, sd->addr, sd->size)) sd = 0;
+    Surf *sd = daddr ? get_surface(daddr, d->width, d->height, d->dfmt, 1) : 0;
     validate(sc); validate(sd);
     if (sc) sc->last = gen;
     if (sd) sd->last = gen;
@@ -551,7 +563,7 @@ void vkr_frame(void) {
     submit_wait();
     static uint64_t frames;
     if (++frames % 300 == 0)
-        LOG(1, "vulkan: GPU wait %.2f s, write-back %.2f s, textures %.2f s", t_wait / 1e9, t_fin / 1e9, t_tex / 1e9);
+        LOG(1, "vulkan: GPU wait %.2f s, write-back %.2f s, textures %.2f s, stale texture catches %llu", t_wait / 1e9, t_fin / 1e9, t_tex / 1e9, (unsigned long long)nstale);
         LOG(1, "vulkan: %llu submissions, %llu sync points, %llu surface downloads, %llu surface uploads, %llu texture uploads, %d pipelines",
             (unsigned long long)nsubmits, (unsigned long long)nsyncs, (unsigned long long)ndownloads, (unsigned long long)nuploads,
             (unsigned long long)ntexuploads, npipes);
