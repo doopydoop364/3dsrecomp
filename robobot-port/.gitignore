@@ -1,0 +1,6 @@
+# Never commit anything derived from the game itself.
+game/
+build/
+.venv/
+__pycache__/
+docs/romfs_files.tsv

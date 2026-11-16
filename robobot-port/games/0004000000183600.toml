@@ -1,0 +1,12 @@
+# Hand-written settings for Kirby: Planet Robobot (CTR-P-AT3A). The memory layout is read from the
+# ExHeader and the idioms are found by pattern detectors (build/gen/specials.json); only entries a
+# person decided belong here.
+[title]
+id = "0004000000183600"
+product = "CTR-P-AT3A"
+
+[functions]
+# 0x369e48 and the four targets of the self-relative jump table at 0x369e38 (hand-written block routine),
+# found at run time through game/missing_functions.txt
+extra = [0x369e48, 0x369de4, 0x369d48, 0x369ca4, 0x369bc0]
+not_code = [0x2eb3b4, 0x48db68]    # strings that scans mistake for code (found by difftest)
