@@ -7,6 +7,7 @@
 #include "input.h"
 #include "settings.h"
 #include "vkr.h"
+#include "audio.h"
 void nfc_host_tap(void); void nfc_host_remove(void);   /* nfc.c */
 
 #define OUT_W 400
@@ -23,6 +24,7 @@ static int layout, swapped;
 static SDL_FRect r_top, r_bot;                         /* where each screen is drawn, in window pixels */
 static SDL_Scancode ff_key; static int ff_toggle, ff_on;
 static int show_fps;
+static void menu_init(void);
 /* Touch hotspots from [hotspots] (per-game file or settings.toml): holding the key touches that point. */
 static struct { SDL_Scancode key; uint16_t x, y; } hot[32]; static int nhot;
 static void add_hotspot(const char *name, const char *value) {
@@ -135,6 +137,7 @@ void video_init(const char *title) {
     ff_toggle = !strcmp(settings_get("controls.fast_forward_mode", "hold"), "toggle");
     show_fps = settings_int("video.show_fps", 0);
     settings_each("hotspots", add_hotspot);
+    menu_init();
     const char *lname = settings_get("video.layout", "stacked");
     static const char *lnames[L_COUNT] = { "stacked", "large_top", "top_only", "side_by_side" };
     for (int i = 0; i < L_COUNT; i++) if (!strcmp(lname, lnames[i])) layout = i;
@@ -222,6 +225,169 @@ static int compose_hires(const uint8_t *top, const uint8_t *bot) {
 }
 static SDL_Texture *tex_top_hi, *tex_bot_hi; static uint32_t tex_hi_scale;
 
+/* ---- overlay menu (Esc): the game is paused while it is open ---- */
+static int menu_open;
+static const char *lnames_all[L_COUNT] = { "stacked", "large_top", "top_only", "side_by_side" };
+static const char *filters[3] = { "console", "nearest", "linear" }, *renderers[2] = { "vulkan", "software" };
+static const int anisos[5] = { 1, 2, 4, 8, 16 };
+static int m_volume = 100, m_scale = 1, m_filter, m_aniso, m_renderer, m_saved_msg;
+static int bind_dirty[NBINDS], ffkey_dirty;
+static int idx_of(const char *v, const char **list, int n) { for (int i = 0; i < n; i++) if (!strcmp(v, list[i])) return i; return 0; }
+static void menu_init(void) {
+    m_volume = settings_int("audio.volume", 100);
+    m_scale = settings_int("video.scale", 1); if (m_scale < 1 || m_scale > 4) m_scale = 1;
+    m_filter = idx_of(settings_get("video.texture_filter", "console"), filters, 3);
+    m_renderer = idx_of(settings_get("video.renderer", "vulkan"), renderers, 2);
+    int a = settings_int("video.anisotropy", 1); m_aniso = 0; for (int i = 0; i < 5; i++) if (anisos[i] <= a) m_aniso = i;
+}
+static void text(float x, float y, float sc, const char *t, uint8_t r, uint8_t g, uint8_t b) {
+    SDL_SetRenderScale(ren, sc, sc); SDL_SetRenderDrawColor(ren, r, g, b, 255);
+    SDL_RenderDebugText(ren, x / sc, y / sc, t); SDL_SetRenderScale(ren, 1, 1);
+}
+enum { MI_RESUME, MI_LAYOUT, MI_SWAP, MI_FULL, MI_VOLUME, MI_FPS, MI_FFMODE, MI_SCALE, MI_FILTER, MI_ANISO, MI_RENDERER,
+       MI_CONTROLS, MI_SAVE, MI_QUIT, MI_N };
+static void item_text(int i, char *o, size_t n) {
+    int full = (SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN) != 0;
+    switch (i) {
+    case MI_RESUME: snprintf(o, n, "Resume"); break;
+    case MI_LAYOUT: snprintf(o, n, "Layout          < %s >", lnames_all[layout]); break;
+    case MI_SWAP: snprintf(o, n, "Swap screens    < %s >", swapped ? "on" : "off"); break;
+    case MI_FULL: snprintf(o, n, "Fullscreen      < %s >", full ? "on" : "off"); break;
+    case MI_VOLUME: snprintf(o, n, "Volume          < %d%% >", m_volume); break;
+    case MI_FPS: snprintf(o, n, "FPS counter     < %s >", show_fps ? "on" : "off"); break;
+    case MI_FFMODE: snprintf(o, n, "Fast-forward    < %s >", ff_toggle ? "toggle" : "hold"); break;
+    case MI_SCALE: snprintf(o, n, "Resolution      < %dx >  (restart)", m_scale); break;
+    case MI_FILTER: snprintf(o, n, "Textures        < %s >  (restart)", filters[m_filter]); break;
+    case MI_ANISO: snprintf(o, n, "Anisotropy      < %dx >  (restart)", anisos[m_aniso]); break;
+    case MI_RENDERER: snprintf(o, n, "Renderer        < %s >  (restart)", renderers[m_renderer]); break;
+    case MI_CONTROLS: snprintf(o, n, "Controls..."); break;
+    case MI_SAVE: snprintf(o, n, m_saved_msg ? "Save settings   (saved to settings.toml)" : "Save settings"); break;
+    default: snprintf(o, n, "Quit game");
+    }
+}
+static void item_change(int i, int d) {
+    switch (i) {
+    case MI_LAYOUT: layout = (layout + d + L_COUNT) % L_COUNT; break;
+    case MI_SWAP: swapped = !swapped; break;
+    case MI_FULL: SDL_SetWindowFullscreen(win, !(SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN)); break;
+    case MI_VOLUME: m_volume += 10 * d; if (m_volume < 0) m_volume = 0; if (m_volume > 200) m_volume = 200; audio_set_volume(m_volume); break;
+    case MI_FPS: show_fps = !show_fps; break;
+    case MI_FFMODE: ff_toggle = !ff_toggle; ff_on = 0; k_set_fast_forward(0); break;
+    case MI_SCALE: m_scale += d; if (m_scale < 1) m_scale = 4; if (m_scale > 4) m_scale = 1; break;
+    case MI_FILTER: m_filter = (m_filter + d + 3) % 3; break;
+    case MI_ANISO: m_aniso = (m_aniso + d + 5) % 5; break;
+    case MI_RENDERER: m_renderer = !m_renderer; break;
+    default: return;
+    }
+    m_saved_msg = 0;
+}
+static void menu_save(void) {
+    char v[32];
+    settings_save("video.layout", lnames_all[layout]);
+    settings_save("video.fullscreen", (SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN) ? "true" : "false");
+    snprintf(v, sizeof v, "%d", m_volume); settings_save("audio.volume", v);
+    settings_save("video.show_fps", show_fps ? "true" : "false");
+    settings_save("controls.fast_forward_mode", ff_toggle ? "toggle" : "hold");
+    snprintf(v, sizeof v, "%d", m_scale); settings_save("video.scale", v);
+    settings_save("video.texture_filter", filters[m_filter]);
+    snprintf(v, sizeof v, "%d", anisos[m_aniso]); settings_save("video.anisotropy", v);
+    settings_save("video.renderer", renderers[m_renderer]);
+    for (unsigned i = 0; i < NBINDS; i++) if (bind_dirty[i]) {
+        char k[64]; snprintf(k, sizeof k, "controls.%s", binds_def[i].name);
+        settings_save(k, SDL_GetScancodeName(binds[i][0]));
+    }
+    if (ffkey_dirty) settings_save("controls.fast_forward", SDL_GetScancodeName(ff_key));
+    m_saved_msg = 1;
+}
+static void menu_loop(SDL_Texture *tt, SDL_Texture *tb) {
+    int sel = 0, page = 0, csel = 0, waiting = 0;
+    int nctl = (int)NBINDS + 1;                          /* the controls page: every 3DS control, then fast-forward */
+    while (menu_open) {
+        SDL_Event e;
+        while (SDL_PollEvent(&e)) {
+            if (e.type == SDL_EVENT_QUIT) { fprintf(stderr, "window closed\n"); exit(0); }
+            int up = 0, down = 0, left = 0, right = 0, ok = 0, back = 0;
+            if (e.type == SDL_EVENT_KEY_DOWN) {
+                if (waiting) {                               /* rebinding: the next key pressed becomes the binding */
+                    if (e.key.scancode != SDL_SCANCODE_ESCAPE) {
+                        if (csel < (int)NBINDS) { binds[csel][0] = e.key.scancode; for (int j = 1; j < NALT; j++) binds[csel][j] = SDL_SCANCODE_UNKNOWN; bind_dirty[csel] = 1; }
+                        else { ff_key = e.key.scancode; ffkey_dirty = 1; }
+                        m_saved_msg = 0;
+                    }
+                    waiting = 0; continue;
+                }
+                SDL_Scancode c = e.key.scancode;
+                up = c == SDL_SCANCODE_UP || c == SDL_SCANCODE_W; down = c == SDL_SCANCODE_DOWN || c == SDL_SCANCODE_S;
+                left = c == SDL_SCANCODE_LEFT || c == SDL_SCANCODE_A; right = c == SDL_SCANCODE_RIGHT || c == SDL_SCANCODE_D;
+                ok = c == SDL_SCANCODE_RETURN || c == SDL_SCANCODE_SPACE || c == SDL_SCANCODE_KP_ENTER; back = c == SDL_SCANCODE_ESCAPE;
+            } else if (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
+                int b = e.gbutton.button;
+                up = b == SDL_GAMEPAD_BUTTON_DPAD_UP; down = b == SDL_GAMEPAD_BUTTON_DPAD_DOWN; left = b == SDL_GAMEPAD_BUTTON_DPAD_LEFT;
+                right = b == SDL_GAMEPAD_BUTTON_DPAD_RIGHT; ok = b == SDL_GAMEPAD_BUTTON_EAST;          /* Nintendo positions: east = A, south = B */
+                back = b == SDL_GAMEPAD_BUTTON_SOUTH || b == SDL_GAMEPAD_BUTTON_GUIDE || b == SDL_GAMEPAD_BUTTON_START;
+            } else continue;
+            if (page == 0) {
+                if (up) sel = (sel + MI_N - 1) % MI_N;
+                if (down) sel = (sel + 1) % MI_N;
+                if (left) item_change(sel, -1);
+                if (right) item_change(sel, 1);
+                if (ok) {
+                    if (sel == MI_RESUME) menu_open = 0;
+                    else if (sel == MI_CONTROLS) { page = 1; csel = 0; }
+                    else if (sel == MI_SAVE) menu_save();
+                    else if (sel == MI_QUIT) { fprintf(stderr, "quit from the menu\n"); exit(0); }
+                    else item_change(sel, 1);
+                }
+                if (back) menu_open = 0;
+            } else {
+                if (up) csel = (csel + nctl - 1) % nctl;
+                if (down) csel = (csel + 1) % nctl;
+                if (ok) waiting = 1;
+                if (back) page = 0;
+            }
+        }
+        int w, h; SDL_GetWindowSizeInPixels(win, &w, &h);
+        place_screens(w, h, 0);
+        SDL_SetRenderDrawColor(ren, 0, 0, 0, 255); SDL_RenderClear(ren);
+        if (r_top.w > 0) SDL_RenderTexture(ren, tt, 0, &r_top);
+        if (r_bot.w > 0) SDL_RenderTexture(ren, tb, 0, &r_bot);
+        SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+        SDL_SetRenderDrawColor(ren, 0, 0, 0, 215); SDL_FRect all = { 0, 0, (float)w, (float)h }; SDL_RenderFillRect(ren, &all);
+        float sc = (float)w * 0.84f / (46 * 8), sh = (float)h / (24 * 8 * 1.6f);   /* fit ~46 columns and ~24 rows */
+        if (sh < sc) sc = sh; if (sc > 3) sc = 3; if (sc < 1) sc = 1;
+        float lh = 8 * sc * 1.6f, x0 = (float)w * 0.08f, y0 = (float)h * 0.06f;
+        if (page == 0) {
+            text(x0, y0, sc + 1, "Paused", 255, 255, 255);
+            for (int i = 0; i < MI_N; i++) {
+                char t[96]; item_text(i, t, sizeof t);
+                float y = y0 + lh * 2.2f + lh * (float)i;
+                if (i == sel) text(x0 - 3 * 8 * sc, y, sc, ">", 255, 230, 80);
+                text(x0, y, sc, t, i == sel ? 255 : 210, i == sel ? 230 : 210, i == sel ? 80 : 210);
+            }
+            text(x0, y0 + lh * (3.4f + MI_N), sc * 0.75f, "Up/Down choose, Left/Right change, Enter select, Esc resume", 160, 160, 160);
+        } else {
+            text(x0, y0, sc + 1, "Controls", 255, 255, 255);
+            for (int i = 0; i < nctl; i++) {
+                char t[96];
+                if (i < (int)NBINDS) {
+                    char keys[64] = ""; for (int j = 0; j < NALT && binds[i][j] != SDL_SCANCODE_UNKNOWN; j++)
+                        { if (j) strncat(keys, ", ", sizeof keys - strlen(keys) - 1); strncat(keys, SDL_GetScancodeName(binds[i][j]), sizeof keys - strlen(keys) - 1); }
+                    snprintf(t, sizeof t, "%-14s %s", binds_def[i].name, (waiting && i == csel) ? "press a key..." : keys);
+                } else snprintf(t, sizeof t, "%-14s %s", "fast_forward", (waiting && i == csel) ? "press a key..." : SDL_GetScancodeName(ff_key));
+                float y = y0 + lh * 2.0f + lh * 0.85f * (float)i;
+                text(x0, y, sc * 0.85f, t, i == csel ? 255 : 210, i == csel ? 230 : 210, i == csel ? 80 : 210);
+            }
+            text(x0, y0 + lh * (2.6f + 0.85f * (float)nctl), sc * 0.75f, "Enter: rebind (next key pressed)   Esc: back   Save settings keeps changes", 160, 160, 160);
+        }
+        { static int test = -1; if (test < 0) test = getenv("RB_MENU_TEST") != 0;      /* test: save one menu frame and exit */
+          if (test) { SDL_Surface *sf = SDL_RenderReadPixels(ren, 0); SDL_Surface *c = sf ? SDL_ConvertSurface(sf, SDL_PIXELFORMAT_RGBA32) : 0;
+                      if (c) write_png_buf("build/menu_test.png", c->pixels, (uint32_t)c->w, (uint32_t)c->h); exit(0); } }
+        SDL_RenderPresent(ren);
+        SDL_Delay(16);
+    }
+    ff_on = 0; k_set_fast_forward(0);
+}
+
 /* Called once per vertical blank with the framebuffers the game currently displays (0 = none yet). */
 void video_frame(uint64_t frame, const uint8_t *top, uint32_t top_stride, uint32_t top_fmt,
                  const uint8_t *bot, uint32_t bot_stride, uint32_t bot_fmt) {
@@ -244,7 +410,9 @@ void video_frame(uint64_t frame, const uint8_t *top, uint32_t top_stride, uint32
     if (headless) return;
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
-        if (e.type == SDL_EVENT_QUIT || (e.type == SDL_EVENT_KEY_DOWN && e.key.key == SDLK_ESCAPE)) { fprintf(stderr, "window closed\n"); exit(0); }
+        if (e.type == SDL_EVENT_QUIT) { fprintf(stderr, "window closed\n"); exit(0); }
+        if ((e.type == SDL_EVENT_KEY_DOWN && e.key.key == SDLK_ESCAPE && !e.key.repeat) ||
+            (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN && e.gbutton.button == SDL_GAMEPAD_BUTTON_GUIDE)) menu_open = 1;
         if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat) {
             if (e.key.key == SDLK_F1) layout = (layout + 1) % L_COUNT;
             if (e.key.key == SDLK_F2) swapped = !swapped;
@@ -304,4 +472,7 @@ void video_frame(uint64_t frame, const uint8_t *top, uint32_t top_stride, uint32
         SDL_SetRenderScale(ren, 1.0f, 1.0f);
     }
     SDL_RenderPresent(ren);
+    { static long long at = -2; if (at == -2) { const char *e = getenv("RB_MENU_TEST"); at = e ? atoll(e) : -1; }
+      if (at >= 0 && (long long)frame == at) menu_open = 1; }
+    if (menu_open) menu_loop(tt, tb);
 }

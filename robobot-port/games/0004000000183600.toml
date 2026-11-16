@@ -18,7 +18,7 @@ layout = "large_top"   # the bottom screen is mostly menus here: show it as a co
 # Keyboard layout tuned for Robobot (manual: A jump/hover, B inhale/attack/armor punch, X drop ability / reset specs,
 # Y use Assist Star, L or R guard + direction to dodge, Start pause; Down + A slides; double-tap a direction to dash).
 [controls]
-a = "Space"              # jump, hold or tap in the air to hover
+a = "W, Space"           # jump, hold or tap in the air to hover (W is also circle-pad up)
 b = "J"                  # inhale / spit / attack; Robobot Armor punch (mash for a slam)
 x = "K"                  # drop copy ability; armor: reset specs
 y = "L"                  # use the Assist Star item

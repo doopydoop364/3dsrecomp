@@ -29,9 +29,14 @@ Hotkeys: F1 next layout (stacked, large top, top only, side by side), F2 swap sc
 screen in top-only mode, F11 fullscreen, F12 screenshot, Escape quit. `RB_INPUT` scripts input for tests.
 
 ## Robobot controls (games/0004000000183600.toml)
-WASD move (double-tap to dash) · Space jump/hover · J inhale/attack/armor punch · K drop ability / reset specs ·
+WASD move (double-tap to dash) · W or Space jump/hover · J inhale/attack/armor punch · K drop ability / reset specs ·
 L use Assist Star · Left Shift or Q guard (+direction dodge) · E = R · Enter pause · Backspace select · arrows d-pad ·
 S+Space slide · Tab fast-forward · F5/F6 amiibo tap/remove. A control can list several keys: `l = "Left Shift, Q"`.
+
+## Overlay menu
+Esc (or the gamepad's Guide button) pauses and opens the menu: layout, swap screens, fullscreen, volume, FPS counter,
+fast-forward mode and key rebinding apply at once; resolution, texture filtering, anisotropy and renderer apply after a
+restart. "Save settings" writes the choices into settings.toml, keeping your other lines. Quit is in the menu.
 
 ## Settings layers and command line
 `games/<title id>.toml` holds per-game defaults (Robobot: large-top layout); your `settings.toml` overrides them, and
