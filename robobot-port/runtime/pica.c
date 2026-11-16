@@ -29,6 +29,10 @@ static int64_t log_from = -1, log_frame = -1;
 static uint64_t frame_draw_base, frame_seen = ~0ull;
 
 uint64_t pica_draw_count(void) { return n_draws; }
+static uint64_t n_shaded;                       /* vertices run through the vertex shader */
+/* Running totals for the in-game profiler (F10): ns in draw setup, vertex shading, assembly+clipping, rasterisation
+ * (software) or Vulkan recording; then draws, triangles, shaded vertices. */
+void pica_counters(uint64_t out[7]) { out[0] = t_setup; out[1] = t_shade; out[2] = t_assemble; out[3] = t_raster; out[4] = n_draws; out[5] = n_tris; out[6] = n_shaded; }
 
 /* ---- addresses: everything inside command lists and GPU registers is physical ---- */
 static uint8_t *phys(uint32_t p, uint32_t size) {
@@ -1137,6 +1141,8 @@ static void draw(int indexed) {
         if (vstamp[vi] != vgen) { vstamp[vi] = vgen; vlist[nuniq++] = vi; }
     }
     uint64_t tA = pns(); t_setup += tA - t_draw0;
+    pica_shader_prepare(&vs);
+    n_shaded += nuniq;
     shade_vertices(base, vlist, nuniq, vcache);
     uint64_t tB = pns(); t_shade += tB - tA;
     for (uint32_t i = 0; i < count; i++) {

@@ -19,7 +19,8 @@ static uint64_t frames, swaps, lists, gx_count[8];
 static uint64_t ns_gpu, ns_transfer;              /* host time spent executing GPU work */
 static uint64_t host_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
 uint64_t gpu_frame(void) { return frames; }
-uint64_t gpu_swaps(void) { return swaps; }      /* frames the game finished (buffer swaps), for the FPS counter */
+uint64_t gpu_swaps(void) { return swaps; }
+void gpu_counters(uint64_t out[2]) { out[0] = ns_gpu; out[1] = ns_transfer; }   /* ns in command lists, display transfers */      /* frames the game finished (buffer swaps), for the FPS counter */
 void gpu_report(void);
 
 static void reply(uint32_t *cmd, int normal, int translate) {

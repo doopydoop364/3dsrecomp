@@ -2,6 +2,8 @@
  * RB_HEADLESS=1 runs without a window. RB_SHOT=120,600 writes build/shot_<frame>.png for those frames. */
 #include "host.h"
 #include <SDL3/SDL.h>
+#include <SDL3/SDL_vulkan.h>
+#include <vulkan/vulkan.h>
 #include <zlib.h>
 #include <time.h>
 #include "input.h"
@@ -24,6 +26,65 @@ static int layout, swapped;
 static SDL_FRect r_top, r_bot;                         /* where each screen is drawn, in window pixels */
 static SDL_Scancode ff_key; static int ff_toggle, ff_on;
 static int show_fps;
+/* In-game profiler: F10 records the next 300 frames and writes profile_<frame>.txt (where the time per frame went). */
+void pica_counters(uint64_t out[7]); void gpu_counters(uint64_t out[2]);
+static int prof_left; static uint64_t prof_frame0, prof_wall0, prof_p0[7], prof_v0[4], prof_g0[2], prof_paced0; static double prof_emu_max;
+extern uint64_t k_paced_ns;
+static uint64_t wall_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
+static void prof_start(uint64_t frame) {
+    prof_left = 300; prof_frame0 = frame; prof_wall0 = wall_now(); pica_counters(prof_p0); vkr_counters(prof_v0); gpu_counters(prof_g0);
+    prof_paced0 = k_paced_ns; prof_emu_max = 0;
+    fprintf(stderr, "profiler: recording 300 frames\n");
+}
+static void prof_end(uint64_t frame) {
+    uint64_t p[7], v[4], g[2]; pica_counters(p); vkr_counters(v); gpu_counters(g);
+    double n = (double)(frame - prof_frame0), wall = (double)(wall_now() - prof_wall0) / 1e6 / n, slept = (double)(k_paced_ns - prof_paced0) / 1e6 / n;
+    double ms[7], vm[3], gm[2];
+    for (int i = 0; i < 4; i++) ms[i] = (double)(p[i] - prof_p0[i]) / 1e6 / n;
+    for (int i = 4; i < 7; i++) ms[i] = (double)(p[i] - prof_p0[i]) / n;
+    for (int i = 0; i < 3; i++) vm[i] = (double)(v[i] - prof_v0[i]) / 1e6 / n;
+    for (int i = 0; i < 2; i++) gm[i] = (double)(g[i] - prof_g0[i]) / 1e6 / n;
+    double gpu_lists = gm[0], other = wall - slept - gpu_lists - gm[1] - vm[0] - vm[1];
+    char path[64]; snprintf(path, sizeof path, "profile_%06llu.txt", (unsigned long long)frame);
+    FILE *f = fopen(path, "w");
+    if (f) {
+        fprintf(f, "frames %llu-%llu: %.2f ms wall per frame (%.1f fps), %.2f ms of it pacing sleep, worst emu frame %.1f ms\n",
+                (unsigned long long)prof_frame0, (unsigned long long)frame, wall, 1000.0 / wall, slept, prof_emu_max);
+        fprintf(f, "GPU command lists %.2f ms: draw setup %.2f, vertex shading %.2f, assembly+clipping %.2f, rasterise/record %.2f\n",
+                gpu_lists, ms[0], ms[1], ms[2], ms[3]);
+        fprintf(f, "Vulkan: waiting for the GPU %.2f ms, surface write-back %.2f ms, textures %.2f ms, %.1f texture uploads\n",
+                vm[0], vm[1], vm[2], (double)(v[3] - prof_v0[3]) / n);
+        fprintf(f, "display transfers %.2f ms; everything else (game code, services, audio, window) %.2f ms\n", gm[1], other);
+        fprintf(f, "per frame: %.0f draws, %.0f triangles, %.0f vertices shaded\n", ms[4], ms[5], ms[6]);
+        fclose(f);
+    }
+    fprintf(stderr, "profiler: written to %s\n", path);
+}
+/* video.present = "vulkan": Vulkan draws the window (vk.c); SDL's software renderer draws only the overlay (menu,
+ * FPS) into ovl_surf, which Vulkan composites on top. Falls back to the SDL renderer if anything fails. */
+static int vkpresent, fxaa_on; static SDL_Surface *ovl_surf; static VkrScreen cur_scr[2]; static char ovl_last[128] = "\1";
+static int make_surface(void *instance, uint64_t *out) {
+    VkSurfaceKHR sf;
+    if (!SDL_Vulkan_CreateSurface(win, (VkInstance)instance, NULL, &sf)) { fprintf(stderr, "vulkan: no window surface (%s)\n", SDL_GetError()); return 0; }
+    *out = (uint64_t)(uintptr_t)sf; return 1;
+}
+static int make_headless_surface(void *instance, uint64_t *out) {
+    PFN_vkCreateHeadlessSurfaceEXT f = (PFN_vkCreateHeadlessSurfaceEXT)vkGetInstanceProcAddr((VkInstance)instance, "vkCreateHeadlessSurfaceEXT");
+    VkHeadlessSurfaceCreateInfoEXT ci = { .sType = VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT };
+    VkSurfaceKHR sf;
+    if (!f || f((VkInstance)instance, &ci, 0, &sf) != VK_SUCCESS) return 0;
+    *out = (uint64_t)(uintptr_t)sf; return 1;
+}
+static void ovl_fit(int w, int h) {                     /* overlay surface the size of the window */
+    if (ovl_surf && ovl_surf->w == w && ovl_surf->h == h) return;
+    if (ren) SDL_DestroyRenderer(ren);
+    if (ovl_surf) SDL_DestroySurface(ovl_surf);
+    ovl_surf = SDL_CreateSurface(w, h, SDL_PIXELFORMAT_RGBA32);
+    ren = ovl_surf ? SDL_CreateSoftwareRenderer(ovl_surf) : 0;
+    if (!ren) fatal("cannot create the overlay: %s", SDL_GetError());
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+    ovl_last[0] = 1;                                     /* redraw */
+}
 static double present_ms, emu_ms, frame_end;
 extern uint64_t k_paced_ns; static uint64_t paced_last;      /* FPS overlay timing: smoothed ms per frame */
 static void menu_init(void);
@@ -133,8 +194,28 @@ void video_init(const char *title) {
     const char *s = getenv("RB_SHOT");
     while (s && *s && nshots < 16) { shots[nshots++] = strtoull(s, (char **)&s, 10); if (*s == ',') s++; }
     headless = getenv("RB_HEADLESS") != 0;
+    if (headless && getenv("RB_VK_HEADLESS_PRESENT")) {    /* test: Vulkan presentation to a headless surface */
+        static const char *ex[2] = { "VK_KHR_surface", "VK_EXT_headless_surface" };
+        vkpresent = vkr_init_present(ex, 2, make_headless_surface);
+        fxaa_on = !strcmp(settings_get("video.antialias", "off"), "fxaa");
+        fprintf(stderr, "video: headless Vulkan presentation %s\n", vkpresent ? "on" : "unavailable");
+    }
     if (headless) return;
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) { fprintf(stderr, "SDL video is not available (%s), running without a window\n", SDL_GetError()); headless = 1; return; }
+    const char *rend = getenv("RB_RENDERER");
+    int want_vk = !strcmp(settings_get("video.present", "sdl"), "vulkan") && (!rend || !strcmp(rend, "vulkan"));
+    fxaa_on = !strcmp(settings_get("video.antialias", "off"), "fxaa");
+    if (want_vk) {
+        win = SDL_CreateWindow(title, OUT_W * 2, OUT_H * 2, SDL_WINDOW_RESIZABLE | SDL_WINDOW_VULKAN);
+        Uint32 n = 0; const char *const *ex = win ? SDL_Vulkan_GetInstanceExtensions(&n) : 0;
+        if (ex && vkr_init_present(ex, n, make_surface)) vkpresent = 1;
+        else { fprintf(stderr, "video: Vulkan presentation is not available, using the SDL renderer\n"); if (win) SDL_DestroyWindow(win); win = 0; }
+    }
+    if (vkpresent) {
+        int w, h; SDL_GetWindowSizeInPixels(win, &w, &h); ovl_fit(w, h);
+        tex_top = tex_bot = 0;
+        goto window_ready;
+    }
     win = SDL_CreateWindow(title, OUT_W * 2, OUT_H * 2, SDL_WINDOW_RESIZABLE);
     ren = win ? SDL_CreateRenderer(win, 0) : 0;
     if (ren) SDL_SetRenderVSync(ren, settings_int("video.vsync", 0) ? 1 : 0);   /* never block the emulation on the monitor
@@ -143,6 +224,7 @@ void video_init(const char *title) {
     tex_bot = ren ? SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, 320, 240) : 0;
     if (!tex_top || !tex_bot) fatal("cannot create the window: %s", SDL_GetError());
     SDL_SetTextureScaleMode(tex_top, SDL_SCALEMODE_NEAREST); SDL_SetTextureScaleMode(tex_bot, SDL_SCALEMODE_NEAREST);
+window_ready:
     load_binds();
     ff_key = SDL_GetScancodeFromName(settings_get("controls.fast_forward", "Tab"));
     ff_toggle = !strcmp(settings_get("controls.fast_forward_mode", "hold"), "toggle");
@@ -235,6 +317,35 @@ static int compose_hires(const uint8_t *top, const uint8_t *bot) {
     return 1;
 }
 static SDL_Texture *tex_top_hi, *tex_bot_hi; static uint32_t tex_hi_scale;
+
+/* FPS counter text: counts over the last half second of wall time (the numbers change twice a second). */
+static void fps_text(char *txt, size_t n) {
+    static uint64_t t_last, sw_last, presents; static float game_fps, win_fps; static double e_ms, p_ms;
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    presents++;
+    if (!t_last) { t_last = now; sw_last = gpu_swaps(); presents = 0; }
+    else if (now - t_last >= 500000000ull) {
+        double dt = (double)(now - t_last) / 1e9;
+        game_fps = (float)((double)(gpu_swaps() - sw_last) / dt); win_fps = (float)((double)presents / dt);
+        t_last = now; sw_last = gpu_swaps(); presents = 0; e_ms = emu_ms; p_ms = present_ms;
+    }
+    snprintf(txt, n, "game %.0f fps  window %.0f fps  emu %.1f ms  present %.1f ms%s%s", game_fps, win_fps, e_ms, p_ms, ff_on ? "  >>" : "", prof_left ? "  [profiling]" : "");
+}
+static void draw_fps(const char *txt) {
+    SDL_SetRenderScale(ren, 2.0f, 2.0f);
+    SDL_SetRenderDrawColor(ren, 0, 0, 0, 160); SDL_FRect bg = { 2, 2, (float)strlen(txt) * 8 + 4, 12 }; SDL_RenderFillRect(ren, &bg);
+    SDL_SetRenderDrawColor(ren, 255, 255, 80, 255); SDL_RenderDebugText(ren, 4, 4, txt);
+    SDL_SetRenderScale(ren, 1.0f, 1.0f);
+}
+/* Vulkan presentation of the current screens, with the overlay surface when it has something on it. */
+static void vk_show(int overlay_on, int overlay_dirty) {
+    int w, h; SDL_GetWindowSizeInPixels(win, &w, &h);
+    cur_scr[0].rect[0] = r_top.x; cur_scr[0].rect[1] = r_top.y; cur_scr[0].rect[2] = r_top.w; cur_scr[0].rect[3] = r_top.h;
+    cur_scr[1].rect[0] = r_bot.x; cur_scr[1].rect[1] = r_bot.y; cur_scr[1].rect[2] = r_bot.w; cur_scr[1].rect[3] = r_bot.h;
+    vkr_present(cur_scr, (uint32_t)w, (uint32_t)h, overlay_on ? (const uint8_t *)ovl_surf->pixels : 0,
+                (uint32_t)(ovl_surf->pitch / 4), (uint32_t)ovl_surf->h, overlay_dirty, fxaa_on);
+}
 
 /* ---- overlay menu (Esc): the game is paused while it is open ---- */
 static int menu_open;
@@ -359,9 +470,12 @@ static void menu_loop(SDL_Texture *tt, SDL_Texture *tb) {
         }
         int w, h; SDL_GetWindowSizeInPixels(win, &w, &h);
         place_screens(w, h, 0);
-        SDL_SetRenderDrawColor(ren, 0, 0, 0, 255); SDL_RenderClear(ren);
-        if (r_top.w > 0) SDL_RenderTexture(ren, tt, 0, &r_top);
-        if (r_bot.w > 0) SDL_RenderTexture(ren, tb, 0, &r_bot);
+        if (vkpresent) { ovl_fit(w, h); SDL_SetRenderDrawColor(ren, 0, 0, 0, 0); SDL_RenderClear(ren); }
+        else {
+            SDL_SetRenderDrawColor(ren, 0, 0, 0, 255); SDL_RenderClear(ren);
+            if (r_top.w > 0) SDL_RenderTexture(ren, tt, 0, &r_top);
+            if (r_bot.w > 0) SDL_RenderTexture(ren, tb, 0, &r_bot);
+        }
         SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
         SDL_SetRenderDrawColor(ren, 0, 0, 0, 215); SDL_FRect all = { 0, 0, (float)w, (float)h }; SDL_RenderFillRect(ren, &all);
         float sc = (float)w * 0.84f / (46 * 8), sh = (float)h / (24 * 8 * 1.6f);   /* fit ~46 columns and ~24 rows */
@@ -393,7 +507,8 @@ static void menu_loop(SDL_Texture *tt, SDL_Texture *tb) {
         { static int test = -1; if (test < 0) test = getenv("RB_MENU_TEST") != 0;      /* test: save one menu frame and exit */
           if (test) { SDL_Surface *sf = SDL_RenderReadPixels(ren, 0); SDL_Surface *c = sf ? SDL_ConvertSurface(sf, SDL_PIXELFORMAT_RGBA32) : 0;
                       if (c) write_png_buf("build/menu_test.png", c->pixels, (uint32_t)c->w, (uint32_t)c->h); exit(0); } }
-        SDL_RenderPresent(ren);
+        if (vkpresent) { SDL_FlushRenderer(ren); vk_show(1, 1); ovl_last[0] = 1; }
+        else SDL_RenderPresent(ren);
         SDL_Delay(16);
     }
     ff_on = 0; k_set_fast_forward(0);
@@ -409,6 +524,9 @@ void video_frame(uint64_t frame, const uint8_t *top, uint32_t top_stride, uint32
     { struct timespec a; clock_gettime(CLOCK_MONOTONIC, &a); double now = (double)a.tv_sec * 1e3 + (double)a.tv_nsec / 1e6;
       double slept = (double)(k_paced_ns - paced_last) / 1e6; paced_last = k_paced_ns;
       if (frame_end > 0) emu_ms = emu_ms * 0.9 + 0.1 * (now - frame_end - slept); }
+    if (prof_left) { if (emu_ms > prof_emu_max) prof_emu_max = emu_ms; if (--prof_left == 0) prof_end(frame); }
+    { static long long pa = -2; if (pa == -2) { const char *e = getenv("RB_PROFILE_AT"); pa = e ? atoll(e) : -1; }   /* test hook */
+      if (pa >= 0 && (long long)frame == pa && !prof_left) prof_start(frame); }
     memset(frame_rgba, 0, sizeof frame_rgba);
     if (top) blit_screen(top, top_stride, top_fmt, 400, 0, 0);
     if (bot) blit_screen(bot, bot_stride, bot_fmt, 320, 40, 240);
@@ -421,6 +539,14 @@ void video_frame(uint64_t frame, const uint8_t *top, uint32_t top_stride, uint32
         char p[64]; snprintf(p, sizeof p, "build/shot_%06llu.png", (unsigned long long)frame); write_png(p);
         if (hi) { snprintf(p, sizeof p, "build/shot_%06llu_hi.png", (unsigned long long)frame); write_png_buf(p, frame_hi, OUT_W * hi_scale, OUT_H * hi_scale); }
     }
+    if (headless && vkpresent) {                           /* test: present a fixed 1280x720 window */
+        place_screens(1280, 720, 0);
+        cur_scr[0].fb = (uint32_t)(uintptr_t)top; cur_scr[0].native = frame_rgba; cur_scr[0].nw = 400; cur_scr[0].stride = OUT_W * 4;
+        cur_scr[1].fb = (uint32_t)(uintptr_t)bot; cur_scr[1].native = frame_rgba + ((size_t)240 * OUT_W + 40) * 4; cur_scr[1].nw = 320; cur_scr[1].stride = OUT_W * 4;
+        float rr[2][4] = { { r_top.x, r_top.y, r_top.w, r_top.h }, { r_bot.x, r_bot.y, r_bot.w, r_bot.h } };
+        for (int k = 0; k < 2; k++) memcpy(cur_scr[k].rect, rr[k], sizeof rr[k]);
+        vkr_present(cur_scr, 1280, 720, 0, 0, 0, 0, fxaa_on);
+    }
     if (headless) return;
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
@@ -432,6 +558,7 @@ void video_frame(uint64_t frame, const uint8_t *top, uint32_t top_stride, uint32
             if (e.key.key == SDLK_F2) swapped = !swapped;
             if (ff_toggle && e.key.scancode == ff_key) { ff_on = !ff_on; k_set_fast_forward(ff_on); }
             if (e.key.key == SDLK_F9) show_fps = !show_fps;
+            if (e.key.key == SDLK_F10 && !prof_left) prof_start(frame);
             if (e.key.key == SDLK_F5) nfc_host_tap();             /* amiibo: tap the next dump from <game>/amiibo */
             if (e.key.key == SDLK_F6) nfc_host_remove();
             if (e.key.key == SDLK_F11) SDL_SetWindowFullscreen(win, !(SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN));
@@ -453,6 +580,27 @@ void video_frame(uint64_t frame, const uint8_t *top, uint32_t top_stride, uint32
     place_screens(w, h, SDL_GetKeyboardState(0)[SDL_SCANCODE_F3]);
     poll_host_input();
     if (!ff_toggle && ff_key != SDL_SCANCODE_UNKNOWN) { int on = SDL_GetKeyboardState(0)[ff_key]; if (on != ff_on) { ff_on = on; k_set_fast_forward(on); } }
+    if (vkpresent) {
+        cur_scr[0].fb = (uint32_t)(uintptr_t)top; cur_scr[0].native = frame_rgba; cur_scr[0].nw = 400; cur_scr[0].stride = OUT_W * 4;
+        cur_scr[1].fb = (uint32_t)(uintptr_t)bot; cur_scr[1].native = frame_rgba + ((size_t)240 * OUT_W + 40) * 4; cur_scr[1].nw = 320; cur_scr[1].stride = OUT_W * 4;
+        ovl_fit(w, h);
+        char txt[128] = ""; if (show_fps) fps_text(txt, sizeof txt);
+        int dirty = strcmp(txt, ovl_last) != 0;
+        if (dirty) {
+            SDL_SetRenderDrawColor(ren, 0, 0, 0, 0); SDL_RenderClear(ren);
+            if (*txt) draw_fps(txt);
+            SDL_FlushRenderer(ren); snprintf(ovl_last, sizeof ovl_last, "%s", txt);
+        }
+        struct timespec a; clock_gettime(CLOCK_MONOTONIC, &a);
+        vk_show(*txt != 0, dirty);
+        struct timespec b; clock_gettime(CLOCK_MONOTONIC, &b);
+        present_ms = present_ms * 0.9 + 0.1 * ((double)(b.tv_sec - a.tv_sec) * 1e3 + (double)(b.tv_nsec - a.tv_nsec) / 1e6);
+        frame_end = (double)b.tv_sec * 1e3 + (double)b.tv_nsec / 1e6;
+        { static long long at = -2; if (at == -2) { const char *e = getenv("RB_MENU_TEST"); at = e ? atoll(e) : -1; }
+          if (at >= 0 && (long long)frame == at) menu_open = 1; }
+        if (menu_open) menu_loop(0, 0);
+        return;
+    }
     SDL_Texture *tt = tex_top, *tb = tex_bot;
     if (hi) {
         uint32_t S = hi_scale;
@@ -475,23 +623,7 @@ void video_frame(uint64_t frame, const uint8_t *top, uint32_t top_stride, uint32
     SDL_RenderClear(ren);
     if (r_top.w > 0) SDL_RenderTexture(ren, tt, 0, &r_top);
     if (r_bot.w > 0) SDL_RenderTexture(ren, tb, 0, &r_bot);
-    if (show_fps) {                                    /* counts over the last half second of wall time */
-        static uint64_t t_last, sw_last, presents; static float game_fps, win_fps;
-        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-        uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
-        presents++;
-        if (!t_last) { t_last = now; sw_last = gpu_swaps(); presents = 0; }
-        else if (now - t_last >= 500000000ull) {
-            double dt = (double)(now - t_last) / 1e9;
-            game_fps = (float)((double)(gpu_swaps() - sw_last) / dt); win_fps = (float)((double)presents / dt);
-            t_last = now; sw_last = gpu_swaps(); presents = 0;
-        }
-        char txt[96]; snprintf(txt, sizeof txt, "game %.0f fps  window %.0f fps  emu %.1f ms  present %.1f ms%s", game_fps, win_fps, emu_ms, present_ms, ff_on ? "  >>" : "");
-        SDL_SetRenderScale(ren, 2.0f, 2.0f);
-        SDL_SetRenderDrawColor(ren, 0, 0, 0, 160); SDL_FRect bg = { 2, 2, (float)strlen(txt) * 8 + 4, 12 }; SDL_RenderFillRect(ren, &bg);
-        SDL_SetRenderDrawColor(ren, 255, 255, 80, 255); SDL_RenderDebugText(ren, 4, 4, txt);
-        SDL_SetRenderScale(ren, 1.0f, 1.0f);
-    }
+    if (show_fps) { char txt[128]; fps_text(txt, sizeof txt); draw_fps(txt); }
     { struct timespec a; clock_gettime(CLOCK_MONOTONIC, &a); SDL_RenderPresent(ren); struct timespec b; clock_gettime(CLOCK_MONOTONIC, &b);
       present_ms = present_ms * 0.9 + 0.1 * ((double)(b.tv_sec - a.tv_sec) * 1e3 + (double)(b.tv_nsec - a.tv_nsec) / 1e6);
       frame_end = (double)b.tv_sec * 1e3 + (double)b.tv_nsec / 1e6; }

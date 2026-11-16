@@ -18,27 +18,6 @@ typedef struct {
 
 static const float ONES[4] = { 1, 1, 1, 1 };
 
-/* Fetch a source register with swizzle and negation. raw: 5 or 7-bit register index;
- * rel: address register selector (0 none, 1 a0.x, 2 a0.y, 3 aL), only applied to uniforms. */
-static void fetch(const PicaShader *sh, const ShState *st, const float in[16][4], uint32_t raw, uint32_t rel,
-                  uint32_t swz, int neg, float out[4]) {
-    const float *src;
-    if (raw < 0x10) src = in[raw];
-    else if (raw < 0x20) src = st->r[raw - 0x10];
-    else {
-        int32_t u = (int32_t)raw - 0x20;
-        if (rel) {
-            int32_t off = rel == 1 ? st->a0x : rel == 2 ? st->a0y : st->aL;
-            if (off < -128 || off > 127) off = 0;
-            u = (u + off) & 0x7f;
-        }
-        src = u < 96 ? sh->uniform[u] : ONES;
-    }
-    for (int i = 0; i < 4; i++) {
-        float v = src[(swz >> (6 - 2 * i)) & 3];
-        out[i] = neg ? -v : v;
-    }
-}
 static void store(float dst_o[16][4], ShState *st, uint32_t dest, uint32_t mask, const float v[4]) {
     float *d;
     if (dest < 0x10) d = dst_o[dest];
@@ -69,23 +48,85 @@ static int cond(const ShState *st, uint32_t w) {
 
 typedef struct { uint32_t kind, end, ret, start, count, inc; int32_t saved_aL; } Frame;   /* kind: 1 call, 2 if, 3 loop */
 
-/* Runs the program from entry. Returns 0 on success, -1 on a runaway program. */
+/* Each program word is decoded once (pica_shader_prepare) instead of once per vertex: source registers, the
+ * relative-address selector of each source, negation and the swizzle as four component indices. */
+typedef struct {
+    uint8_t kind, op, dest, mask;              /* kind: 0 arithmetic, 1 compare, 2 multiply-add, 3 flow control */
+    uint8_t src[3], rel[3], neg[3], swz[3][4];
+    uint32_t w;
+} DInst;
+static DInst prog[512];
+static uint32_t prog_code[512], prog_desc[128];
+static int prog_ok;
+static void set_src(DInst *d, int k, uint32_t raw, uint32_t rel, uint32_t swz, uint32_t neg) {
+    d->src[k] = (uint8_t)raw; d->rel[k] = (uint8_t)rel; d->neg[k] = (uint8_t)neg;
+    for (int i = 0; i < 4; i++) d->swz[k][i] = (uint8_t)((swz >> (6 - 2 * i)) & 3);
+}
+void pica_shader_prepare(const PicaShader *sh) {
+    if (prog_ok && !memcmp(prog_code, sh->code, sizeof prog_code) && !memcmp(prog_desc, sh->desc, sizeof prog_desc)) return;
+    memcpy(prog_code, sh->code, sizeof prog_code); memcpy(prog_desc, sh->desc, sizeof prog_desc);
+    for (int pc = 0; pc < 512; pc++) {
+        uint32_t w = sh->code[pc], op = w >> 26;
+        DInst *d = &prog[pc];
+        memset(d, 0, sizeof *d);
+        d->w = w; d->op = (uint8_t)op;
+        if (op < 0x20) {
+            int inv = op >= 0x18 && op <= 0x1b;
+            uint32_t ds = sh->desc[w & 0x7f], rel = (w >> 19) & 3;
+            d->kind = 0; d->dest = (uint8_t)((w >> 21) & 0x1f); d->mask = (uint8_t)(ds & 15);
+            set_src(d, 0, inv ? (w >> 14) & 0x1f : (w >> 12) & 0x7f, inv ? 0 : rel, (ds >> 5) & 0xff, (ds >> 4) & 1);
+            set_src(d, 1, inv ? (w >> 7) & 0x7f : (w >> 7) & 0x1f, inv ? rel : 0, (ds >> 14) & 0xff, (ds >> 13) & 1);
+        } else if ((op & ~1u) == 0x2e) {
+            uint32_t ds = sh->desc[w & 0x7f];
+            d->kind = 1;
+            set_src(d, 0, (w >> 12) & 0x7f, (w >> 19) & 3, (ds >> 5) & 0xff, (ds >> 4) & 1);
+            set_src(d, 1, (w >> 7) & 0x1f, 0, (ds >> 14) & 0xff, (ds >> 13) & 1);
+        } else if (op >= 0x30) {
+            int madi = (op & ~7u) == 0x30;
+            uint32_t ds = sh->desc[w & 0x1f], rel = (w >> 22) & 3;
+            d->kind = 2; d->dest = (uint8_t)((w >> 24) & 0x1f); d->mask = (uint8_t)(ds & 15);
+            set_src(d, 0, (w >> 17) & 0x1f, 0, (ds >> 5) & 0xff, (ds >> 4) & 1);
+            set_src(d, 1, madi ? (w >> 12) & 0x1f : (w >> 10) & 0x7f, madi ? 0 : rel, (ds >> 14) & 0xff, (ds >> 13) & 1);
+            set_src(d, 2, madi ? (w >> 5) & 0x7f : (w >> 5) & 0x1f, madi ? rel : 0, (ds >> 23) & 0xff, (ds >> 22) & 1);
+        } else d->kind = 3;
+    }
+    prog_ok = 1;
+}
+static inline void fetchd(const PicaShader *sh, const ShState *st, const float in[16][4], const DInst *d, int k, float out[4]) {
+    uint32_t raw = d->src[k];
+    const float *src;
+    if (raw < 0x10) src = in[raw];
+    else if (raw < 0x20) src = st->r[raw - 0x10];
+    else {
+        int32_t u = (int32_t)raw - 0x20;
+        if (d->rel[k]) {
+            int32_t off = d->rel[k] == 1 ? st->a0x : d->rel[k] == 2 ? st->a0y : st->aL;
+            if (off < -128 || off > 127) off = 0;
+            u = (u + off) & 0x7f;
+        }
+        src = u < 96 ? sh->uniform[u] : ONES;
+    }
+    const uint8_t *z = d->swz[k];
+    if (d->neg[k]) { out[0] = -src[z[0]]; out[1] = -src[z[1]]; out[2] = -src[z[2]]; out[3] = -src[z[3]]; }
+    else { out[0] = src[z[0]]; out[1] = src[z[1]]; out[2] = src[z[2]]; out[3] = src[z[3]]; }
+}
+
+/* Runs the program from entry. Returns 0 on success, -1 on a runaway program. Call pica_shader_prepare first. */
 int pica_shader_run(const PicaShader *sh, uint32_t entry, const float in[16][4], float out[16][4]) {
+    if (!prog_ok) pica_shader_prepare(sh);
     ShState st;
     memset(&st, 0, sizeof st);
     Frame stack[16]; int sp = 0;
     uint32_t pc = entry;
     for (int steps = 0; steps < 200000; steps++) {
         if (pc >= 512) return 0;
-        uint32_t w = sh->code[pc], op = w >> 26, next = pc + 1;
+        const DInst *di = &prog[pc];
+        uint32_t w = di->w, op = di->op, next = pc + 1;
         int jumped = 0;
-        if (op < 0x20) {                                              /* arithmetic, common format */
-            int inv = op >= 0x18 && op <= 0x1b;
-            uint32_t d = sh->desc[w & 0x7f], dest = (w >> 21) & 0x1f, mask = d & 15, rel = (w >> 19) & 3;
-            uint32_t s1 = inv ? (w >> 14) & 0x1f : (w >> 12) & 0x7f, s2 = inv ? (w >> 7) & 0x7f : (w >> 7) & 0x1f;
+        if (di->kind == 0) {                                          /* arithmetic, common format */
             float a[4], b[4], r[4];
-            fetch(sh, &st, in, s1, inv ? 0 : rel, (d >> 5) & 0xff, (d >> 4) & 1, a);
-            fetch(sh, &st, in, s2, inv ? rel : 0, (d >> 14) & 0xff, (d >> 13) & 1, b);
+            fetchd(sh, &st, in, di, 0, a);
+            fetchd(sh, &st, in, di, 1, b);
             switch (op) {
             case 0x00: for (int i = 0; i < 4; i++) r[i] = a[i] + b[i]; break;
             case 0x01: { float s = fmul(a[0], b[0]) + fmul(a[1], b[1]) + fmul(a[2], b[2]); r[0] = r[1] = r[2] = r[3] = s; break; }
@@ -101,32 +142,28 @@ int pica_shader_run(const PicaShader *sh, uint32_t entry, const float in[16][4],
             case 0x0d: for (int i = 0; i < 4; i++) r[i] = a[i] < b[i] ? a[i] : b[i]; break;
             case 0x0e: r[0] = r[1] = r[2] = r[3] = 1.0f / a[0]; break;
             case 0x0f: r[0] = r[1] = r[2] = r[3] = 1.0f / sqrtf(a[0]); break;
-            case 0x12: if (mask & 8) st.a0x = (int32_t)a[0]; if (mask & 4) st.a0y = (int32_t)a[1]; goto done;   /* MOVA */
+            case 0x12: if (di->mask & 8) st.a0x = (int32_t)a[0]; if (di->mask & 4) st.a0y = (int32_t)a[1]; goto done;   /* MOVA */
             case 0x13: memcpy(r, a, sizeof r); break;
             default:
                 if (!warned_unimpl[op]) { warned_unimpl[op] = 1; fprintf(stderr, "pica: shader opcode %02x is not implemented (result left unchanged)\n", op); }
                 goto done;
             }
-            store(out, &st, dest, mask, r);
-        } else if ((op & ~1u) == 0x2e) {                             /* CMP */
-            uint32_t d = sh->desc[w & 0x7f], rel = (w >> 19) & 3;
+            store(out, &st, di->dest, di->mask, r);
+        } else if (di->kind == 1) {                                   /* CMP */
             float a[4], b[4];
-            fetch(sh, &st, in, (w >> 12) & 0x7f, rel, (d >> 5) & 0xff, (d >> 4) & 1, a);
-            fetch(sh, &st, in, (w >> 7) & 0x1f, 0, (d >> 14) & 0xff, (d >> 13) & 1, b);
+            fetchd(sh, &st, in, di, 0, a);
+            fetchd(sh, &st, in, di, 1, b);
             uint32_t ox = (w >> 24) & 7, oy = (w >> 21) & 7;
             if (sh_test == 3) { uint32_t t = ox; ox = oy; oy = t; }
             if (ox < 6) st.cc[0] = cmp_op(ox, a[0], b[0]);
             if (oy < 6) st.cc[1] = cmp_op(oy, a[1], b[1]);
-        } else if (op >= 0x30) {                                      /* MAD / MADI */
-            int madi = (op & ~7u) == 0x30;
-            uint32_t d = sh->desc[w & 0x1f], dest = (w >> 24) & 0x1f, rel = (w >> 22) & 3;
-            uint32_t s1 = (w >> 17) & 0x1f, s2 = madi ? (w >> 12) & 0x1f : (w >> 10) & 0x7f, s3 = madi ? (w >> 5) & 0x7f : (w >> 5) & 0x1f;
+        } else if (di->kind == 2) {                                   /* MAD / MADI */
             float a[4], b[4], c3[4], r[4];
-            fetch(sh, &st, in, s1, 0, (d >> 5) & 0xff, (d >> 4) & 1, a);
-            fetch(sh, &st, in, s2, madi ? 0 : rel, (d >> 14) & 0xff, (d >> 13) & 1, b);
-            fetch(sh, &st, in, s3, madi ? rel : 0, (d >> 23) & 0xff, (d >> 22) & 1, c3);
+            fetchd(sh, &st, in, di, 0, a);
+            fetchd(sh, &st, in, di, 1, b);
+            fetchd(sh, &st, in, di, 2, c3);
             for (int i = 0; i < 4; i++) r[i] = fmul(a[i], b[i]) + c3[i];
-            store(out, &st, dest, d & 15, r);
+            store(out, &st, di->dest, di->mask, r);
         } else {                                                      /* flow control */
             uint32_t target = (w >> 10) & 0xfff, count = w & 0xff;
             int bval = (sh->bools >> ((w >> 22) & 15)) & 1;

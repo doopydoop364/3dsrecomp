@@ -10,6 +10,7 @@ typedef struct {
     uint32_t ints[4];          /* i0-i3: x y z w bytes */
 } PicaShader;
 
+void pica_shader_prepare(const PicaShader *sh);   /* decode the program when it changed (before running it) */
 int pica_shader_run(const PicaShader *sh, uint32_t entry, const float in[16][4], float out[16][4]);
 
 void pica_run_list(uint32_t vaddr, uint32_t size);   /* execute a command list (virtual address) */
@@ -18,3 +19,4 @@ int pica_save_state(const char *path);
 int pica_load_state(const char *path);
 uint64_t pica_draw_count(void);
 uint64_t gpu_frame(void);
+void pica_counters(uint64_t out[7]);

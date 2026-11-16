@@ -34,3 +34,16 @@ extern int vkr_on;
 void vkr_display_link(uint32_t in, uint32_t out, uint32_t iw, uint32_t ih, uint32_t flags);   /* before a display transfer */
 /* Full-resolution RGBA (rows = PICA y, 240*scale wide) of the surface last transferred to `out`, or 0. */
 const uint8_t *vkr_hires(uint32_t out, uint32_t want_h, uint32_t *w, uint32_t *h, int *flip, uint32_t *scale);
+
+/* Window presentation through Vulkan (video.present = "vulkan"). vkr_init_present: before the first draw, with the
+ * window system's instance extensions and a callback that creates the window surface; returns 1 if presenting. */
+int vkr_init_present(const char *const *exts, uint32_t n, int (*mksurf)(void *instance, uint64_t *surface));
+int vkr_presenting(void);
+typedef struct {
+    uint32_t fb;                 /* guest framebuffer address shown on this screen (matches a display-transfer output) */
+    const uint8_t *native;       /* the native screen image (RGBA, nw x 240, row stride bytes), used without a snapshot */
+    uint32_t nw; size_t stride;
+    float rect[4];               /* x, y, w, h in window pixels; w <= 0 hides the screen */
+} VkrScreen;
+void vkr_present(const VkrScreen scr[2], uint32_t win_w, uint32_t win_h, const uint8_t *overlay, uint32_t ow, uint32_t oh, int overlay_dirty, int fxaa);
+void vkr_counters(uint64_t out[4]);

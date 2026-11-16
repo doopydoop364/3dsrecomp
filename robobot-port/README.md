@@ -33,6 +33,10 @@ WASD move (double-tap to dash) · W or Space jump/hover · J inhale/attack/armor
 L use Assist Star · Left Shift or Q guard (+direction dodge) · E = R · Enter pause · Backspace select · arrows d-pad ·
 S+Space slide · Tab fast-forward · F5/F6 amiibo tap/remove. A control can list several keys: `l = "Left Shift, Q"`.
 
+## Profiling a slow spot
+Press F10 where the game slows down: the next 300 frames are recorded and `profile_<frame>.txt` (in the folder you run
+from) shows where each frame's time went: vertex shading, clipping, GPU waits, textures, game code, draws and vertices.
+
 ## Overlay menu
 Esc (or the gamepad's Guide button) pauses and opens the menu: layout, swap screens, fullscreen, volume, FPS counter,
 fast-forward mode and key rebinding apply at once; resolution, texture filtering, anisotropy and renderer apply after a
@@ -63,7 +67,9 @@ library itself must be installed, since the binary links it; loading it at runti
   the native image (averaged on the GPU), and a screen that came straight from a rendered surface through a plain display
   transfer is shown from the full-resolution surface. F12 / `RB_SHOT` also write `_hi` screenshots. Uncapped headless speed
   in stage 1: about 71 fps at 2x, about 50 fps at 4x (GPU-bound; the CPU waits for the GPU at every sync point).
-- Not done yet: Vulkan presentation (the window still uses SDL's renderer, so full-resolution frames are read back),
+- Vulkan presentation (opt-in, `video.present = "vulkan"`, with `video.antialias = "fxaa"`): the window is drawn by
+  Vulkan from snapshots of the rendered surfaces; falls back to SDL if it cannot start. Not yet tested on a real window.
+- Not done yet: making Vulkan presentation the default,
   CPU/GPU overlap, GPU-side display transfers.
 
 ## Motion controls
