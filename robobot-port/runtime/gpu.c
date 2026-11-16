@@ -20,7 +20,8 @@ static uint64_t ns_gpu, ns_transfer;              /* host time spent executing G
 static uint64_t host_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
 uint64_t gpu_frame(void) { return frames; }
 uint64_t gpu_swaps(void) { return swaps; }
-void gpu_counters(uint64_t out[2]) { out[0] = ns_gpu; out[1] = ns_transfer; }   /* ns in command lists, display transfers */      /* frames the game finished (buffer swaps), for the FPS counter */
+static uint64_t ns_gpu_vk;                          /* part of ns_gpu spent waiting for the Vulkan GPU / writing back */
+void gpu_counters(uint64_t out[3]) { out[0] = ns_gpu; out[1] = ns_transfer; out[2] = ns_gpu_vk; }   /* ns: command lists, display transfers, Vulkan waits inside lists */      /* frames the game finished (buffer swaps), for the FPS counter */
 void gpu_report(void);
 
 static void reply(uint32_t *cmd, int normal, int translate) {
@@ -129,7 +130,8 @@ static void run_queue(void) {
         switch (id) {
         case 0: vkr_sync_range(c[1], c[3], 0); vkr_sync_range(c[2], c[3], 1);
                 if (mem_valid(c[1], c[3]) && mem_valid(c[2], c[3])) memmove((void *)(uintptr_t)c[2], (void *)(uintptr_t)c[1], c[3]); irq(IRQ_DMA); break;
-        case 1: { uint64_t t0 = host_ns(); uint64_t d0 = pica_draw_count(); lists++; pica_run_list(c[1], c[2]); uint64_t dt = host_ns() - t0; ns_gpu += dt;
+        case 1: { uint64_t vk0[4], vk1[4]; vkr_counters(vk0); uint64_t t0 = host_ns(); uint64_t d0 = pica_draw_count(); lists++; pica_run_list(c[1], c[2]); uint64_t dt = host_ns() - t0; ns_gpu += dt;
+                  vkr_counters(vk1); ns_gpu_vk += (vk1[0] - vk0[0]) + (vk1[1] - vk0[1]);
                   { static int64_t tf = -2; if (tf == -2) { const char *e = getenv("RB_TIME_FRAME"); tf = e ? atoll(e) : -1; }
                     if ((int64_t)frames == tf) fprintf(stderr, "gpu: list %08x (%u bytes): %.2f ms, %llu draws\n", c[1], c[2], (double)dt / 1e6, (unsigned long long)(pica_draw_count() - d0)); }
                   irq(IRQ_P3D); break; }

@@ -27,8 +27,8 @@ static SDL_FRect r_top, r_bot;                         /* where each screen is d
 static SDL_Scancode ff_key; static int ff_toggle, ff_on;
 static int show_fps;
 /* In-game profiler: F10 records the next 300 frames and writes profile_<frame>.txt (where the time per frame went). */
-void pica_counters(uint64_t out[7]); void gpu_counters(uint64_t out[2]);
-static int prof_left; static uint64_t prof_frame0, prof_wall0, prof_p0[7], prof_v0[4], prof_g0[2], prof_paced0; static double prof_emu_max;
+void gpu_counters(uint64_t out[3]); void pica_counters(uint64_t out[9]);
+static int prof_left; static uint64_t prof_frame0, prof_wall0, prof_p0[9], prof_v0[4], prof_g0[3], prof_paced0; static double prof_emu_max;
 extern uint64_t k_paced_ns;
 static uint64_t wall_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
 static void prof_start(uint64_t frame) {
@@ -37,27 +37,29 @@ static void prof_start(uint64_t frame) {
     fprintf(stderr, "profiler: recording 300 frames\n");
 }
 static void prof_end(uint64_t frame) {
-    uint64_t p[7], v[4], g[2]; pica_counters(p); vkr_counters(v); gpu_counters(g);
+    uint64_t p[9], v[4], g[3]; pica_counters(p); vkr_counters(v); gpu_counters(g);
     double n = (double)(frame - prof_frame0), wall = (double)(wall_now() - prof_wall0) / 1e6 / n, slept = (double)(k_paced_ns - prof_paced0) / 1e6 / n;
-    double ms[7], vm[3], gm[2];
-    for (int i = 0; i < 4; i++) ms[i] = (double)(p[i] - prof_p0[i]) / 1e6 / n;
-    for (int i = 4; i < 7; i++) ms[i] = (double)(p[i] - prof_p0[i]) / n;
-    for (int i = 0; i < 3; i++) vm[i] = (double)(v[i] - prof_v0[i]) / 1e6 / n;
-    for (int i = 0; i < 2; i++) gm[i] = (double)(g[i] - prof_g0[i]) / 1e6 / n;
-    double gpu_lists = gm[0], other = wall - slept - gpu_lists - gm[1] - vm[0] - vm[1];
+#define D(a, b) ((double)((a) - (b)) / 1e6 / n)
+    double lists = D(g[0], prof_g0[0]), lists_vk = D(g[2], prof_g0[2]), transfers = D(g[1], prof_g0[1]);
+    double vkwait = D(v[0], prof_v0[0]) + D(v[1], prof_v0[1]), vk_outside = vkwait - lists_vk;
+    double other = wall - slept - lists - transfers - vk_outside;
     char path[64]; snprintf(path, sizeof path, "profile_%06llu.txt", (unsigned long long)frame);
     FILE *f = fopen(path, "w");
     if (f) {
-        fprintf(f, "frames %llu-%llu: %.2f ms wall per frame (%.1f fps), %.2f ms of it pacing sleep, worst emu frame %.1f ms\n",
+        fprintf(f, "frames %llu-%llu: %.2f ms per frame (%.1f fps); %.2f ms of that was pacing sleep; worst emulation frame %.1f ms\n",
                 (unsigned long long)prof_frame0, (unsigned long long)frame, wall, 1000.0 / wall, slept, prof_emu_max);
-        fprintf(f, "GPU command lists %.2f ms: draw setup %.2f, vertex shading %.2f, assembly+clipping %.2f, rasterise/record %.2f\n",
-                gpu_lists, ms[0], ms[1], ms[2], ms[3]);
-        fprintf(f, "Vulkan: waiting for the GPU %.2f ms, surface write-back %.2f ms, textures %.2f ms, %.1f texture uploads\n",
-                vm[0], vm[1], vm[2], (double)(v[3] - prof_v0[3]) / n);
-        fprintf(f, "display transfers %.2f ms; everything else (game code, services, audio, window) %.2f ms\n", gm[1], other);
-        fprintf(f, "per frame: %.0f draws, %.0f triangles, %.0f vertices shaded\n", ms[4], ms[5], ms[6]);
+        fprintf(f, "GPU command lists %.2f ms per frame, of which:\n", lists);
+        fprintf(f, "  vertex shading %.2f (main thread waiting for shading threads %.2f), clipping+assembly %.2f, draw setup %.2f,\n"
+                   "  Vulkan recording %.2f, Vulkan waits/write-backs inside lists %.2f\n",
+                D(p[1], prof_p0[1]), D(p[7], prof_p0[7]), D(p[2], prof_p0[2]), D(p[0], prof_p0[0]), D(p[3], prof_p0[3]), lists_vk);
+        fprintf(f, "Vulkan waits/write-backs outside lists (display, vblank) %.2f ms; display transfers %.2f ms; textures %.2f ms (%.1f uploads)\n",
+                vk_outside, transfers, D(v[2], prof_v0[2]), (double)(v[3] - prof_v0[3]) / n);
+        fprintf(f, "everything else (game code, services, audio, window) %.2f ms\n", other);
+        fprintf(f, "per frame: %.0f draws, %.0f triangles drawn (%.0f submitted triangles needed no clipping), %.0f vertices shaded\n",
+                (double)(p[4] - prof_p0[4]) / n, (double)(p[5] - prof_p0[5]) / n, (double)(p[8] - prof_p0[8]) / n, (double)(p[6] - prof_p0[6]) / n);
         fclose(f);
     }
+#undef D
     fprintf(stderr, "profiler: written to %s\n", path);
 }
 /* video.present = "vulkan": Vulkan draws the window (vk.c); SDL's software renderer draws only the overlay (menu,

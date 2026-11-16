@@ -19,7 +19,8 @@ static float dflt[16][4]; static uint32_t dflt_queue[3]; static int dflt_n;
 static uint64_t n_partial_uni, n_f32_uni, n_f24_uni;
 static uint64_t t_shade, t_assemble, t_raster, t_setup;
 static uint64_t pns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
-static uint64_t n_in_tris, n_clipped, n_culled;
+static uint64_t n_in_tris, n_clipped, n_culled, n_trivial;
+static uint64_t t_pool_wait;                 /* main thread waiting for shading workers */
 static int dump_draw = -1, dump_left;
 static float ndc_min[2], ndc_max[2];
 static uint64_t vtx_out[7], vtx_total, frag_cov, frag_alpha, frag_depth, frag_stencil;
@@ -32,7 +33,8 @@ uint64_t pica_draw_count(void) { return n_draws; }
 static uint64_t n_shaded;                       /* vertices run through the vertex shader */
 /* Running totals for the in-game profiler (F10): ns in draw setup, vertex shading, assembly+clipping, rasterisation
  * (software) or Vulkan recording; then draws, triangles, shaded vertices. */
-void pica_counters(uint64_t out[7]) { out[0] = t_setup; out[1] = t_shade; out[2] = t_assemble; out[3] = t_raster; out[4] = n_draws; out[5] = n_tris; out[6] = n_shaded; }
+void pica_counters(uint64_t out[9]) { out[0] = t_setup; out[1] = t_shade; out[2] = t_assemble; out[3] = t_raster; out[4] = n_draws; out[5] = n_tris; out[6] = n_shaded;
+                                       out[7] = t_pool_wait; out[8] = n_trivial; }
 
 /* ---- addresses: everything inside command lists and GPU registers is physical ---- */
 static uint8_t *phys(uint32_t p, uint32_t size) {
@@ -894,6 +896,17 @@ static void triangle(const Fb *fb, const Vtx *a, const Vtx *b, const Vtx *c) {
     }
     int n = 3;
     Vtx *src = buf1, *dst = buf2;
+    /* Trivial accept: when every vertex is inside every plane, clip_poly would copy its input unchanged, so skip it. */
+    int inside = 1;
+    for (int v = 0; v < 3 && inside; v++) {
+        const float *q = buf1[v].a;
+        for (int p = 0; p < 6; p++)
+            if (q[0] * planes[p][0] + q[1] * planes[p][1] + q[2] * planes[p][2] + q[3] * planes[p][3] < -1e-8f) { inside = 0; break; }
+        if (inside && (q[3] + 1e-5f) * wplane[3] < -1e-8f) inside = 0;
+        if (inside && (reg[0x047] & 1) &&
+            q[0] * f24(reg[0x048]) + q[1] * f24(reg[0x049]) + q[2] * f24(reg[0x04a]) + q[3] * f24(reg[0x04b]) < -1e-8f) inside = 0;
+    }
+    if (inside) { n_trivial++; goto accepted; }
     for (int p = 0; p < 7 && n >= 3; p++) {
         n = p < 6 ? clip_poly(src, n, dst, planes[p], 0.0f) : clip_poly(src, n, dst, wplane, 1e-5f);
         Vtx *t = src; src = dst; dst = t;
@@ -905,6 +918,7 @@ static void triangle(const Fb *fb, const Vtx *a, const Vtx *b, const Vtx *c) {
         Vtx *t = src; src = dst; dst = t;
         if (n < 3) return;
     }
+accepted:
     for (int i = 0; i < n; i++) to_screen(&src[i]);
     for (int i = 0; i + 2 < n; i++) queue_tri(&src[0], &src[i + 1], &src[i + 2]);
     (void)fb;
@@ -920,8 +934,15 @@ static FragStats job_stats[64];
 static int job_kind;                                   /* 0 rasterise bands, 1 shade vertices */
 static uint32_t job_base, job_nv; static const uint32_t *job_vlist; static Vtx *job_vout;
 static void shade_vertex(uint32_t base, uint32_t vertex, Vtx *out);
+static uint32_t job_next;                               /* next vertex chunk to take (dynamic load balancing) */
 static void run_vertices(int b, int n) {
-    for (uint32_t i = (uint32_t)b; i < job_nv; i += (uint32_t)n) shade_vertex(job_base, job_vlist[i], &job_vout[job_vlist[i]]);
+    (void)b; (void)n;
+    for (;;) {
+        uint32_t i = __atomic_fetch_add(&job_next, 32, __ATOMIC_RELAXED);
+        if (i >= job_nv) break;
+        uint32_t e = i + 32 < job_nv ? i + 32 : job_nv;
+        for (; i < e; i++) shade_vertex(job_base, job_vlist[i], &job_vout[job_vlist[i]]);
+    }
 }
 
 static void run_band(int b) {
@@ -930,42 +951,61 @@ static void run_band(int b) {
     for (int i = 0; i < ntris; i++) raster_band(job_fb, &tris[i], lo, hi, &st);
     job_stats[b] = st;
 }
+/* Workers spin briefly before sleeping: a frame has ~100+ small draws back to back, and waking sleeping threads for
+ * each one cost the main thread more than the shading itself. */
+#define POOL_SPIN 4000
+static inline void cpu_relax(void) {
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#endif
+}
 static void *worker(void *arg) {
     int b = (int)(intptr_t)arg;
     uint64_t seen = 0;
     for (;;) {
-        pthread_mutex_lock(&pool_mu);
-        while (pool_gen == seen) pthread_cond_wait(&pool_start, &pool_mu);
-        seen = pool_gen;
-        pthread_mutex_unlock(&pool_mu);
+        for (int spin = 0; __atomic_load_n(&pool_gen, __ATOMIC_ACQUIRE) == seen; spin++) {
+            if (spin < POOL_SPIN) { cpu_relax(); continue; }
+            pthread_mutex_lock(&pool_mu);
+            while (__atomic_load_n(&pool_gen, __ATOMIC_ACQUIRE) == seen) pthread_cond_wait(&pool_start, &pool_mu);
+            pthread_mutex_unlock(&pool_mu);
+        }
+        seen = __atomic_load_n(&pool_gen, __ATOMIC_ACQUIRE);
         if (job_kind == 0) run_band(b); else run_vertices(b, nworkers);
-        pthread_mutex_lock(&pool_mu);
-        if (--pool_pending == 0) pthread_cond_signal(&pool_done);
-        pthread_mutex_unlock(&pool_mu);
+        if (__atomic_sub_fetch(&pool_pending, 1, __ATOMIC_ACQ_REL) == 0) {
+            pthread_mutex_lock(&pool_mu); pthread_cond_signal(&pool_done); pthread_mutex_unlock(&pool_mu);
+        }
     }
     return 0;
 }
 static void pool_init(void) {
     if (nworkers >= 0) return;
     const char *e = getenv("RB_THREADS");              /* RB_THREADS=n sets the thread count (1 = no threads) */
-    long n = e ? atol(e) : sysconf(_SC_NPROCESSORS_ONLN);
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    FILE *smt = fopen("/sys/devices/system/cpu/smt/active", "r");   /* one thread per physical core: hyperthread pairs
+                                                                       sharing a core made shading slower, not faster */
+    if (smt) { int on = 0; if (fscanf(smt, "%d", &on) == 1 && on && n >= 4) n /= 2; fclose(smt); }
+    if (e) n = atol(e);
     nworkers = (int)(n < 1 ? 1 : n > 64 ? 64 : n);
     for (int i = 1; i < nworkers; i++) { pthread_t t; pthread_create(&t, 0, worker, (void *)(intptr_t)i); pthread_detach(t); }
 }
 static void pool_run(int kind) {                       /* run a job on all threads, including this one */
     job_kind = kind;
+    __atomic_store_n(&pool_pending, nworkers - 1, __ATOMIC_RELEASE);
     pthread_mutex_lock(&pool_mu);
-    pool_pending = nworkers - 1; pool_gen++;
+    __atomic_add_fetch(&pool_gen, 1, __ATOMIC_RELEASE);
     pthread_cond_broadcast(&pool_start);
     pthread_mutex_unlock(&pool_mu);
     if (kind == 0) run_band(0); else run_vertices(0, nworkers);
+    uint64_t tw = pns();
+    for (int spin = 0; __atomic_load_n(&pool_pending, __ATOMIC_ACQUIRE) && spin < POOL_SPIN * 4; spin++) cpu_relax();
     pthread_mutex_lock(&pool_mu);
-    while (pool_pending) pthread_cond_wait(&pool_done, &pool_mu);
+    while (__atomic_load_n(&pool_pending, __ATOMIC_ACQUIRE)) pthread_cond_wait(&pool_done, &pool_mu);
     pthread_mutex_unlock(&pool_mu);
+    t_pool_wait += pns() - tw;
 }
 static void shade_vertices(uint32_t base, const uint32_t *list, uint32_t n, Vtx *out) {
     pool_init();
-    job_base = base; job_vlist = list; job_nv = n; job_vout = out;
+    job_base = base; job_vlist = list; job_nv = n; job_vout = out; job_next = 0;
     if (nworkers == 1 || n < 48) run_vertices(0, 1);
     else pool_run(1);
 }

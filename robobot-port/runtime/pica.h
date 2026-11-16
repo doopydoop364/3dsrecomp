@@ -19,4 +19,4 @@ int pica_save_state(const char *path);
 int pica_load_state(const char *path);
 uint64_t pica_draw_count(void);
 uint64_t gpu_frame(void);
-void pica_counters(uint64_t out[7]);
+void pica_counters(uint64_t out[9]);   /* profiler totals, see pica.c */
