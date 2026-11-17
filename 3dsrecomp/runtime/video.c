@@ -117,7 +117,9 @@ static const struct { const char *name, *def; uint32_t bit; } binds_def[] = {
 #define NBINDS (sizeof binds_def / sizeof *binds_def)
 #define NALT 4                                          /* keys per control: "Left Shift, Q" binds both */
 static SDL_Scancode binds[NBINDS][NALT];
+static int pad_xbox;           /* gamepad face buttons by label (Xbox: the A button is 3DS A) instead of by position */
 static void load_binds(void) {
+    pad_xbox = !strcmp(settings_get("controls.gamepad_layout", "nintendo"), "xbox");
     for (unsigned i = 0; i < NBINDS; i++) {
         char key[64]; snprintf(key, sizeof key, "controls.%s", binds_def[i].name);
         char list[64]; snprintf(list, sizeof list, "%s", settings_get(key, binds_def[i].def));
@@ -154,10 +156,12 @@ static void poll_host_input(void) {
     if (bind_down(k, 19)) sy -= 156;
     if (bind_down(k, 20)) sx -= 156;
     if (bind_down(k, 21)) sx += 156;
-    if (pad) {                                         /* positional (Nintendo) layout: east = A, south = B */
-        static const struct { SDL_GamepadButton b; uint32_t bit; } pb[] = {
-            { SDL_GAMEPAD_BUTTON_EAST, BTN_A }, { SDL_GAMEPAD_BUTTON_SOUTH, BTN_B }, { SDL_GAMEPAD_BUTTON_NORTH, BTN_X },
-            { SDL_GAMEPAD_BUTTON_WEST, BTN_Y }, { SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, BTN_L }, { SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, BTN_R },
+    if (pad) {                                         /* Nintendo layout: by position (east = A, south = B);
+                                                          Xbox layout: by label (south "A" = A, east "B" = B, west "X" = X) */
+        uint32_t east = pad_xbox ? BTN_B : BTN_A, south = pad_xbox ? BTN_A : BTN_B, north = pad_xbox ? BTN_Y : BTN_X, west = pad_xbox ? BTN_X : BTN_Y;
+        const struct { SDL_GamepadButton b; uint32_t bit; } pb[] = {
+            { SDL_GAMEPAD_BUTTON_EAST, east }, { SDL_GAMEPAD_BUTTON_SOUTH, south }, { SDL_GAMEPAD_BUTTON_NORTH, north },
+            { SDL_GAMEPAD_BUTTON_WEST, west }, { SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, BTN_L }, { SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, BTN_R },
             { SDL_GAMEPAD_BUTTON_START, BTN_START }, { SDL_GAMEPAD_BUTTON_BACK, BTN_SELECT }, { SDL_GAMEPAD_BUTTON_DPAD_UP, BTN_UP },
             { SDL_GAMEPAD_BUTTON_DPAD_DOWN, BTN_DOWN }, { SDL_GAMEPAD_BUTTON_DPAD_LEFT, BTN_LEFT }, { SDL_GAMEPAD_BUTTON_DPAD_RIGHT, BTN_RIGHT } };
         for (unsigned i = 0; i < sizeof pb / sizeof *pb; i++) if (SDL_GetGamepadButton(pad, pb[i].b)) s.buttons |= pb[i].bit;
@@ -388,7 +392,7 @@ static void text(float x, float y, float sc, const char *t, uint8_t r, uint8_t g
     SDL_SetRenderScale(ren, sc, sc); SDL_SetRenderDrawColor(ren, r, g, b, 255);
     SDL_RenderDebugText(ren, x / sc, y / sc, t); SDL_SetRenderScale(ren, 1, 1);
 }
-enum { MI_RESUME, MI_LAYOUT, MI_SWAP, MI_FULL, MI_VOLUME, MI_FPS, MI_FFMODE, MI_AA, MI_SCALE, MI_FILTER, MI_ANISO, MI_RENDERER,
+enum { MI_RESUME, MI_LAYOUT, MI_SWAP, MI_FULL, MI_VOLUME, MI_FPS, MI_FFMODE, MI_PAD, MI_AA, MI_SCALE, MI_FILTER, MI_ANISO, MI_RENDERER,
        MI_CONTROLS, MI_SAVE, MI_QUIT, MI_N };
 static void item_text(int i, char *o, size_t n) {
     int full = (SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN) != 0;
@@ -400,6 +404,7 @@ static void item_text(int i, char *o, size_t n) {
     case MI_VOLUME: snprintf(o, n, "Volume          < %d%% >", m_volume); break;
     case MI_FPS: snprintf(o, n, "FPS counter     < %s >", show_fps ? "on" : "off"); break;
     case MI_FFMODE: snprintf(o, n, "Fast-forward    < %s >", ff_toggle ? "toggle" : "hold"); break;
+    case MI_PAD: snprintf(o, n, "Gamepad buttons < %s >", pad_xbox ? "xbox (by label)" : "nintendo (by position)"); break;
     case MI_AA: snprintf(o, n, vkpresent ? "Anti-aliasing   < %s >" : "Anti-aliasing   < %s >  (Vulkan window only)", fxaa_on ? "fxaa" : "off"); break;
     case MI_SCALE: snprintf(o, n, "Resolution      < %dx >  (restart)", m_scale); break;
     case MI_FILTER: snprintf(o, n, "Textures        < %s >  (restart)", filters[m_filter]); break;
@@ -418,6 +423,7 @@ static void item_change(int i, int d) {
     case MI_VOLUME: m_volume += 10 * d; if (m_volume < 0) m_volume = 0; if (m_volume > 200) m_volume = 200; audio_set_volume(m_volume); break;
     case MI_FPS: show_fps = !show_fps; break;
     case MI_FFMODE: ff_toggle = !ff_toggle; ff_on = 0; k_set_fast_forward(0); break;
+    case MI_PAD: pad_xbox = !pad_xbox; break;
     case MI_AA: fxaa_on = !fxaa_on; break;
     case MI_SCALE: m_scale += d; if (m_scale < 1) m_scale = 4; if (m_scale > 4) m_scale = 1; break;
     case MI_FILTER: m_filter = (m_filter + d + 3) % 3; break;
@@ -435,6 +441,7 @@ static void menu_save(void) {
     settings_save("video.show_fps", show_fps ? "true" : "false");
     settings_save("video.antialias", fxaa_on ? "fxaa" : "off");
     settings_save("controls.fast_forward_mode", ff_toggle ? "toggle" : "hold");
+    settings_save("controls.gamepad_layout", pad_xbox ? "xbox" : "nintendo");
     snprintf(v, sizeof v, "%d", m_scale); settings_save("video.scale", v);
     settings_save("video.texture_filter", filters[m_filter]);
     snprintf(v, sizeof v, "%d", anisos[m_aniso]); settings_save("video.anisotropy", v);
