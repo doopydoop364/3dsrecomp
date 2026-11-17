@@ -52,6 +52,34 @@ static void srv(KObject *s, uint32_t *cmd) {
     }
 }
 
+/* The shared font lives right after the application's memory in the linear mapping (0x18000000 for an Old 3DS
+ * title with its linear heap at 0x14000000). Its CFNT holds absolute pointers for the address it was dumped at;
+ * move them to the new one (as Azahar's BCFNT::RelocateSharedFont). */
+static void font_relocate(uint8_t *m, uint32_t size, uint32_t target) {
+    #define R32(o) (*(uint32_t *)(m + (o)))
+    uint32_t cfnt = 0x80;
+    if (size < cfnt + 0x14 || (memcmp(m + cfnt, "CFNT", 4) && memcmp(m + cfnt, "CFNU", 4))) { LOG(1, "apt: shared font has no CFNT/CFNU, not relocated"); return; }
+    uint32_t hsz = *(uint16_t *)(m + cfnt + 6), nblocks = R32(cfnt + 0x10);
+    uint32_t first_cmap = 0, assumed_cmap = 0, o = cfnt + hsz;
+    for (uint32_t b = 0; b < nblocks && o + 8 <= size; b++) {             /* find where the pointers assume the base is */
+        if (!first_cmap && !memcmp(m + o, "CMAP", 4)) first_cmap = o;
+        else if (!memcmp(m + o, "FINF", 4)) assumed_cmap = R32(o + 24) - 8;
+        o += R32(o + 4);
+    }
+    uint32_t prev = assumed_cmap - first_cmap, delta = target - prev;
+    if (!first_cmap || !delta) return;
+    o = cfnt + hsz;
+    for (uint32_t b = 0; b < nblocks && o + 8 <= size; b++) {
+        if (!memcmp(m + o, "FINF", 4)) { R32(o + 16) += delta; R32(o + 20) += delta; R32(o + 24) += delta; }
+        else if (!memcmp(m + o, "CMAP", 4)) { if (R32(o + 16)) R32(o + 16) += delta; }
+        else if (!memcmp(m + o, "CWDH", 4)) { if (R32(o + 12)) R32(o + 12) += delta; }
+        else if (!memcmp(m + o, "TGLP", 4)) R32(o + 28) += delta;
+        o += R32(o + 4);
+    }
+    LOG(1, "apt: shared font moved from %08x to %08x", prev, target);
+    #undef R32
+}
+
 /* ---- APT: applet manager. The game is the only running application and is never suspended. ---- */
 static KObject *apt_lock, *apt_notify_ev, *apt_param_ev;
 static int apt_param_pending;                 /* a Wakeup parameter is waiting to be received */
@@ -84,17 +112,17 @@ static void apt(KObject *s, uint32_t *cmd) {
     case 0x0044: {                                                     /* GetSharedFont */
         static KObject *font;
         if (!font) {
-            font = k_shmem(0x332000); font->prefer = 0x18000000;       /* the font block has a fixed address */
+            font = k_shmem(0x332000); font->prefer = LINEAR_BASE + app_mem_size;   /* after the application's memory */
             char fp[600]; sys_path(fp, sizeof fp, "shared_font.bin");
             FILE *f = fopen(fp, "rb");
             size_t n = f ? fread(font->mem, 1, font->size, f) : 0;
             if (f) fclose(f);
-            if (n) LOG(1, "apt: shared system font loaded from %s (%zu bytes)", fp, n);
+            if (n) { LOG(1, "apt: shared system font loaded from %s (%zu bytes)", fp, n); font_relocate(font->mem, (uint32_t)n, font->prefer); }
             else fatal("the game needs the shared system font, and %s is missing.\n"
                        "Build it with extract/make_shared_font.py from the font system archive dumped from your console\n"
                        "(title 0004009b00014002 on USA/EUR/JPN consoles).", fp);
         }
-        reply(cmd, 2, 2); cmd[2] = 0x18000000; cmd[3] = 0; cmd[4] = h_new(font);
+        reply(cmd, 2, 2); cmd[2] = font->prefer; cmd[3] = 0; cmd[4] = h_new(font);
         break;
     }
     case 0x0043: case 0x0055: reply(cmd, 1, 0); break;                 /* NotifyToWait, SetApplicationCpuTimeLimit */
