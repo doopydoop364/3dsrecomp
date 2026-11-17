@@ -13,8 +13,9 @@ static uint32_t fog_lut[128];               /* fog factors, filled through 0x0E8
 static uintptr_t cur_word;
 static uint32_t top_list, cur_list;         /* top-level list of this submission, and the list now executing */                 /* host address of the command word being executed */
 static uintptr_t uni_src[96];              /* where each uniform's last upload came from */
-static PicaShader vs;
+static PicaShader vs, gs;                  /* vertex and geometry shader units */
 static uint32_t uni_queue[4]; static int uni_n;
+static uint32_t gs_uni_queue[4]; static int gs_uni_n;
 static float dflt[16][4]; static uint32_t dflt_queue[3]; static int dflt_n;
 static uint64_t n_partial_uni, n_f32_uni, n_f24_uni;
 static uint64_t t_shade, t_assemble, t_raster, t_setup;
@@ -117,14 +118,42 @@ static uint32_t write_reg(uint32_t id, uint32_t value, uint32_t mask) {
     }
     case 0x2cc: case 0x2cd: case 0x2ce: case 0x2cf: case 0x2d0: case 0x2d1: case 0x2d2: case 0x2d3: {
         uint32_t o = reg[0x2cb];
-        if (o < 512) vs.code[o] = v;
+        if (o < 512) { vs.code[o] = v; if (!(reg[0x244] & 1)) gs.code[o] = v; }   /* units not configured apart: shared */
         reg[0x2cb] = o + 1;
         break;
     }
     case 0x2d6: case 0x2d7: case 0x2d8: case 0x2d9: case 0x2da: case 0x2db: case 0x2dc: case 0x2dd: {
         uint32_t o = reg[0x2d5];
-        if (o < 128) vs.desc[o] = v;
+        if (o < 128) { vs.desc[o] = v; if (!(reg[0x244] & 1)) gs.desc[o] = v; }
         reg[0x2d5] = o + 1;
+        break;
+    }
+    /* geometry shader unit: the same layout as the vertex shader's registers, 0x30 lower */
+    case 0x290: gs_uni_n = 0; break;
+    case 0x291: case 0x292: case 0x293: case 0x294: case 0x295: case 0x296: case 0x297: case 0x298: {
+        int f32 = (int)(reg[0x290] >> 31);
+        gs_uni_queue[gs_uni_n++] = v;
+        if (gs_uni_n == (f32 ? 4 : 3)) {
+            uint32_t idx = reg[0x290] & 0x7f;
+            if (idx < 96) {
+                if (f32) for (int i = 0; i < 4; i++) memcpy(&gs.uniform[idx][3 - i], &gs_uni_queue[i], 4);
+                else unpack24(gs_uni_queue, gs.uniform[idx]);
+            }
+            reg[0x290] = (reg[0x290] & ~0x7fu) | ((idx + 1) & 0x7f);
+            gs_uni_n = 0;
+        }
+        break;
+    }
+    case 0x29c: case 0x29d: case 0x29e: case 0x29f: case 0x2a0: case 0x2a1: case 0x2a2: case 0x2a3: {
+        uint32_t o = reg[0x29b];
+        if (o < 512) gs.code[o] = v;
+        reg[0x29b] = o + 1;
+        break;
+    }
+    case 0x2a6: case 0x2a7: case 0x2a8: case 0x2a9: case 0x2aa: case 0x2ab: case 0x2ac: case 0x2ad: {
+        uint32_t o = reg[0x2a5];
+        if (o < 128) gs.desc[o] = v;
+        reg[0x2a5] = o + 1;
         break;
     }
     default: break;
@@ -237,12 +266,11 @@ static void dump_vertex(uint32_t base, uint32_t vertex, const Vtx *v) {
     for (uint32_t r = 0; r < nin && r < 16; r++) fprintf(stderr, " v%u(%g %g %g %g)", r, in[r][0], in[r][1], in[r][2], in[r][3]);
     fprintf(stderr, "\n    out pos (%g %g %g %g) col (%g %g %g %g) tc0 (%g %g)\n", v->a[0], v->a[1], v->a[2], v->a[3], v->a[8], v->a[9], v->a[10], v->a[11], v->a[12], v->a[13]);
 }
-static void shade_vertex(uint32_t base, uint32_t vertex, Vtx *out) {
-    float in[16][4] = { { 0 } }, o[16][4] = { { 0 } };
-    load_vertex(base, vertex, in);
-    if (pica_shader_run(&vs, reg[0x2ba] & 0xffff, in, o) < 0) LOG(1, "pica: vertex shader did not finish");
+/* Output registers of the last shader stage (enabled by omask, in register order) -> vertex attributes, through
+ * the output semantic map 0x050-0x056. */
+static void map_outputs(const float o[16][4], uint32_t omask, Vtx *out) {
     for (int i = 0; i < NSEM; i++) out->a[i] = 1.0f;
-    uint32_t omask = reg[0x2bd] & 0xffff, total = reg[0x04f] & 7, slot = 0;
+    uint32_t total = reg[0x04f] & 7, slot = 0;
     for (uint32_t r = 0; r < 16 && slot < total; r++) {
         if (!((omask >> r) & 1)) continue;
         uint32_t sem = reg[0x050 + slot];
@@ -250,6 +278,12 @@ static void shade_vertex(uint32_t base, uint32_t vertex, Vtx *out) {
         slot++;
     }
     for (int c = 0; c < 4; c++) { float v = fabsf(out->a[S_COL + c]); out->a[S_COL + c] = v < 1.0f ? v : 1.0f; }
+}
+static void shade_vertex(uint32_t base, uint32_t vertex, Vtx *out) {
+    float in[16][4] = { { 0 } }, o[16][4] = { { 0 } };
+    load_vertex(base, vertex, in);
+    if (pica_shader_run(&vs, reg[0x2ba] & 0xffff, in, o) < 0) LOG(1, "pica: vertex shader did not finish");
+    map_outputs(o, reg[0x2bd] & 0xffff, out);
 }
 
 /* ---- framebuffer access ---- */
@@ -1122,6 +1156,48 @@ static void audit_draw(void) {
     }
 }
 
+/* ---- geometry shader: point mode (as Azahar's GeometryPipeline_Point) ----
+ * The vertex shader's outputs (the first vs_outmap_total of those its output mask enables, in register order) are
+ * collected; every gs_input_count of them become the geometry shader's inputs, placed by its input map. SETEMIT and
+ * EMIT then produce vertices, mapped through the output semantics like a vertex shader's; an EMIT with the primitive
+ * flag set completes a triangle of the three slots (winding swaps the first two). */
+static Vtx gs_slot[3];
+static const Fb *gs_fb;
+static void triangle(const Fb *fb, const Vtx *a, const Vtx *b, const Vtx *c);
+static void gs_emit(PicaEmitter *em, const float o[16][4]) {
+    if (em->vertex_id > 2) return;
+    map_outputs(o, reg[0x28d] & 0xffff, &gs_slot[em->vertex_id]);
+    if (em->prim_emit) {
+        if (em->winding) triangle(gs_fb, &gs_slot[1], &gs_slot[0], &gs_slot[2]);
+        else triangle(gs_fb, &gs_slot[0], &gs_slot[1], &gs_slot[2]);
+    }
+}
+static uint64_t n_gs_runs;
+static void gs_draw(const Fb *fb, uint32_t base, const uint8_t *ib, int i16, int indexed, uint32_t first, uint32_t count) {
+    gs.bools = reg[0x280] & 0xffff;
+    for (int k = 0; k < 4; k++) gs.ints[k] = reg[0x281 + k];
+    pica_shader_prepare(&gs);
+    gs_fb = fb;
+    uint32_t vs_n = (reg[0x24a] & 15) + 1, gs_n = (reg[0x289] & 15) + 1, omask = reg[0x2bd] & 0xffff;
+    uint64_t gmap = (uint64_t)reg[0x28c] << 32 | reg[0x28b];
+    float attrs[16][4]; uint32_t na = 0;
+    PicaEmitter em = { 0, 0, 0, gs_emit };
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t vi = indexed ? (i16 ? (uint32_t)(ib[2 * i] | ib[2 * i + 1] << 8) : ib[i]) : first + i;
+        float in[16][4] = { { 0 } }, o[16][4] = { { 0 } };
+        load_vertex(base, vi, in);
+        pica_shader_run(&vs, reg[0x2ba] & 0xffff, in, o);
+        for (uint32_t r = 0, k = 0; r < 16 && k < vs_n; r++)
+            if ((omask >> r) & 1) { if (na < 16) memcpy(attrs[na++], o[r], sizeof o[r]); k++; }
+        if (na >= gs_n) {
+            float gin[16][4] = { { 0 } }, gout[16][4] = { { 0 } };
+            for (uint32_t a = 0; a < gs_n; a++) memcpy(gin[(gmap >> (4 * a)) & 15], attrs[a], sizeof attrs[a]);
+            if (pica_shader_run_gs(&gs, reg[0x28a] & 0xffff, gin, gout, &em) < 0) LOG(1, "pica: geometry shader did not finish");
+            n_gs_runs++; na = 0;
+        }
+    }
+}
+
 static void draw(int indexed) {
     { static int tried; if (!tried) { tried = 1; vkr_init(); } }
     uint64_t t_draw0 = pns();
@@ -1132,8 +1208,9 @@ static void draw(int indexed) {
                          s = getenv("RB_LOG_FRAME"); log_frame = s ? atoll(s) : -1; }
     if (gpu_frame() != frame_seen) { frame_seen = gpu_frame(); frame_draw_base = n_draws; }
     uint32_t draw_in_frame = (uint32_t)(n_draws - frame_draw_base);
-    if ((reg[0x229] & 3) == 2) {
-        if (!n_skipped_gs++) LOG(1, "pica: draw with the geometry shader enabled skipped (not implemented)");
+    int use_gs = (reg[0x229] & 3) == 2;
+    if (use_gs && ((reg[0x229] >> 8) & 1 || (reg[0x289] >> 8) & 1)) {   /* variable-primitive and subdivision modes */
+        if (!n_skipped_gs++) LOG(1, "pica: geometry shader mode %s is not implemented (draw skipped)", (reg[0x229] >> 8) & 1 ? "variable primitive" : "fixed/subdivision");
         return;
     }
     Fb fb;
@@ -1182,6 +1259,14 @@ static void draw(int indexed) {
     }
     uint64_t tA = pns(); t_setup += tA - t_draw0;
     pica_shader_prepare(&vs);
+    if (use_gs) {                                                     /* geometry shader, point mode */
+        gs_draw(&fb, base, ib, i16, indexed, first, count);
+        uint64_t tC = pns(); t_shade += tC - tA;
+        if (vkr_on) { vk_submit(&fb, caddr, daddr); ntris = 0; }
+        else flush_tris(&fb);
+        t_raster += pns() - tC;
+        return;
+    }
     n_shaded += nuniq;
     shade_vertices(base, vlist, nuniq, vcache);
     uint64_t tB = pns(); t_shade += tB - tA;
@@ -1277,6 +1362,7 @@ void pica_report(void) {
     fprintf(stderr, "pica: %llu draws with fog\n", (unsigned long long)n_fog_draws);
     fprintf(stderr, "pica: audit of missing or approximated features (draws using each):\n");
     for (int k = 0; k < A_COUNT; k++) fprintf(stderr, "  %-40s %llu\n", audit_name[k], (unsigned long long)audit[k]);
+    fprintf(stderr, "pica: %llu geometry shader runs\n", (unsigned long long)n_gs_runs);
     fprintf(stderr, "pica: %llu command lists, %llu draws, %llu triangles rasterised, %llu pixels written, %llu geometry-shader draws skipped\n",
             (unsigned long long)n_lists, (unsigned long long)n_draws, (unsigned long long)n_tris, (unsigned long long)n_pixels, (unsigned long long)n_skipped_gs);
 }

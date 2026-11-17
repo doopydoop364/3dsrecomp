@@ -10,8 +10,16 @@ typedef struct {
     uint32_t ints[4];          /* i0-i3: x y z w bytes */
 } PicaShader;
 
+/* Geometry shader output: SETEMIT sets the slot (0-2), whether the next EMIT completes a triangle and its winding;
+ * EMIT hands the current output registers to emit(). */
+typedef struct PicaEmitter {
+    int vertex_id, prim_emit, winding;
+    void (*emit)(struct PicaEmitter *em, const float out[16][4]);
+} PicaEmitter;
+
 void pica_shader_prepare(const PicaShader *sh);   /* decode the program when it changed (before running it) */
 int pica_shader_run(const PicaShader *sh, uint32_t entry, const float in[16][4], float out[16][4]);
+int pica_shader_run_gs(const PicaShader *sh, uint32_t entry, const float in[16][4], float out[16][4], PicaEmitter *em);
 
 void pica_run_list(uint32_t vaddr, uint32_t size);   /* execute a command list (virtual address) */
 void pica_report(void);

@@ -8,10 +8,12 @@ tool are in `general_tool_design.md` section 10.
 - Phases 0-5 of the general tool: `3dsrecomp build|run <dump>`, extraction with seeds, discovery from the entry
   point, cached build stages; Mario Kart 7, Ocarina of Time 3D and Xenoblade Chronicles 3D boot and play.
 
-## 1. Phase 6: Thumb code — *in progress (2026-11-16 night)*
-16-bit Thumb (ARMv6K has no Thumb-2) beside ARM in the recompiler and in discovery; interworking through one
-dispatch on bit 0 of the address. A differential test against a reference emulator before any game.
-Target: Tomodachi Life and Monster Hunter 4 Ultimate boot; Smash as far as it goes before its CRO.
+## 1. Phase 6: Thumb code — *done (2026-11-17)*
+16-bit Thumb (ARMv6K has no Thumb-2) beside ARM in the recompiler and in discovery; interworking through function
+keys (bit 0 = Thumb). Every completed Thumb run of Tomodachi Life matches Unicorn (difftest --thumb).
+Tomodachi Life boots to its first-run screens (touch works); Monster Hunter 4 Ultimate runs (needed geometry
+shaders); Smash runs until it loads its CRO module (phase 7). Open: Tomodachi Life reports demo-version data on a
+fresh console (not understood yet); APT Wrap is a stub (called 520 times by Tomodachi Life).
 
 ## 2. Phase 7: CRO modules
 Pokémon X (134), Animal Crossing: New Leaf Welcome amiibo (39), Smash (1). Each module is recompiled ahead of time
@@ -24,7 +26,7 @@ replaces the base program before discovery; its RomFS patches the base RomFS; DL
 `am`/`fs` like on a console. Smash's DLC is in the library.
 
 ## 4. GPU features
-1. Geometry shaders (Mario Kart 7 skips 44 draws per race).
+1. Geometry shaders — *point mode done (2026-11-17)*; variable-primitive and subdivision modes still log and skip.
 2. The rest of the PICA200, driven by the feature audit over all 8 games first, then complete: procedural textures,
    shadow maps, gas (fog volumes), min/max blending factors, logic ops, wrap modes 4-7, 16-bit colour blending.
 

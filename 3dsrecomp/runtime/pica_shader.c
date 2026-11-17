@@ -55,16 +55,25 @@ typedef struct {
     uint8_t src[3], rel[3], neg[3], swz[3][4];
     uint32_t w;
 } DInst;
-static DInst prog[512];
-static uint32_t prog_code[512], prog_desc[128];
-static int prog_ok;
+/* Decoded programs, one slot per shader unit (vertex, geometry), so alternating units does not decode again. */
+typedef struct { const PicaShader *owner; DInst prog[512]; uint32_t code[512], desc[128]; int ok; } ProgCache;
+static ProgCache caches[2];
+static ProgCache *cache_for(const PicaShader *sh) {
+    if (caches[0].owner == sh) return &caches[0];
+    if (caches[1].owner == sh) return &caches[1];
+    ProgCache *c = !caches[0].owner ? &caches[0] : &caches[1];
+    c->owner = sh; c->ok = 0;
+    return c;
+}
 static void set_src(DInst *d, int k, uint32_t raw, uint32_t rel, uint32_t swz, uint32_t neg) {
     d->src[k] = (uint8_t)raw; d->rel[k] = (uint8_t)rel; d->neg[k] = (uint8_t)neg;
     for (int i = 0; i < 4; i++) d->swz[k][i] = (uint8_t)((swz >> (6 - 2 * i)) & 3);
 }
 void pica_shader_prepare(const PicaShader *sh) {
-    if (prog_ok && !memcmp(prog_code, sh->code, sizeof prog_code) && !memcmp(prog_desc, sh->desc, sizeof prog_desc)) return;
-    memcpy(prog_code, sh->code, sizeof prog_code); memcpy(prog_desc, sh->desc, sizeof prog_desc);
+    ProgCache *pc_ = cache_for(sh);
+    if (pc_->ok && !memcmp(pc_->code, sh->code, sizeof pc_->code) && !memcmp(pc_->desc, sh->desc, sizeof pc_->desc)) return;
+    memcpy(pc_->code, sh->code, sizeof pc_->code); memcpy(pc_->desc, sh->desc, sizeof pc_->desc);
+    DInst *prog = pc_->prog;
     for (int pc = 0; pc < 512; pc++) {
         uint32_t w = sh->code[pc], op = w >> 26;
         DInst *d = &prog[pc];
@@ -90,7 +99,7 @@ void pica_shader_prepare(const PicaShader *sh) {
             set_src(d, 2, madi ? (w >> 5) & 0x7f : (w >> 5) & 0x1f, madi ? rel : 0, (ds >> 23) & 0xff, (ds >> 22) & 1);
         } else d->kind = 3;
     }
-    prog_ok = 1;
+    pc_->ok = 1;
 }
 static inline void fetchd(const PicaShader *sh, const ShState *st, const float in[16][4], const DInst *d, int k, float out[4]) {
     uint32_t raw = d->src[k];
@@ -113,7 +122,12 @@ static inline void fetchd(const PicaShader *sh, const ShState *st, const float i
 
 /* Runs the program from entry. Returns 0 on success, -1 on a runaway program. Call pica_shader_prepare first. */
 int pica_shader_run(const PicaShader *sh, uint32_t entry, const float in[16][4], float out[16][4]) {
-    if (!prog_ok) pica_shader_prepare(sh);
+    return pica_shader_run_gs(sh, entry, in, out, 0);
+}
+int pica_shader_run_gs(const PicaShader *sh, uint32_t entry, const float in[16][4], float out[16][4], PicaEmitter *em) {
+    ProgCache *pc_ = cache_for(sh);
+    if (!pc_->ok) pica_shader_prepare(sh);
+    const DInst *prog = pc_->prog;
     ShState st;
     memset(&st, 0, sizeof st);
     Frame stack[16]; int sp = 0;
@@ -195,7 +209,8 @@ int pica_shader_run(const PicaShader *sh, uint32_t entry, const float in[16][4],
                 st.aL = (int32_t)((iu >> 8) & 0xff);
                 break;
             }
-            case 0x2a: case 0x2b: break;                              /* EMIT / SETEMIT: geometry shader only */
+            case 0x2a: if (em) em->emit(em, out); break;              /* EMIT (geometry shader) */
+            case 0x2b: if (em) { em->vertex_id = (int)((w >> 24) & 3); em->prim_emit = (int)((w >> 23) & 1); em->winding = (int)((w >> 22) & 1); } break;   /* SETEMIT */
             case 0x2c: if (cond(&st, w)) { next = target; jumped = 1; } break;
             case 0x2d: if (bval == !(count & 1)) { next = target; jumped = 1; } break;
             default:

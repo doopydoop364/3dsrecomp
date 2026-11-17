@@ -192,9 +192,8 @@ static void quiet_ok(KObject *s, uint32_t *cmd) {
 #define FS_EXISTS    0xc82044beu
 typedef struct { int fd; uint64_t base, size; int fixed, virt; } HFile;   /* virt: the game RomFS (romfs.c) */
 uint64_t romfs_open(const char *dir); int64_t romfs_read(uint64_t off, uint32_t size, uint8_t *dst);
-typedef struct { uint32_t id; char root[300]; } HArchive;
-static HArchive archives[32];
-static int narchives;
+typedef struct { uint32_t id; char root[300]; int used; } HArchive;
+static HArchive archives[64];         /* open archive handles: slot + 1 */
 
 /* Guest path (ASCII or UTF-16) -> host path under root. Returns 0 for paths that try to escape. */
 static int fs_path(const char *root, uint32_t type, uint32_t size, uint32_t ptr, char *out, size_t outsz) {
@@ -289,8 +288,10 @@ static void extdata_root(char *out, size_t n, int shared, uint32_t lo, uint32_t 
 }
 /* Opens an archive. Save data always exists; extra data must have been created first, as on a console. */
 static uint32_t archive_open(uint32_t id, uint32_t psize, uint32_t pptr, HArchive **out) {
-    if (narchives == 32) fatal("too many open archives");
-    HArchive *a = &archives[narchives];
+    int slot = 0;
+    while (slot < 64 && archives[slot].used) slot++;
+    if (slot == 64) fatal("too many open archives");
+    HArchive *a = &archives[slot];
     a->id = id; a->root[0] = 0;
     struct stat st;
     if (id == 6 || id == 7 || id == 0x12345678) {                      /* ExtSaveData, SharedExtSaveData, BOSS */
@@ -319,10 +320,10 @@ static uint32_t archive_open(uint32_t id, uint32_t psize, uint32_t pptr, HArchiv
     } else if (id == 9) {
         snprintf(a->root, sizeof a->root, "%s/sdmc", game_dir); mkdir(a->root, 0755);
     }
-    narchives++; *out = a;
+    a->used = 1; *out = a;
     return RES_OK;
 }
-static HArchive *archive_get(uint32_t lo) { return lo >= 1 && lo <= (uint32_t)narchives ? &archives[lo - 1] : 0; }
+static HArchive *archive_get(uint32_t lo) { return lo >= 1 && lo <= 64 && archives[lo - 1].used ? &archives[lo - 1] : 0; }
 static uint32_t host_open(HArchive *a, uint32_t ptype, uint32_t psize, uint32_t pptr, uint32_t flags, uint32_t *out_handle) {
     char path[600];
     if (!a || !a->root[0] || !fs_path(a->root, ptype, psize, pptr, path, sizeof path)) return FS_NOT_FOUND;
@@ -337,7 +338,9 @@ static void fs_user(KObject *s, uint32_t *cmd) {
     uint32_t id = cmd[0] >> 16, res, h = 0;
     char path[600];
     switch (id) {
-    case 0x0801: case 0x0861: case 0x0862: case 0x080e: case 0x080d: reply(cmd, 1, 0); break;
+    case 0x0801: case 0x0861: case 0x0862: case 0x080d: reply(cmd, 1, 0); break;
+    case 0x080e: { HArchive *a = archive_get(cmd[1]); if (a) a->used = 0; reply(cmd, 1, 0); break; }   /* CloseArchive */
+    case 0x0812: reply(cmd, 3, 0); cmd[2] = 0x40000000; cmd[3] = 0; break;   /* GetFreeBytes: 1 GB */
     case 0x0802:                                                       /* OpenFile */
         res = host_open(archive_get(cmd[2]), cmd[4], cmd[5], cmd[9], cmd[6], &h);
         reply(cmd, 1, 2); cmd[1] = res; cmd[2] = 0x10; cmd[3] = h; break;
@@ -369,7 +372,7 @@ static void fs_user(KObject *s, uint32_t *cmd) {
                 }
             }
             res = archive_open(arch, cmd[4], cmd[10], &a);
-            if (res == RES_OK) res = host_open(a, ftype, fsize, fptr, flags, &h);
+            if (res == RES_OK) { res = host_open(a, ftype, fsize, fptr, flags, &h); a->used = 0; }   /* the archive was only for this open */
         }
         reply(cmd, 1, 2); cmd[1] = res; cmd[2] = 0x10; cmd[3] = h; break;
     }
@@ -421,7 +424,7 @@ static void fs_user(KObject *s, uint32_t *cmd) {
         if (aid >> 8 == 0x567890 && cmd[3] >= 12) LOG(2, "fs: OpenArchive %x path %08x %08x %08x", aid, ld32(cmd[5]), ld32(cmd[5] + 4), ld32(cmd[5] + 8));
         res = archive_open(aid, cmd[3], cmd[5], &a);
         LOG(1, "fs: OpenArchive id %x -> %s", aid, res ? "does not exist" : a->root[0] ? a->root : "(no host folder)");
-        reply(cmd, 3, 0); cmd[1] = res; cmd[2] = res ? 0 : (uint32_t)narchives; cmd[3] = 0; break;
+        reply(cmd, 3, 0); cmd[1] = res; cmd[2] = res ? 0 : (uint32_t)(a - archives) + 1; cmd[3] = 0; break;
     }
     case 0x0851: { char root[300]; extdata_root(root, sizeof root, 0, cmd[2], cmd[3]); mkdir(root, 0755);   /* CreateExtSaveData */
                    LOG(1, "fs: created extra data folder %s", root); reply(cmd, 1, 0); break; }
