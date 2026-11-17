@@ -171,3 +171,17 @@ services. Save states and widescreen stay on the PC-experience list.
   second game for phase 5.
 - Tomodachi Life (000400000008c300): about 3,000 ARM-to-Thumb calls, so it needs phase 6 first; no CRO.
 - First `3dsrecomp run` of Mario Kart 7: builds and starts, stops at svc 0x38 GetResourceLimit (phase 5 starts there).
+
+### Test library (user's dumps in ~/3ds-games, 2026-11-16)
+| Game | Title id | Code | ARM->Thumb calls | CRO/CRS files | Needs |
+|---|---|---|---|---|---|
+| Kirby: Planet Robobot | 0004000000183600 | 5.7 MB | 2 | 0 | plays |
+| Mario Kart 7 | 0004000000030800 | 5.2 MB | 3 | 0 | phase 5 |
+| Ocarina of Time 3D | 0004000000033500 | 4.0 MB | 3 | 0 | phase 5 |
+| Xenoblade Chronicles 3D (New 3DS, key slot 0x18) | 000400000f700100 | 3.6 MB | 7 | 0 | phase 5 + New 3DS mode |
+| Tomodachi Life | 000400000008c300 | 7.7 MB | 3052 | 0 | phase 6 |
+| Monster Hunter 4 Ultimate | 0004000000126300 | 13.5 MB | 1919 | 0 | phase 6 |
+| Super Smash Bros. for 3DS (+ DLC 0004008c000edf00) | 00040000000edf00 | 10.0 MB | 6864 | 1 | phase 6 (7) |
+| Animal Crossing: New Leaf - Welcome amiibo | 0004000000198e00 | 7.6 MB | 5445 | 39 | phases 6, 7 |
+| Pokemon X | 0004000000055d00 | 4.4 MB | 1373 | 134 | phases 6, 7 |
+All nine extract with `3dsrecomp extract` (key slots 0x2C, 0x25, 0x18; Robobot with a seed).
