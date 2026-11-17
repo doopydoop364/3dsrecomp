@@ -17,6 +17,7 @@ typedef struct {
     const uint32_t *regs;                 /* 0x300 PICA registers */
     const uint32_t *lut;                  /* 24 x 256 lighting LUT entries */
     const uint32_t *fog_lut;              /* 128 fog LUT entries */
+    const uint32_t *pt_lut;               /* 6 x 256 procedural texture table entries */
     uint64_t lut_version;
     float lights[48][4], gamb[4], zscale, zoff;
     uint32_t flat, flat_color, nlights;

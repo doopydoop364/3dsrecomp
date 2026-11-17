@@ -17,7 +17,7 @@ layout(std140, set = 0, binding = 0) uniform Draw {
     uvec4 flags;           // x: flat mode, y: flat colour, z: light count, w: texture units on (bits)
     uvec4 texinfo[3];      // width, height, wrap_s | wrap_t << 8 | filtered << 16 | cube << 17, border colour
 } D;
-layout(std430, set = 0, binding = 1) readonly buffer Lut { uint lut[24 * 256 + 128]; };   // lighting, then fog
+layout(std430, set = 0, binding = 1) readonly buffer Lut { uint lut[24 * 256 + 128 + 6 * 256]; };   // lighting, fog, procedural texture
 layout(set = 0, binding = 2) uniform sampler2DArray tex0;
 layout(set = 0, binding = 3) uniform sampler2DArray tex1;
 layout(set = 0, binding = 4) uniform sampler2DArray tex2;
@@ -90,7 +90,7 @@ int tevOp(uint op, int a, int b, int c) {
     default: return 0;
     }
 }
-ivec4 combine(ivec4 vcol, ivec4 t0, ivec4 t1, ivec4 t2, ivec4 prim, ivec4 sec) {
+ivec4 combine(ivec4 vcol, ivec4 t0, ivec4 t1, ivec4 t2, ivec4 t3, ivec4 prim, ivec4 sec) {
     const uint tr[6] = uint[6](0x0c0u, 0x0c8u, 0x0d0u, 0x0d8u, 0x0f0u, 0x0f8u);
     uint bc = reg(0x0fdu), upd = reg(0x0e0u);
     ivec4 prev = ivec4(0), buf = ivec4(0), next = ivec4(bc & 255u, (bc >> 8) & 255u, (bc >> 16) & 255u, bc >> 24);
@@ -111,9 +111,9 @@ ivec4 combine(ivec4 vcol, ivec4 t0, ivec4 t1, ivec4 t2, ivec4 prim, ivec4 sec) {
             for (int j = 0; j < 3; j++) {
                 ivec4 sv, sa;
                 uint n = cs[j];
-                sv = n == 0u ? vcol : n == 1u ? prim : n == 2u ? sec : n == 3u ? t0 : n == 4u ? t1 : n == 5u ? t2 : n == 6u ? ivec4(0) : n == 13u ? buf : n == 14u ? kc : prev;
+                sv = n == 0u ? vcol : n == 1u ? prim : n == 2u ? sec : n == 3u ? t0 : n == 4u ? t1 : n == 5u ? t2 : n == 6u ? t3 : n == 13u ? buf : n == 14u ? kc : prev;
                 n = as_[j];
-                sa = n == 0u ? vcol : n == 1u ? prim : n == 2u ? sec : n == 3u ? t0 : n == 4u ? t1 : n == 5u ? t2 : n == 6u ? ivec4(0) : n == 13u ? buf : n == 14u ? kc : prev;
+                sa = n == 0u ? vcol : n == 1u ? prim : n == 2u ? sec : n == 3u ? t0 : n == 4u ? t1 : n == 5u ? t2 : n == 6u ? t3 : n == 13u ? buf : n == 14u ? kc : prev;
                 c[j] = tevOperand(cm[j], sv);
                 a[j] = tevAlphaOperand(am[j], sa);
             }
@@ -251,6 +251,80 @@ void lighting(vec4 qin, vec3 view, ivec4 t0, ivec4 t1, ivec4 t2, out ivec4 prim,
     sec = ivec4(clamp(ssum, 0.0, 1.0) * 255.0);
 }
 
+// ---- procedural texture (texture unit 3), the same as proctex() in pica.c ----
+const uint PT = 24u * 256u + 128u;                        // tables: noise, -, colour map, alpha map, colour, colour delta
+float halfF(uint h) { return unpackHalf2x16(h & 0xffffu).x; }
+float ptLookup(uint t, float coord) {
+    coord *= 128.0;
+    int i = clamp(int(coord), 0, 127);
+    uint e = lut[PT + t * 256u + uint(i)];
+    return float(e & 0xfffu) / 4095.0 + (coord - float(i)) * float(int(e << 8) >> 20) / 4095.0;
+}
+uint ptRand1(uint v) {
+    const uint tb[16] = uint[16](0u, 4u, 10u, 8u, 4u, 9u, 7u, 12u, 5u, 15u, 13u, 14u, 11u, 15u, 2u, 11u);
+    return (((v % 9u + 2u) * 3u) & 0xFu) ^ tb[(v / 9u) & 0xFu];
+}
+float ptRand2(uint x, uint y) {
+    const uint tb[16] = uint[16](10u, 2u, 15u, 8u, 0u, 7u, 4u, 5u, 5u, 13u, 2u, 6u, 13u, 9u, 3u, 14u);
+    uint u2 = ptRand1(x), v2 = ptRand1(y);
+    v2 += (u2 & 3u) == 1u ? 4u : 0u; v2 ^= (u2 & 1u) * 6u; v2 += 10u + u2; v2 &= 0xFu; v2 ^= tb[u2];
+    return -1.0 + float(v2) * 2.0 / 15.0;
+}
+float ptShift(float v, uint mode, uint clampm) {
+    float off = clampm == 3u ? 1.0 : 0.5;
+    if (mode == 1u) return off * float((int(v) / 2) % 2);
+    if (mode == 2u) return off * float(((int(v) + 1) / 2) % 2);
+    return 0.0;
+}
+float ptClamp(float c, uint mode) {
+    if (mode == 0u) return c > 1.0 ? 0.0 : c;
+    if (mode == 2u) return c - floor(c);
+    if (mode == 3u) { int i = int(c); float f = c - float(i); return i % 2 == 0 ? f : 1.0 - f; }
+    if (mode == 4u) return c <= 0.5 ? 0.0 : 1.0;
+    return min(c, 1.0);
+}
+float ptCombine(float u, float v, uint k, uint map) {
+    float f = 0.0;
+    if (k == 0u) f = u; else if (k == 1u) f = u * u; else if (k == 2u) f = v; else if (k == 3u) f = v * v;
+    else if (k == 4u) f = (u + v) * 0.5; else if (k == 5u) f = (u * u + v * v) * 0.5;
+    else if (k == 6u) f = min(sqrt(u * u + v * v), 1.0); else if (k == 7u) f = min(u, v); else if (k == 8u) f = max(u, v);
+    else if (k == 9u) f = min(((u + v) * 0.5 + sqrt(u * u + v * v)) * 0.5, 1.0);
+    return ptLookup(map, f);
+}
+ivec4 procTex(float u, float v) {
+    uint c = reg(0x0a8u);
+    u = abs(u); v = abs(v);
+    float us = ptShift(v, (c >> 16) & 3u, c & 7u), vs = ptShift(u, (c >> 18) & 3u, (c >> 3) & 7u);
+    if (((c >> 15) & 1u) != 0u) {
+        float fu = halfF(reg(0x0abu)), fv = halfF(reg(0x0abu) >> 16), pu = halfF(reg(0x0a9u) >> 16), pv = halfF(reg(0x0aau) >> 16);
+        float x = 9.0 * fu * abs(u + pu), y = 9.0 * fv * abs(v + pv);
+        int xi = int(x), yi = int(y); float xf = x - float(xi), yf = y - float(yi);
+        float g0 = ptRand2(uint(xi), uint(yi)) * (xf + yf), g1 = ptRand2(uint(xi) + 1u, uint(yi)) * (xf + yf - 1.0);
+        float g2 = ptRand2(uint(xi), uint(yi) + 1u) * (xf + yf - 1.0), g3 = ptRand2(uint(xi) + 1u, uint(yi) + 1u) * (xf + yf - 2.0);
+        float xn = ptLookup(0u, xf), yn = ptLookup(0u, yf);
+        float n = mix(mix(g0, g1, xn), mix(g2, g3, xn), yn);
+        u = abs(u + n * float(int(reg(0x0a9u) << 16) >> 16) / 4095.0);
+        v = abs(v + n * float(int(reg(0x0aau) << 16) >> 16) / 4095.0);
+    }
+    u = ptClamp(u + us, c & 7u); v = ptClamp(v + vs, (c >> 3) & 7u);
+    float lc = ptCombine(u, v, (c >> 6) & 15u, 2u);
+    uint off = reg(0x0adu) & 255u, width = (reg(0x0acu) >> 11) & 255u, filt = reg(0x0acu) & 7u;
+    float idx = float(off) + lc * float(int(width) - 1);
+    ivec4 o;
+    if (filt == 1u || filt == 3u || filt == 5u) {
+        int ii = clamp(int(idx), 0, 255); float fr = idx - float(ii);
+        uint cv = lut[PT + 4u * 256u + uint(ii)], cd = lut[PT + 5u * 256u + uint(ii)];
+        vec4 base = vec4(cv & 255u, (cv >> 8) & 255u, (cv >> 16) & 255u, cv >> 24);
+        vec4 dlt = vec4(int(cd << 24) >> 24, int(cd << 16) >> 24, int(cd << 8) >> 24, int(cd) >> 24) * 2.0;
+        o = ivec4(clamp(base + fr * dlt, 0.0, 255.0));
+    } else {
+        uint cv = lut[PT + 4u * 256u + uint(clamp(int(roundEven(idx)), 0, 255))];
+        o = ivec4(cv & 255u, (cv >> 8) & 255u, (cv >> 16) & 255u, cv >> 24);
+    }
+    if (((c >> 14) & 1u) != 0u) o.a = int(ptCombine(u, v, (c >> 10) & 15u, 3u) * 255.0);
+    return o;
+}
+
 void main() {
     // texture coordinates and their screen derivatives, before anything can discard
     float iw0 = 1.0 / iz.x;
@@ -283,9 +357,15 @@ void main() {
     if ((on & 1u) != 0u) t0 = ((D.texinfo[0].z >> 16) & 1u) != 0u ? sampleFiltered(0, uv0, dx0, dy0, float(face)) : sampleTex(0, uv0, face);
     if ((on & 2u) != 0u) t1 = ((D.texinfo[1].z >> 16) & 1u) != 0u ? sampleFiltered(1, uv1, dx1, dy1, 0.0) : sampleTex(1, uv1, 0);
     if ((on & 4u) != 0u) t2 = ((D.texinfo[2].z >> 16) & 1u) != 0u ? sampleFiltered(2, uv2, dx2, dy2, 0.0) : sampleTex(2, uv2, 0);
+    ivec4 t3 = ivec4(0);
+    if (((reg(0x080u) >> 10) & 1u) != 0u) {                // procedural texture from the coordinates of 0x080 bits 8-9
+        uint cs = (reg(0x080u) >> 8) & 3u;
+        vec2 uv = (cs == 0u ? i3.xy : cs == 1u ? i3.zw : i5.zw) * iw0;
+        t3 = procTex(uv.x, uv.y);
+    }
     ivec4 prim = ivec4(0), sec = ivec4(0);
     if ((reg(0x1c6u) & 1u) == 0u) lighting(i1 * iw, vec3(i4.zw, i5.x) * iw, t0, t1, t2, prim, sec);
-    ivec4 o = combine(vcol, t0, t1, t2, prim, sec);
+    ivec4 o = combine(vcol, t0, t1, t2, t3, prim, sec);
     uint at = reg(0x104u);
     if ((at & 1u) != 0u && !cmp((at >> 4) & 7u, o.a, int((at >> 8) & 255u))) discard;
     uint fm = reg(0x0e0u);

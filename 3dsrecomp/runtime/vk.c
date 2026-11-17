@@ -611,7 +611,7 @@ static void ensure_render(Surf *c, Surf *d, uint32_t w, uint32_t h) {
     in_render = 1; rt_c = c; rt_d = d; rt_cv = c ? c->im.view : 0; rt_dv = d ? d->im.view : 0; rt_w = w; rt_h = h;
 }
 
-#define LUT_BYTES ((24 * 256 + 128) * 4)   /* lighting LUTs, then the fog LUT */
+#define LUT_BYTES ((24 * 256 + 128 + 6 * 256) * 4)   /* lighting LUTs, the fog LUT, the procedural texture tables */
 typedef struct {
     uint32_t R[0x300]; float L[48][4]; float gamb[4], misc[4]; uint32_t flags[4]; uint32_t texinfo[3][4];
 } Ubo;
@@ -639,6 +639,7 @@ void vkr_draw(const VkrDraw *d, const void *tris, int ntris, void (*decode)(int,
     memcpy(ring.map + voff, tris, vbytes);
     if (d->lut_version != lut_ver || lut_ring_gen != ring_gen) {
         lut_off = ring_alloc(&ring, LUT_BYTES); memcpy(ring.map + lut_off, d->lut, 24 * 256 * 4); memcpy(ring.map + lut_off + 24 * 256 * 4, d->fog_lut, 128 * 4);
+        memcpy(ring.map + lut_off + (24 * 256 + 128) * 4, d->pt_lut, 6 * 256 * 4);
         lut_ver = d->lut_version; lut_ring_gen = ring_gen;
     }
     Ubo *u = (Ubo *)(ring.map + uoff);

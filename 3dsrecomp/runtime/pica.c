@@ -10,6 +10,8 @@
 static uint32_t reg[0x300];
 static uint32_t lut[24][256]; static uint64_t lut_version;   /* lighting lookup tables, filled through 0x1C8-0x1CF */
 static uint32_t fog_lut[128];               /* fog factors, filled through 0x0E8-0x0EF at index 0x0E6 */
+static uint32_t pt_lut[6][256];             /* procedural texture: noise, -, colour map, alpha map, colour, colour delta
+                                             * (filled through 0x0B0-0x0B7, table and index in 0x0AF) */
 static uintptr_t cur_word;
 static uint32_t top_list, cur_list;         /* top-level list of this submission, and the list now executing */                 /* host address of the command word being executed */
 static uintptr_t uni_src[96];              /* where each uniform's last upload came from */
@@ -95,6 +97,12 @@ static uint32_t write_reg(uint32_t id, uint32_t value, uint32_t mask) {
         uint32_t cfg = reg[0x1c5], idx = cfg & 0xff, type = (cfg >> 8) & 0x1f;
         if (type < 24) { lut[type][idx] = v; lut_version++; }
         reg[0x1c5] = (cfg & ~0xffu) | ((idx + 1) & 0xff);
+        break;
+    }
+    case 0x0b0: case 0x0b1: case 0x0b2: case 0x0b3: case 0x0b4: case 0x0b5: case 0x0b6: case 0x0b7: {
+        uint32_t cfg = reg[0x0af], idx = cfg & 0xff, t = (cfg >> 8) & 15;
+        if (t < 6) { pt_lut[t][idx] = v; lut_version++; }
+        reg[0x0af] = (cfg & ~0xffu) | ((idx + 1) & 0xff);
         break;
     }
     case 0x0e8: case 0x0e9: case 0x0ea: case 0x0eb: case 0x0ec: case 0x0ed: case 0x0ee: case 0x0ef:
@@ -723,6 +731,92 @@ static int cube_coord(float u, float v, float w, float *ou, float *ov) {
 }
 
 /* Interpolated fragment colour; returns 0 if the fragment is discarded by the alpha test. */
+/* ---- procedural texture (texture unit 3), as Azahar's sw_proctex.cpp ---- */
+static float half_f(uint32_t h) {                    /* float16 register fields */
+    uint32_t s = (h >> 15) & 1, e = (h >> 10) & 31, m = h & 0x3ff;
+    float f = e == 0 ? ldexpf((float)m, -24) : e == 31 ? (m ? NAN : INFINITY) : ldexpf((float)(m | 0x400), (int)e - 25);
+    return s ? -f : f;
+}
+static float pt_lookup(const uint32_t *t, float coord) {      /* value entry: 0.12 value, signed 0.12 delta */
+    coord *= 128.0f;
+    int i = (int)coord; if (i > 127) i = 127; if (i < 0) i = 0;
+    float frac = coord - (float)i;
+    return (float)(t[i] & 0xfff) / 4095.0f + frac * (float)((int32_t)(t[i] << 8) >> 20) / 4095.0f;
+}
+static uint32_t pt_rand1(uint32_t v) {
+    static const uint32_t tb[16] = { 0, 4, 10, 8, 4, 9, 7, 12, 5, 15, 13, 14, 11, 15, 2, 11 };
+    return (((v % 9 + 2) * 3) & 0xF) ^ tb[(v / 9) & 0xF];
+}
+static float pt_rand2(uint32_t x, uint32_t y) {
+    static const uint32_t tb[16] = { 10, 2, 15, 8, 0, 7, 4, 5, 5, 13, 2, 6, 13, 9, 3, 14 };
+    uint32_t u2 = pt_rand1(x), v2 = pt_rand1(y);
+    v2 += (u2 & 3) == 1 ? 4 : 0; v2 ^= (u2 & 1) * 6; v2 += 10 + u2; v2 &= 0xF; v2 ^= tb[u2];
+    return -1.0f + (float)v2 * 2.0f / 15.0f;
+}
+static float pt_shift(float v, uint32_t mode, uint32_t clamp) {
+    float off = clamp == 3 ? 1.0f : 0.5f;
+    if (mode == 1) return off * (float)(((int)v / 2) % 2);
+    if (mode == 2) return off * (float)((((int)v + 1) / 2) % 2);
+    return 0.0f;
+}
+static float pt_clamp(float c, uint32_t mode) {
+    switch (mode) {
+    case 0: return c > 1.0f ? 0.0f : c;
+    case 2: return c - floorf(c);
+    case 3: { int i = (int)c; float f = c - (float)i; return i % 2 == 0 ? f : 1.0f - f; }
+    case 4: return c <= 0.5f ? 0.0f : 1.0f;
+    default: return c < 1.0f ? c : 1.0f;
+    }
+}
+static float pt_combine(float u, float v, uint32_t k, const uint32_t *map) {
+    float f;
+    switch (k) {
+    case 0: f = u; break; case 1: f = u * u; break; case 2: f = v; break; case 3: f = v * v; break;
+    case 4: f = (u + v) * 0.5f; break; case 5: f = (u * u + v * v) * 0.5f; break;
+    case 6: f = fminf(sqrtf(u * u + v * v), 1.0f); break; case 7: f = fminf(u, v); break; case 8: f = fmaxf(u, v); break;
+    case 9: f = fminf(((u + v) * 0.5f + sqrtf(u * u + v * v)) * 0.5f, 1.0f); break;
+    default: f = 0.0f;
+    }
+    return pt_lookup(map, f);
+}
+static void proctex(float u, float v, uint8_t out[4]) {
+    uint32_t c = reg[0x0a8];
+    u = fabsf(u); v = fabsf(v);
+    float us = pt_shift(v, (c >> 16) & 3, c & 7), vs_ = pt_shift(u, (c >> 18) & 3, (c >> 3) & 7);
+    if ((c >> 15) & 1) {                                      /* noise */
+        float fu = half_f(reg[0x0ab] & 0xffff), fv = half_f(reg[0x0ab] >> 16);
+        float pu = half_f(reg[0x0a9] >> 16), pv = half_f(reg[0x0aa] >> 16);
+        float x = 9.0f * fu * fabsf(u + pu), y = 9.0f * fv * fabsf(v + pv);
+        int xi = (int)x, yi = (int)y; float xf = x - (float)xi, yf = y - (float)yi;
+        float g0 = pt_rand2((uint32_t)xi, (uint32_t)yi) * (xf + yf), g1 = pt_rand2((uint32_t)xi + 1, (uint32_t)yi) * (xf + yf - 1);
+        float g2 = pt_rand2((uint32_t)xi, (uint32_t)yi + 1) * (xf + yf - 1), g3 = pt_rand2((uint32_t)xi + 1, (uint32_t)yi + 1) * (xf + yf - 2);
+        float xn = pt_lookup(pt_lut[0], xf), yn = pt_lookup(pt_lut[0], yf);
+        float n = (g0 * (1 - xn) + g1 * xn) * (1 - yn) + (g2 * (1 - xn) + g3 * xn) * yn;
+        u = fabsf(u + n * (float)(int16_t)(reg[0x0a9] & 0xffff) / 4095.0f);
+        v = fabsf(v + n * (float)(int16_t)(reg[0x0aa] & 0xffff) / 4095.0f);
+    }
+    u = pt_clamp(u + us, c & 7); v = pt_clamp(v + vs_, (c >> 3) & 7);
+    float lc = pt_combine(u, v, (c >> 6) & 15, pt_lut[2]);
+    uint32_t off = reg[0x0ad] & 0xff, width = (reg[0x0ac] >> 11) & 0xff, filt = reg[0x0ac] & 7;
+    float idx = (float)off + lc * (float)(width - 1);
+    if (filt == 1 || filt == 3 || filt == 5) {                /* linear between colour entries */
+        int ii = (int)idx; if (ii < 0) ii = 0; if (ii > 255) ii = 255;
+        float fr = idx - (float)ii;
+        uint32_t cv = pt_lut[4][ii], cd = pt_lut[5][ii];
+        for (int k = 0; k < 4; k++) {
+            float x = (float)((cv >> (8 * k)) & 255) + fr * (float)((int8_t)(cd >> (8 * k)) * 2);
+            out[k] = (uint8_t)(x < 0 ? 0 : x > 255 ? 255 : x);
+        }
+    } else {
+        int ii = (int)lrintf(idx); if (ii < 0) ii = 0; if (ii > 255) ii = 255;
+        for (int k = 0; k < 4; k++) out[k] = (uint8_t)(pt_lut[4][ii] >> (8 * k));
+    }
+    if ((c >> 14) & 1) {                                      /* separate alpha: straight from its own combiner */
+        float a = pt_combine(u, v, (c >> 10) & 15, pt_lut[3]);
+        out[3] = (uint8_t)(a * 255.0f);
+    }
+}
+
 static int fragment(const Vtx *v0, const Vtx *v1, const Vtx *v2, float b0, float b1, float b2, uint8_t out[4]) {
     if (flat_mode) { memcpy(out, flat, 4); return 1; }
     float iw = 1.0f / (b0 * v0->invw + b1 * v1->invw + b2 * v2->invw);
@@ -742,6 +836,10 @@ static int fragment(const Vtx *v0, const Vtx *v1, const Vtx *v2, float b0, float
     if (tu[2].on) {
         int c1 = (reg[0x080] >> 13) & 1;
         sample(&tu[2], c1 ? I(S_TC1) : I(S_TC2), c1 ? I(S_TC1 + 1) : I(S_TC2 + 1), tex[2]);
+    }
+    if ((reg[0x080] >> 10) & 1) {                            /* procedural texture from the coordinates of 0x080 bits 8-9 */
+        uint32_t cs = (reg[0x080] >> 8) & 3; int k = cs == 0 ? S_TC0 : cs == 1 ? S_TC1 : S_TC2;
+        proctex(I(k), I(k + 1), tex[3]);
     }
     uint8_t prim[4] = { 0, 0, 0, 0 }, sec[4] = { 0, 0, 0, 0 };
     if (!(reg[0x1c6] & 1)) {                         /* lighting enabled (the reference gates on 0x1C6 only) */
@@ -1094,7 +1192,7 @@ static void vk_submit(const Fb *fb, uint32_t caddr, uint32_t daddr) {
     d.caddr = fb->color ? (uint32_t)(uintptr_t)fb->color : 0; d.daddr = fb->depth ? (uint32_t)(uintptr_t)fb->depth : 0;
     (void)caddr; (void)daddr;
     d.width = fb->width; d.height = fb->hreg + 1; d.cfmt = fb->cfmt; d.dfmt = fb->dfmt;
-    d.regs = reg; d.lut = &lut[0][0]; d.fog_lut = fog_lut; d.lut_version = lut_version;
+    d.regs = reg; d.lut = &lut[0][0]; d.fog_lut = fog_lut; d.pt_lut = &pt_lut[0][0]; d.lut_version = lut_version;
     for (uint32_t k = 0; k < 8; k++) {
         const LightP *l = &lights[k];
         float (*L)[4] = &d.lights[k * 6];

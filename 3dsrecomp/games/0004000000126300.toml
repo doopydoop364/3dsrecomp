@@ -1,0 +1,9 @@
+# Monster Hunter 4 Ultimate (Thumb code; geometry shaders and procedural textures for its interface)
+# Per-game hints and PC defaults (see games/0004000000183600.toml for every section). It runs without hints.
+
+[tests]
+# tests/smoke.sh 0004000000126300: from a console where it never ran: save formatted, extra data created,
+# the Circle Pad Pro check
+input = "1500-1506:A;1700-1706:A;1900-1906:A;2100-2106:A;2300-2306:A"
+shots = "600,1800,2400"
+frames = 2400
