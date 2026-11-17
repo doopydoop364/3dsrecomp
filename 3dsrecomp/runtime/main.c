@@ -12,7 +12,7 @@
 
 extern const struct { uint32_t addr; recomp_fn fn; } recomp_functions[];
 extern const uint32_t recomp_function_count;
-recomp_fn *recomp_table;
+recomp_fn *recomp_table, *recomp_table_thumb;
 
 void video_init(const char *title);
 void gpu_report(void);
@@ -92,16 +92,15 @@ int main(int argc, char **argv) {
     cfg[0x62] = 50; cfg[0x63] = 2; cfg[0x64] = 2;
     /* shared page: clock, retail hardware, 3D slider off, full battery */
     struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
-    uint64_t ms1900 = ((uint64_t)ts.tv_sec + 2208988800ull) * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+    struct tm lt; localtime_r(&ts.tv_sec, &lt);                /* a 3DS clock keeps local time, not UTC */
+    uint64_t ms1900 = ((uint64_t)(ts.tv_sec + lt.tm_gmtoff) + 2208988800ull) * 1000 + (uint64_t)ts.tv_nsec / 1000000;
     unsigned __int128 tick = (unsigned __int128)now_ns() * 268111856u / 1000000000u;
     shp[0x04] = 1;
     *(uint64_t *)(shp + 0x20) = ms1900; *(uint64_t *)(shp + 0x28) = (uint64_t)tick; *(uint64_t *)(shp + 0x30) = 0xffb0ff0;
     memcpy(shp + 0x40, shp + 0x20, 0x20);
     *(float *)(shp + 0x80) = 0.0f; shp[0x84] = 1; shp[0x85] = (5 << 2) | 1;
 
-    recomp_table = calloc(RECOMP_TEXT_SIZE / 4, sizeof(recomp_fn));
-    for (uint32_t i = 0; i < recomp_function_count; i++)
-        recomp_table[(recomp_functions[i].addr - RECOMP_TEXT_BASE) >> 2] = recomp_functions[i].fn;
+    recomp_table_build(recomp_functions, recomp_function_count, calloc);
 
     stack_t ss = { .ss_sp = malloc(1 << 16), .ss_size = 1 << 16 };
     sigaltstack(&ss, 0);

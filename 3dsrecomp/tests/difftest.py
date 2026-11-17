@@ -4,7 +4,9 @@ recompiled native build, on identical inputs, and compare the resulting CPU and 
 
 Unicorn is only a test oracle here; the port itself does not use an emulator.
 
-Usage: difftest.py [--limit N] [--variants N] [--fn ADDR] [--jobs N] [--seed N]
+Usage: difftest.py [--title ID] [--thumb] [--limit N] [--variants N] [--fn ADDR] [--jobs N] [--seed N]
+  --title ID   a game built by 3dsrecomp (work/<id>/); default Robobot in game/ and build/gen
+  --thumb      only Thumb functions (keys with bit 0 set; Unicorn starts them in Thumb state)
 """
 import argparse, collections, os, random, struct, subprocess, sys, zlib
 from multiprocessing import Pool
@@ -12,8 +14,14 @@ from multiprocessing import Pool
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, 'recomp'))
 import layout
-IMG_PATH = os.path.join(ROOT, 'game', 'code_decompressed.bin')
-LAY = layout.read_layout(os.path.join(ROOT, 'game', 'exheader.bin'))
+# the game is chosen before workers start: --title on the command line, inherited through the environment
+_T = next((sys.argv[i + 1] for i, x in enumerate(sys.argv[:-1]) if x == '--title'), os.environ.get('DIFFTEST_TITLE', ''))
+os.environ['DIFFTEST_TITLE'] = _T
+GAME = os.path.join(ROOT, 'work', _T, 'game') if _T else os.path.join(ROOT, 'game')
+GEN = os.path.join(ROOT, 'work', _T, 'gen') if _T else os.path.join(ROOT, 'build', 'gen')
+RUNNER = os.path.join(ROOT, 'work', _T, 'runner') if _T else os.path.join(ROOT, 'build', 'runner')
+IMG_PATH = os.path.join(GAME, 'code_decompressed.bin')
+LAY = layout.read_layout(os.path.join(GAME, 'exheader.bin'))
 IMG_BASE, RO_END, RW_END, TEXT_END = LAY.text_base, LAY.ro_end, LAY.rw_end, LAY.text_end
 SCRATCH_BASE, SCRATCH_SIZE = 0x08000000, 0x10000
 STACK_BASE, STACK_SIZE = 0x0FFE0000, 0x10000
@@ -152,13 +160,22 @@ def main():
     ap.add_argument('--jobs', type=int, default=os.cpu_count())
     ap.add_argument('--seed', type=int, default=1)
     ap.add_argument('--show', type=int, default=25)
+    ap.add_argument('--title', default='')
+    ap.add_argument('--thumb', action='store_true')
     a = ap.parse_args()
-    gen = os.path.join(ROOT, 'build', 'gen')
+    gen = GEN
+    if _T:
+        r = subprocess.run(['make', f'-j{os.cpu_count()}', f'GEN={GEN}', f'OBJ={os.path.join(ROOT, "work", _T, "obj")}',
+                            f'RUNNER={RUNNER}', RUNNER], cwd=ROOT, capture_output=True, text=True)
+        if r.returncode:
+            sys.exit('building the runner failed:\n' + r.stdout[-2000:] + r.stderr[-2000:])
     if a.fn:
         fns = [int(x, 16) for x in a.fn]
     else:
         bad = {int(l, 16) for l in open(os.path.join(gen, 'functions_unsupported.txt'))}
         fns = [f for f in (int(l, 16) for l in open(os.path.join(gen, 'functions_all.txt'))) if f not in bad]
+        if a.thumb:
+            fns = [f for f in fns if f & 1]
         if a.limit:
             fns = random.Random(a.seed).sample(fns, min(a.limit, len(fns)))
     tests = [make_input(f, v, a.seed) for f in fns for v in range(a.variants)]
@@ -176,7 +193,7 @@ def main():
     with open(vec, 'wb') as fh:
         for t in tests:
             fh.write(struct.pack(IN_FMT, *t))
-    log = subprocess.run([os.path.join(ROOT, 'build', 'runner'), IMG_PATH, vec, out], capture_output=True, text=True)
+    log = subprocess.run([RUNNER, IMG_PATH, vec, out], capture_output=True, text=True)
     if log.returncode:
         print('runner failed:', log.returncode, log.stderr[-2000:]); sys.exit(1)
     nat = open(out, 'rb').read()
@@ -190,7 +207,7 @@ def main():
                 for pre in ('info=', '@'):
                     if tok.startswith(pre):
                         v = int(tok[len(pre):], 16)
-                        if IMG_BASE <= v < TEXT_END and not v & 3 and ('unknown function' in line) == (pre == '@'):
+                        if IMG_BASE <= v < TEXT_END and (v & 3) in (0, 1, 3) and ('unknown function' in line) == (pre == '@'):
                             missing.add(v)
 
     valid = match = 0

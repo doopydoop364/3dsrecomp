@@ -13,7 +13,7 @@
 
 extern const struct { uint32_t addr; recomp_fn fn; } recomp_functions[];
 extern const uint32_t recomp_function_count;
-recomp_fn *recomp_table;
+recomp_fn *recomp_table, *recomp_table_thumb;
 
 #define IMG_BASE     RECOMP_TEXT_BASE     /* layout comes from the generated layout.h */
 #define RO_END       RECOMP_RO_END
@@ -80,9 +80,7 @@ int main(int argc, char **argv) {
     static uint32_t patterns[NPAT][SCRATCH_SIZE / 4];
     for (uint32_t p = 0; p < NPAT; p++) gen_pattern(p, patterns[p]);
 
-    recomp_table = calloc(RECOMP_TEXT_SIZE / 4, sizeof(recomp_fn));
-    for (uint32_t i = 0; i < recomp_function_count; i++)
-        recomp_table[(recomp_functions[i].addr - RECOMP_TEXT_BASE) >> 2] = recomp_functions[i].fn;
+    recomp_table_build(recomp_functions, recomp_function_count, calloc);
 
     stack_t ss = { .ss_sp = malloc(1 << 16), .ss_size = 1 << 16 };
     sigaltstack(&ss, 0);

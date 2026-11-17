@@ -108,6 +108,24 @@ void mem_dump_all(const char *dir) {
     }
     fprintf(stderr, "guest memory written to %s (%d regions)\n", dir, nregions);
 }
+/* ControlMemory MAP / UNMAP: the pages of src appear at dst, and src is not accessible meanwhile (its state is
+ * "aliased" on a console), so the pages are moved and src keeps an inaccessible placeholder. */
+static int mem_alias(uint32_t dst, uint32_t src, uint32_t size, int unmap) {
+    size = (size + 0xfff) & ~0xfffu;
+    uint32_t from = unmap ? dst : src, to = unmap ? src : dst;
+    void *p = mremap((void *)(uintptr_t)from, size, size, MREMAP_MAYMOVE | MREMAP_FIXED, (void *)(uintptr_t)to);
+    if (p != (void *)(uintptr_t)to) return -1;
+    if (!unmap) {
+        if (mmap((void *)(uintptr_t)src, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED) return -1;
+        if (nregions == 512) fatal("too many memory regions");
+        regions[nregions++] = (Region){ dst, size, 9, 3, "alias" };       /* state 9: alias */
+    } else {
+        for (int i = 0; i < nregions; i++)
+            if (regions[i].base == dst && !strcmp(regions[i].what, "alias")) { regions[i] = regions[--nregions]; break; }
+    }
+    LOG(2, "%s %08x <-> %08x (%x bytes)", unmap ? "unmap alias" : "map alias", dst, src, size);
+    return 0;
+}
 static Region *region_find(uint32_t addr) {
     for (int i = 0; i < nregions; i++)
         if (addr - regions[i].base < regions[i].size) return &regions[i];
@@ -329,6 +347,9 @@ void svc_call(CPU *c, uint32_t num, uint32_t addr) {
             break;
         case 1: r[1] = a0; break;                          /* free: keep the mapping, nothing reuses it yet */
         case 6: r[1] = a0; break;                          /* protect */
+        case 4: case 5:                                    /* map / unmap an alias of src (addr1) at dst (addr0) */
+            if (mem_alias(a0, a1, size, (op & 0xff) == 5)) fatal("ControlMemory %s %08x <- %08x (%x bytes) failed", (op & 0xff) == 4 ? "map" : "unmap", a0, a1, size);
+            r[1] = a0; break;
         default: fatal("ControlMemory operation %x (addr0 %08x addr1 %08x size %x) is not implemented", op, a0, a1, size);
         }
         LOG(2, "ControlMemory op %x size %x -> %08x", op, size, r[1]);

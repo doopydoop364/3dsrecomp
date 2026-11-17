@@ -29,13 +29,25 @@ double vfp_nan1d(double a);
 #define TRAP(addr, why) recomp_trap(c, (addr), 0, (why))
 #define TRAP_UNIMPL(addr, word) recomp_trap(c, (addr), (word), "unimplemented instruction")
 
-/* Function table: one slot per 4 bytes of guest .text. */
+/* Function tables: ARM functions one slot per 4 bytes of guest .text, Thumb functions one slot per 2 bytes.
+ * A Thumb function is addressed with bit 0 set, as an interworking branch (bx, blx, pop {pc}) carries it. */
 /* RECOMP_TEXT_BASE / RECOMP_TEXT_SIZE and the other layout values: generated from the ExHeader */
 #include "layout.h"
-extern recomp_fn *recomp_table;
+extern recomp_fn *recomp_table, *recomp_table_thumb;
 static inline recomp_fn recomp_lookup(uint32_t a) {
-    uint32_t o = a - RECOMP_TEXT_BASE;
-    return (o < RECOMP_TEXT_SIZE && !(a & 3)) ? recomp_table[o >> 2] : (recomp_fn)0;
+    uint32_t o = (a & ~1u) - RECOMP_TEXT_BASE;
+    if (o >= RECOMP_TEXT_SIZE) return (recomp_fn)0;
+    if (a & 1) return recomp_table_thumb[o >> 1];
+    return (a & 3) ? (recomp_fn)0 : recomp_table[o >> 2];
+}
+static inline void recomp_table_build(const void *list, uint32_t count, void *(*alloc)(size_t, size_t)) {
+    const struct { uint32_t addr; recomp_fn fn; } *f = list;
+    recomp_table = alloc(RECOMP_TEXT_SIZE / 4, sizeof(recomp_fn));
+    recomp_table_thumb = alloc(RECOMP_TEXT_SIZE / 2, sizeof(recomp_fn));
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t o = (f[i].addr & ~1u) - RECOMP_TEXT_BASE;
+        if (f[i].addr & 1) recomp_table_thumb[o >> 1] = f[i].fn; else recomp_table[o >> 2] = f[i].fn;
+    }
 }
 
 /* Returns record the guest return target in r15. Builds with RECOMP_CHECK_RETURNS verify at

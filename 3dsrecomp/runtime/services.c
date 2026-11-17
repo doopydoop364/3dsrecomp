@@ -274,10 +274,19 @@ static uint32_t archive_open(uint32_t id, uint32_t psize, uint32_t pptr, HArchiv
                 LOG(1, "fs: created empty shared extra data %08x%08x (the system provides it on a real console)", hi, lo);
             } else { LOG(1, "fs: extra data %08x%08x does not exist", hi, lo); return FS_ARCHIVE_NOT_FOUND; }
         }
-    } else if (id == 4 || id == 0x567890b2) {                          /* the game's save data: exists once formatted */
+    } else if ((id == 0x567890b2 || id == 0x567890b4) && psize >= 8 &&
+               (ld32(pptr + 4) & 0xffffff) != (uint32_t)((RECOMP_TITLE_ID >> 8) & 0xffffff)) {
+        /* another title's save data (path: media type, unique id): that game's save if it is also in work/ */
+        uint32_t lo = (ld32(pptr + 4) & 0xffffff) << 8, hi = 0x00040000u;
+        char gd[300]; snprintf(gd, sizeof gd, "%s", game_dir);
+        char *s1 = strrchr(gd, '/'); if (s1) *s1 = 0;                 /* work/<id>/game -> work/<id> */
+        char *s2 = strrchr(gd, '/'); if (s2) *s2 = 0;                 /* -> work */
+        snprintf(a->root, sizeof a->root, "%s/%08x%08x/game/save", s1 && s2 ? gd : ".", hi, lo);
+        if (stat(a->root, &st)) { LOG(1, "fs: save data of title %08x%08x does not exist", hi, lo); return FS_ARCHIVE_NOT_FOUND; }
+    } else if (id == 4 || id == 0x567890b2 || id == 0x567890b4) {      /* the game's save data: exists once formatted */
         snprintf(a->root, sizeof a->root, "%s/save", game_dir);
         if (stat(a->root, &st)) { LOG(1, "fs: save data is not formatted yet"); return FS_NOT_FORMATTED; }
-    } else if (id == 8 || id == 0x567890b4) {
+    } else if (id == 8) {
         snprintf(a->root, sizeof a->root, "%s/save", game_dir); mkdir(a->root, 0755);
     } else if (id == 9) {
         snprintf(a->root, sizeof a->root, "%s/sdmc", game_dir); mkdir(a->root, 0755);
@@ -381,6 +390,7 @@ static void fs_user(KObject *s, uint32_t *cmd) {
     }
     case 0x080c: {                                                     /* OpenArchive */
         HArchive *a = 0; uint32_t aid = cmd[1];
+        if (aid >> 8 == 0x567890 && cmd[3] >= 12) LOG(2, "fs: OpenArchive %x path %08x %08x %08x", aid, ld32(cmd[5]), ld32(cmd[5] + 4), ld32(cmd[5] + 8));
         res = archive_open(aid, cmd[3], cmd[5], &a);
         LOG(1, "fs: OpenArchive id %x -> %s", aid, res ? "does not exist" : a->root[0] ? a->root : "(no host folder)");
         reply(cmd, 3, 0); cmd[1] = res; cmd[2] = res ? 0 : (uint32_t)narchives; cmd[3] = 0; break;

@@ -1,0 +1,9 @@
+# Tomodachi Life (Thumb code in its libraries)
+# Per-game hints and PC defaults (see games/0004000000183600.toml for every section). It runs without hints.
+
+[tests]
+# tests/smoke.sh 000400000008c300: from a console where it never ran: the carry-over question (No, by touch),
+# save data created, the date and time screens (OK by touch)
+input = "400-410:touch=100/205;800-806:touch=160/206;920-926:touch=160/206;1040-1046:touch=160/206;1160-1166:touch=160/206;1280-1286:touch=160/206;1400-1406:touch=160/206"
+shots = "300,900,1400"
+frames = 1400

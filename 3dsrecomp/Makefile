@@ -8,7 +8,7 @@ CFLAGS  := $(OPT) -w -fwrapv -fno-strict-aliasing -ffp-contract=off -Iruntime -I
 SRCS    := $(wildcard $(GEN)/rc_*.c) $(GEN)/table.c
 OBJS    := $(patsubst $(GEN)/%.c,$(OBJ)/%.o,$(SRCS))
 
-all: build/runner $(BIN)
+all: $(RUNNER) $(BIN)
 
 $(OBJ)/%.o: $(GEN)/%.c runtime/recomp.h $(GEN)/funcs.h $(GEN)/layout.h | $(OBJ)
 	$(CC) $(CFLAGS) -DRECOMP_CHECK_RETURNS -c $< -o $@
@@ -16,7 +16,8 @@ $(OBJ)/%.o: $(GEN)/%.c runtime/recomp.h $(GEN)/funcs.h $(GEN)/layout.h | $(OBJ)
 $(OBJ):
 	mkdir -p $@
 
-build/runner: tests/runner.c runtime/vfp.c runtime/recomp.h $(OBJS)
+RUNNER  ?= build/runner
+$(RUNNER): tests/runner.c runtime/vfp.c runtime/recomp.h $(OBJS)
 	$(CC) -O1 -g -Iruntime -I$(GEN) tests/runner.c runtime/vfp.c $(OBJS) -o $@ -lz -lm
 
 RT := runtime/kernel.c runtime/services.c runtime/gpu.c runtime/pica.c runtime/pica_shader.c runtime/video.c runtime/input.c runtime/settings.c runtime/dsp.c runtime/audio.c runtime/y2r.c runtime/nfc.c runtime/romfs.c runtime/vk.c runtime/main.c runtime/vfp.c

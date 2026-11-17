@@ -98,6 +98,9 @@ def run(tid, args):
     game, extra = os.path.join(wd, "game"), os.path.join(wd, "extra_functions.txt")
     missing = os.path.join(game, "missing_functions.txt")
     env = dict(os.environ, RB_SYSTEM_DIR=os.path.join(ROOT, "system"))
+    sys.path.insert(0, os.path.join(ROOT, "extract"))
+    import make_open_sysarchives                   # open replacements for system archives you have not dumped
+    make_open_sysarchives.main_into(os.path.join(ROOT, "system", "sysarchives"))
     for attempt in range(10):
         binp = build(tid, quiet=True)
         if os.path.exists(missing):

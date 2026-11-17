@@ -52,7 +52,7 @@ def _words_chunk(rng):
         if _covered(a):
             continue
         v = struct.unpack_from('<I', _IMG, 4 * k)[0]
-        if R.in_text(v) and v not in R._FUNCS and v not in out and R.is_clean_code(v, R._FUNCS):
+        if R.is_key(v) and v not in R._FUNCS and v not in out and R.is_clean_code(v, R._FUNCS):
             out.add(v)
     return out
 
@@ -112,7 +112,7 @@ def discover_all(img_path, lay, nlr, seeds, not_code, jobs, log=print):
     """Returns (functions, report lines)."""
     img = open(img_path, 'rb').read()
     R.configure(img, lay, nlr)
-    funcs = {f for f in seeds if R.in_text(f)} - not_code
+    funcs = {f for f in seeds if R.is_key(f)} - not_code
     report = [f'seeds: {len(funcs)} (entry point and per-game extras)']
     cov = bytearray((R.TEXT_END - R.BASE) // 4)
     init_done = False
@@ -148,10 +148,11 @@ def discover_all(img_path, lay, nlr, seeds, not_code, jobs, log=print):
                 found.setdefault(k, set()).update(v)
         if not init_done:                                          # static initialisers: self-relative offset tables
             inits = set()
-            for lo, hi in idioms.detect_relative_init_arrays(img, lay.text_base, lay.text_base, lay.text_end):
+            for lo, hi in idioms.detect_relative_init_arrays(img, lay.text_base, lay.text_base, lay.text_end) + \
+                    idioms.detect_relative_init_arrays_thumb(img, lay.text_base, lay.text_base, lay.text_end):
                 for a in range(lo, hi, 4):
                     v = (a + struct.unpack_from('<I', img, a - lay.text_base)[0]) & 0xFFFFFFFF
-                    if R.in_text(v):
+                    if R.is_key(v):
                         inits.add(v)
             found['static initialisers'] = inits
             init_done = True

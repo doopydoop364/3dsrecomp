@@ -595,8 +595,10 @@ static VkPipeline get_pipeline(const PKey *k) {
 
 /* ---- drawing ---- */
 static Surf *rt_c, *rt_d;
+static VkImageView rt_cv, rt_dv;      /* a surface slot can be recreated with a new image: compare the images too */
+static uint32_t rt_w, rt_h;
 static void ensure_render(Surf *c, Surf *d, uint32_t w, uint32_t h) {
-    if (in_render && rt_c == c && rt_d == d) return;
+    if (in_render && rt_c == c && rt_d == d && rt_cv == (c ? c->im.view : 0) && rt_dv == (d ? d->im.view : 0) && rt_w == w && rt_h == h) return;
     end_render();
     VkRenderingAttachmentInfo ca = { .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = c ? c->im.view : 0,
         .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE };
@@ -606,7 +608,7 @@ static void ensure_render(Surf *c, Surf *d, uint32_t w, uint32_t h) {
         .colorAttachmentCount = c ? 1 : 0, .pColorAttachments = &ca, .pDepthAttachment = d ? &da : 0,
         .pStencilAttachment = (d && d->fmt != 0) ? &da : 0 };
     vkCmdBeginRendering(cmd, &ri);
-    in_render = 1; rt_c = c; rt_d = d;
+    in_render = 1; rt_c = c; rt_d = d; rt_cv = c ? c->im.view : 0; rt_dv = d ? d->im.view : 0; rt_w = w; rt_h = h;
 }
 
 #define LUT_BYTES ((24 * 256 + 128) * 4)   /* lighting LUTs, then the fog LUT */
@@ -651,6 +653,7 @@ void vkr_draw(const VkrDraw *d, const void *tris, int ntris, void (*decode)(int,
         u->texinfo[k][0] = d->tex[k].w; u->texinfo[k][1] = d->tex[k].h; u->texinfo[k][2] = d->tex[k].wrap | (uint32_t)hw << 16 | (d->tex[k].faces == 6 ? 1u << 17 : 0); u->texinfo[k][3] = d->tex[k].border;
     }
 
+    begin_cmd();                       /* validating a surface (e.g. one that overlaps a texture) may have submitted */
     ensure_render(sc, sd, d->width, d->height);
 
     uint32_t om = R[0x107], allow_c = R[0x113] & 15, allow_d = R[0x115] & 3, bl = R[0x101];

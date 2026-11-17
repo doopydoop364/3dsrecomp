@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""armrecomp: static recompiler, ARM11 (ARMv6K + VFPv2, ARM mode) machine code -> C.
+"""armrecomp: static recompiler, ARM11 (ARMv6K + VFPv2, ARM and Thumb) machine code -> C.
 
-Each guest function becomes `void fn_XXXXXXXX(CPU *c)`. Guest memory keeps its original
+Each guest function becomes `void fn_XXXXXXXX(CPU *c)`. A function is named by its key: the address for ARM code,
+the address with bit 0 set for Thumb code (as an interworking branch would carry it), so calls, tail branches and
+code pointers always say which instruction set the target uses. Guest memory keeps its original
 addresses, so loads and stores are plain host memory accesses.
 
 Usage: armrecomp.py <code_decompressed.bin> <functions.txt> <outdir> [--files N] [--jobs N]
@@ -44,6 +46,20 @@ def in_text(a):
     return BASE <= a < TEXT_END and not (a & 3)
 
 
+def rd16(a):
+    return struct.unpack_from('<H', IMG, a - BASE)[0]
+
+
+def in_text_t(a):
+    """Thumb instruction address (halfword aligned) inside .text."""
+    return BASE <= a < TEXT_END - 1 and not (a & 1)
+
+
+def is_key(k):
+    """A function key: an ARM address (word aligned) or a Thumb address with bit 0 set."""
+    return in_text_t(k - 1) if k & 1 else in_text(k)
+
+
 def ror32(v, n):
     n &= 31
     return ((v >> n) | (v << (32 - n))) & 0xFFFFFFFF if n else v
@@ -59,14 +75,15 @@ class Unsup(Exception):
 
 
 class Ins:
-    __slots__ = ('addr', 'w', 'cond', 'body', 'falls', 'targets', 'calls', 'unsup', 'ptr', 'resume')
+    __slots__ = ('addr', 'w', 'cond', 'body', 'falls', 'targets', 'calls', 'unsup', 'ptr', 'resume', 'thumb', 'size')
 
-    def __init__(self, addr, w):
-        self.addr, self.w, self.cond = addr, w, w >> 28
+    def __init__(self, addr, w, thumb=False, size=4):
+        self.addr, self.w, self.cond = addr, w, 14 if thumb else w >> 28
+        self.thumb, self.size = thumb, size
         self.body = None
         self.falls = True
-        self.targets = []
-        self.calls = []
+        self.targets = []               # function keys of local jump targets (Thumb ones have bit 0 set)
+        self.calls = []                 # function keys of direct calls
         self.unsup = None
         self.ptr = None                 # code address taken through a literal pool
         self.resume = []                # local addresses a callee may come back to instead of addr+4
@@ -257,8 +274,11 @@ def dp(ins):
     if (w & 0x0FFF0000) in (0x028F0000, 0x024F0000) and rd < 14:   # adr rd, label: may be a function pointer
         imm = ror32(w & 0xFF, ((w >> 8) & 0xF) * 2)
         t = (addr + 8 + (imm if opc == 4 else -imm)) & 0xFFFFFFFF
-        if in_text(t):
+        if is_key(t):
             ins.ptr = t
+            nxt = rd32(addr + 4) if in_text(addr + 4) else 0
+            if (nxt & 0x0FFFFFD0) == 0x012FFF10 and (nxt & 0xF) == rd:   # mode-switch stub: adr rX, code ; bx/blx rX
+                ins.calls = [t]
     if (w & 0x0FFFF000) in (0x028EE000, 0x024EE000):       # add/sub lr, lr, #imm after add/sub lr, pc, #imm
         for back in (1, 2, 3):
             pa = addr - 4 * back
@@ -336,8 +356,11 @@ def ldr_str(ins):
         ea = (addr + 8 + (w & 0xFFF if U else -(w & 0xFFF))) & 0xFFFFFFFF
         if BASE <= ea < RO_END - 3:
             v = rd32(ea)
-            if in_text(v):
+            if is_key(v):
                 ins.ptr = v
+                nxt = rd32(addr + 4) if in_text(addr + 4) else 0
+                if (nxt & 0x0FFFFFD0) == 0x012FFF10 and (nxt & 0xF) == rd:   # veneer: ldr rX, =target ; bx/blx rX
+                    ins.calls = [v]                         # certainly code: discovered without the heuristics
             return f'c->r[{rd}] = 0x{v:08x}u;'
     L, wb = ea_lines(addr, rn, off, P, U, W)
     if Ld:
@@ -731,14 +754,286 @@ def vfp_ls(ins):
     return ' '.join(L)
 
 
+# ---------------------------------------------------------------- Thumb (ARMv6K: 16-bit Thumb-1 plus the v6 additions)
+TSHIFT = ('lsl', 'lsr', 'asr', 'ror')
+
+
+def tr(n, addr):
+    """C expression reading register n from a Thumb instruction at addr (pc reads as addr + 4)."""
+    return f'0x{(addr + 4) & 0xFFFFFFFF:08x}u' if n == 15 else f'c->r[{n}]'
+
+
+def t_nz(v='res'):
+    return f'c->n = {v} >> 31; c->z = ({v} == 0);'
+
+
+def t_ijump(ins, expr, is_return=False):
+    """Computed jump from Thumb code; the target keeps bit 0 as an interworking branch would."""
+    ins.falls = False
+    return f'SITE(0x{ins.addr:08x}u); ' + (f'RET({expr});' if is_return else f'IJUMP({expr});')
+
+
+def t_literal(ins, ea):
+    """Value of a literal-pool word at ea when it is read-only, else None; notes code pointers."""
+    if BASE <= ea < RO_END - 3 and not ea & 3:
+        v = rd32(ea)
+        if is_key(v):
+            ins.ptr = v
+        return v
+    return None
+
+
+def thumb_body(ins):
+    h, addr = ins.w & 0xFFFF, ins.addr
+    top = h >> 11
+    if top <= 2:                                          # LSL / LSR / ASR #imm (sets N Z C)
+        rd, rm, n = h & 7, (h >> 3) & 7, (h >> 6) & 31
+        x = f'c->r[{rm}]'
+        if top == 0:
+            if n == 0:
+                return f'uint32_t res = {x}; c->r[{rd}] = res; {t_nz()}'
+            return f'uint32_t x = {x}; uint32_t res = x << {n}; c->cf = (x >> {32 - n}) & 1; c->r[{rd}] = res; {t_nz()}'
+        if top == 1:
+            if n == 0:
+                return f'uint32_t x = {x}; c->cf = x >> 31; c->r[{rd}] = 0; c->n = 0; c->z = 1;'
+            return f'uint32_t x = {x}; uint32_t res = x >> {n}; c->cf = (x >> {n - 1}) & 1; c->r[{rd}] = res; {t_nz()}'
+        if n == 0:
+            return f'uint32_t x = {x}; c->cf = x >> 31; uint32_t res = (uint32_t)((int32_t)x >> 31); c->r[{rd}] = res; {t_nz()}'
+        return f'uint32_t x = {x}; uint32_t res = (uint32_t)((int32_t)x >> {n}); c->cf = (x >> {n - 1}) & 1; c->r[{rd}] = res; {t_nz()}'
+    if top == 3:                                          # ADDS / SUBS rd, rn, rm|#imm3
+        rd, rn, v = h & 7, (h >> 3) & 7, (h >> 6) & 7
+        b = f'0x{v:x}u' if h & 0x400 else f'c->r[{v}]'
+        if h & 0x200:
+            return f'c->r[{rd}] = add_f(c, c->r[{rn}], ~{b}, 1);'
+        return f'c->r[{rd}] = add_f(c, c->r[{rn}], {b}, 0);'
+    if top <= 7:                                          # MOVS / CMP / ADDS / SUBS rd, #imm8
+        rd, imm, op = (h >> 8) & 7, h & 0xFF, top - 4
+        if op == 0:
+            return f'c->r[{rd}] = 0x{imm:x}u; c->n = 0; c->z = {int(imm == 0)};'
+        if op == 1:
+            return f'add_f(c, c->r[{rd}], ~0x{imm:x}u, 1);'
+        if op == 2:
+            return f'c->r[{rd}] = add_f(c, c->r[{rd}], 0x{imm:x}u, 0);'
+        return f'c->r[{rd}] = add_f(c, c->r[{rd}], ~0x{imm:x}u, 1);'
+    if (h >> 10) == 0x10:                                 # data processing, low registers
+        op, rm, rd = (h >> 6) & 15, (h >> 3) & 7, h & 7
+        a, b = f'c->r[{rd}]', f'c->r[{rm}]'
+        if op in (0, 1, 12, 14):                          # AND EOR ORR BIC
+            e = {0: f'{a} & {b}', 1: f'{a} ^ {b}', 12: f'{a} | {b}', 14: f'{a} & ~{b}'}[op]
+            return f'uint32_t res = {e}; c->r[{rd}] = res; {t_nz()}'
+        if op in (2, 3, 4, 7):                            # LSL LSR ASR ROR by register
+            k = {2: 'lsl', 3: 'lsr', 4: 'asr', 7: 'ror'}[op]
+            return f'uint32_t co = c->cf; uint32_t res = sh_{k}_c({a}, {b} & 0xff, &co); c->cf = co; c->r[{rd}] = res; {t_nz()}'
+        if op == 5:
+            return f'c->r[{rd}] = add_f(c, {a}, {b}, c->cf);'
+        if op == 6:
+            return f'c->r[{rd}] = add_f(c, {a}, ~{b}, c->cf);'
+        if op == 8:
+            return f'uint32_t res = {a} & {b}; {t_nz()}'
+        if op == 9:                                       # NEG (RSBS rd, rm, #0)
+            return f'c->r[{rd}] = add_f(c, 0u, ~{b}, 1);'
+        if op == 10:
+            return f'add_f(c, {a}, ~{b}, 1);'
+        if op == 11:
+            return f'add_f(c, {a}, {b}, 0);'
+        if op == 13:                                      # MULS: N Z, C unchanged on ARMv6
+            return f'uint32_t res = {a} * {b}; c->r[{rd}] = res; {t_nz()}'
+        return f'uint32_t res = ~{b}; c->r[{rd}] = res; {t_nz()}'   # MVN
+    if (h >> 10) == 0x11:                                 # high-register ADD / CMP / MOV, BX / BLX
+        op, rm = (h >> 8) & 3, (h >> 3) & 15
+        rd = (h & 7) | ((h >> 4) & 8)
+        if op == 3:
+            if h & 0x80:                                  # BLX rm
+                ins.falls = True
+                ret = (addr + 2) | 1
+                return (f'uint32_t t = {tr(rm, addr)}; c->r[14] = 0x{ret:08x}u; call_indirect(c, t); '
+                        f'RET_CHECK(0x{ret:08x}u);')
+            if rm == 15:                                  # BX pc: continue in ARM code at the next word
+                t = (addr + 4) & ~3
+                if not in_text(t):
+                    raise Unsup('thumb_bx_pc')
+                ins.falls = False
+                ins.calls = [t]
+                return f'@T:{t:08x}@'
+            return t_ijump(ins, f'c->r[{rm}]', rm == 14)
+        if op == 1:
+            return f'add_f(c, {tr(rd, addr)}, ~{tr(rm, addr)}, 1);'
+        if op == 0 and rm == 15 and rd < 8:               # ldr rX, =offset ; add rX, pc: position-independent address
+            for back in range(1, 6):
+                pa = addr - 2 * back
+                if not in_text_t(pa):
+                    break
+                p = rd16(pa)
+                if (p & 0xFF00) == (0x4800 | (rd << 8)):
+                    lea = ((pa + 4) & ~3) + (p & 0xFF) * 4
+                    if BASE <= lea < RO_END - 3:
+                        v = (rd32(lea) + addr + 4) & 0xFFFFFFFF
+                        if is_key(v):
+                            ins.ptr = v
+                    break
+                if (p & 7) == rd and (p >> 13) in (0, 1, 2) or (p >> 11) == 0x1E:   # rX rewritten, or a call
+                    break
+        val = f'{tr(rd, addr)} + {tr(rm, addr)}' if op == 0 else tr(rm, addr)
+        if rd == 15:                                      # ADD/MOV pc: stays in Thumb state
+            return t_ijump(ins, f'(({val}) | 1u)', op == 2 and rm == 14)
+        return f'c->r[{rd}] = {val};'
+    if top == 9:                                          # LDR rd, [pc, #imm8*4]
+        rd = (h >> 8) & 7
+        ea = ((addr + 4) & ~3) + (h & 0xFF) * 4
+        v = t_literal(ins, ea)
+        if v is not None and ins.ptr is not None:
+            for k in (2, 4):                              # veneer: ldr rX, =target ; [mov ip, rX ;] bx/blx rX
+                n = rd16(addr + k) if in_text_t(addr + k) else 0
+                if (n & 0xFF07) == 0x4700 and ((n >> 3) & 15) == rd:
+                    ins.calls = [v]
+                    break
+        return f'c->r[{rd}] = 0x{v:08x}u;' if v is not None else f'c->r[{rd}] = ld32(0x{ea:08x}u);'
+    if (h >> 12) == 5:                                    # load / store, register offset
+        op, rm, rn, rd = (h >> 9) & 7, (h >> 6) & 7, (h >> 3) & 7, h & 7
+        ea = f'uint32_t ea = c->r[{rn}] + c->r[{rm}];'
+        return ea + ' ' + {0: f'st32(ea, c->r[{rd}]);', 1: f'st16(ea, c->r[{rd}]);', 2: f'st8(ea, c->r[{rd}]);',
+                           3: f'c->r[{rd}] = (uint32_t)(int32_t)(int8_t)ld8(ea);', 4: f'c->r[{rd}] = ld32(ea);',
+                           5: f'c->r[{rd}] = ld16(ea);', 6: f'c->r[{rd}] = ld8(ea);',
+                           7: f'c->r[{rd}] = (uint32_t)(int32_t)(int16_t)ld16(ea);'}[op]
+    if (h >> 13) == 3 or (h >> 12) == 8:                  # load / store, immediate offset (word, byte, halfword)
+        L, rn, rd, imm = (h >> 11) & 1, (h >> 3) & 7, h & 7, (h >> 6) & 31
+        if (h >> 12) == 8:
+            sz, off = 16, imm * 2
+        elif h & 0x1000:
+            sz, off = 8, imm
+        else:
+            sz, off = 32, imm * 4
+        ea = f'c->r[{rn}] + {off}u'
+        return f'c->r[{rd}] = ld{sz}({ea});' if L else f'st{sz}({ea}, c->r[{rd}]);'
+    if (h >> 12) == 9:                                    # load / store sp-relative
+        L, rd, off = (h >> 11) & 1, (h >> 8) & 7, (h & 0xFF) * 4
+        return f'c->r[{rd}] = ld32(c->r[13] + {off}u);' if L else f'st32(c->r[13] + {off}u, c->r[{rd}]);'
+    if (h >> 12) == 10:                                   # ADD rd, pc|sp, #imm8*4
+        rd, off = (h >> 8) & 7, (h & 0xFF) * 4
+        if h & 0x800:
+            return f'c->r[{rd}] = c->r[13] + {off}u;'
+        v = (((addr + 4) & ~3) + off) & 0xFFFFFFFF
+        if is_key(v):
+            ins.ptr = v
+        return f'c->r[{rd}] = 0x{v:08x}u;'
+    if (h >> 12) == 11:                                   # miscellaneous
+        if (h & 0xFF00) == 0xB000:                        # ADD / SUB sp, #imm7*4
+            off = (h & 0x7F) * 4
+            return f'c->r[13] {"-" if h & 0x80 else "+"}= {off}u;'
+        if (h & 0xFF00) == 0xB200:                        # SXTH SXTB UXTH UXTB
+            rm, rd = (h >> 3) & 7, h & 7
+            e = ['(uint32_t)(int32_t)(int16_t)', '(uint32_t)(int32_t)(int8_t)', '0xffffu & ', '0xffu & '][(h >> 6) & 3]
+            return f'c->r[{rd}] = {e}c->r[{rm}];'
+        if (h & 0xFF00) == 0xBA00 and ((h >> 6) & 3) != 2:   # REV REV16 REVSH
+            rm, rd = (h >> 3) & 7, h & 7
+            k = (h >> 6) & 3
+            if k == 0:
+                return f'c->r[{rd}] = __builtin_bswap32(c->r[{rm}]);'
+            if k == 1:
+                return f'uint32_t x = c->r[{rm}]; c->r[{rd}] = ((x >> 8) & 0x00ff00ffu) | ((x << 8) & 0xff00ff00u);'
+            return f'c->r[{rd}] = (uint32_t)(int32_t)(int16_t)__builtin_bswap16((uint16_t)c->r[{rm}]);'
+        if (h & 0xF600) == 0xB400:                        # PUSH / POP
+            regs = [i for i in range(8) if (h >> i) & 1]
+            if h & 0x800:                                 # POP {.., pc}
+                if h & 0x100:
+                    regs.append(15)
+                if not regs:
+                    raise Unsup('thumb_pop_empty')
+                L = ['uint32_t a = c->r[13];']
+                for k, r in enumerate(regs):
+                    L.append(f'uint32_t t = ld32(a + {4 * k});' if r == 15 else f'c->r[{r}] = ld32(a + {4 * k});')
+                L.append(f'c->r[13] = a + {4 * len(regs)}u;')
+                if 15 in regs:
+                    L.append(t_ijump(ins, 't', True))
+                return ' '.join(L)
+            if h & 0x100:
+                regs.append(14)
+            if not regs:
+                raise Unsup('thumb_push_empty')
+            n = len(regs)
+            L = [f'uint32_t a = c->r[13] - {4 * n}u;']
+            L += [f'st32(a + {4 * k}, c->r[{r}]);' for k, r in enumerate(regs)]
+            L.append('c->r[13] = a;')
+            return ' '.join(L)
+        if (h & 0xFFE8) == 0xB660:                        # CPS: no effect in user mode
+            return ';'
+        if (h & 0xFF00) == 0xBE00:
+            raise Unsup('thumb_bkpt')
+        raise Unsup('thumb_misc')
+    if (h >> 12) == 12:                                   # LDMIA / STMIA rn!, {list}
+        L_, rn, regs = (h >> 11) & 1, (h >> 8) & 7, [i for i in range(8) if (h >> i) & 1]
+        if not regs:
+            raise Unsup('thumb_ldm_empty')
+        n = len(regs)
+        L = [f'uint32_t a = c->r[{rn}];']
+        if L_:
+            L += [f'c->r[{r}] = ld32(a + {4 * k});' for k, r in enumerate(regs)]
+            if rn not in regs:
+                L.append(f'c->r[{rn}] = a + {4 * n}u;')
+        else:
+            L += [f'st32(a + {4 * k}, c->r[{r}]);' for k, r in enumerate(regs)]
+            L.append(f'c->r[{rn}] = a + {4 * n}u;')
+        return ' '.join(L)
+    if (h >> 12) == 13:                                   # Bcc / SVC
+        cond = (h >> 8) & 15
+        if cond == 15:
+            return f'svc_call(c, 0x{h & 0xFF:x}u, 0x{addr:08x}u);'
+        if cond == 14:
+            raise Unsup('thumb_undefined')
+        off = h & 0xFF
+        if off & 0x80:
+            off -= 0x100
+        t = (addr + 4 + off * 2) & 0xFFFFFFFF
+        if not in_text_t(t):
+            raise Unsup('branch_out_of_text')
+        ins.cond = cond
+        ins.targets = [t | 1]
+        return G(t | 1)
+    if top == 0x1C:                                       # B imm11
+        off = h & 0x7FF
+        if off & 0x400:
+            off -= 0x800
+        t = (addr + 4 + off * 2) & 0xFFFFFFFF
+        if not in_text_t(t):
+            raise Unsup('branch_out_of_text')
+        ins.falls = False
+        ins.targets = [t | 1]
+        return G(t | 1)
+    if top == 0x1E:                                       # BL / BLX prefix + suffix (one 32-bit instruction)
+        if not in_text_t(addr + 2):
+            raise Unsup('thumb_bl_split')
+        lo = rd16(addr + 2)
+        if (lo >> 11) not in (0x1F, 0x1D) or ((lo >> 11) == 0x1D and lo & 1):
+            raise Unsup('thumb_bl_split')
+        ins.size, ins.w = 4, h | (lo << 16)
+        hi = h & 0x7FF
+        if hi & 0x400:
+            hi -= 0x800
+        t = (addr + 4 + (hi << 12) + ((lo & 0x7FF) << 1)) & 0xFFFFFFFF
+        key = t | 1 if (lo >> 11) == 0x1F else t & ~3
+        if not is_key(key):
+            raise Unsup('branch_out_of_text')
+        ret = (addr + 4) | 1
+        ins.calls = [key]
+        return f'c->r[14] = 0x{ret:08x}u; @C:{key:08x}@ RET_CHECK(0x{ret:08x}u);'
+    raise Unsup('thumb_undefined')
+
+
 # ---------------------------------------------------------------- top-level decode
 def decode_body(ins):
     w, addr = ins.w, ins.addr
     if ins.cond == 0xF:
         if (w & 0xFD70F000) == 0xF550F000 or w == 0xF57FF01F:   # PLD, CLREX
             return ';'
-        if (w & 0xFE000000) == 0xFA000000:
-            raise Unsup('blx_thumb')
+        if (w & 0xFE000000) == 0xFA000000:                # BLX imm: call a Thumb function
+            off = w & 0xFFFFFF
+            if off & 0x800000:
+                off -= 0x1000000
+            t = (addr + 8 + off * 4 + ((w >> 24) & 1) * 2) & 0xFFFFFFFF
+            if not in_text_t(t):
+                raise Unsup('branch_out_of_text')
+            ins.calls = [t | 1]
+            return f'c->r[14] = 0x{addr + 4:08x}u; @C:{t | 1:08x}@ RET_CHECK(0x{addr + 4:08x}u);'
         raise Unsup('uncond')
     op = (w >> 25) & 7
     if op == 0:
@@ -777,15 +1072,25 @@ def decode_body(ins):
     raise Unsup('coproc')
 
 
-def decode(addr):
-    ins = Ins(addr, rd32(addr))
+def decode(key):
+    """Decodes the instruction at a function key's address (bit 0 set: Thumb)."""
+    if key & 1:
+        addr = key & ~1
+        ins = Ins(addr, rd16(addr), thumb=True, size=2)
+        body_fn = thumb_body
+    else:
+        ins = Ins(key, rd32(key))
+        body_fn = decode_body
+        addr = key
     try:
-        ins.body = decode_body(ins)
+        ins.body = body_fn(ins)
     except Unsup as e:
         ins.unsup = e.args[0]
         ins.targets, ins.calls = [], []
         ins.falls = False
         ins.body = f'TRAP_UNIMPL(0x{addr:08x}u, 0x{ins.w:08x}u); /* {ins.unsup} */'
+        if ins.thumb:
+            ins.size = 2
     if ins.cond < 14:
         ins.falls = True
     return ins
@@ -796,35 +1101,53 @@ MAX_FN_INSNS = 60000
 
 
 def discover(entry, funcs):
-    """Recursive descent over direct branches. Returns {addr: Ins}."""
-    body, work = {}, [entry]
+    """Recursive descent over direct branches from a function key. Returns {address: Ins}; every
+    instruction is in the entry's instruction set (keys of the other set are calls, never local)."""
+    tb = entry & 1
+    ok = in_text_t if tb else in_text
+    body, work = {}, [entry & ~1]
+    start = entry & ~1
     while work:
         a = work.pop()
-        while a not in body and in_text(a) and (a == entry or a not in funcs) and len(body) < MAX_FN_INSNS:
-            ins = decode(a)
+        while a not in body and ok(a) and (a == start or (a | tb) not in funcs) and len(body) < MAX_FN_INSNS:
+            ins = decode(a | tb)
             body[a] = ins
             for t in ins.targets:
-                if (t == entry or t not in funcs) and t not in body:
-                    work.append(t)
+                if (t & 1) == tb and (t == entry or t not in funcs) and (t & ~1) not in body:
+                    work.append(t & ~1)
             if not ins.falls:
                 break
-            a += 4
+            a += ins.size
     return body
 
 
 def is_clean_code(t, funcs):
-    """True when recursive descent from t only meets valid instructions (so t is code, not data)."""
+    """True when recursive descent from key t only meets valid instructions (so t is code, not data).
+    Nearly every halfword is a valid Thumb instruction, so a Thumb address must also look like a function
+    start: a push that saves lr, or a short body (64 instructions at most) that reaches a return (bx lr or
+    pop {..., pc}), such as a leaf or a function that shares another one's tail."""
+    if not is_key(t):
+        return False
     body = discover(t, funcs)
-    return 0 < len(body) < MAX_FN_INSNS and all(i.unsup is None for i in body.values())
+    if not (0 < len(body) < MAX_FN_INSNS and all(i.unsup is None for i in body.values())):
+        return False
+    if t & 1:
+        first = rd16(t & ~1)
+        if (first & 0xFF00) == 0xB500:
+            return True
+        return len(body) <= 64 and any((i.w & 0xFFFF) == 0x4770 or (i.w & 0xFF00) == 0xBD00 for i in body.values())
+    return True
 
 
-PLACEHOLDER = re.compile(r'@([GC]):([0-9a-f]{8})@')
+PLACEHOLDER = re.compile(r'@([GCT]):([0-9a-f]{8})@')
 
 
 def emit_function(entry, body, funcs):
+    tb = entry & 1
+    local = lambda t: (t & 1) == tb and (t & ~1) in body       # a target key inside this function
     labels = set()
     for ins in body.values():
-        labels.update(t for t in ins.targets if t in body)
+        labels.update(t & ~1 for t in ins.targets if local(t))
 
     resume = sorted({t for ins in body.values() for t in ins.resume})
     leave = 'goto L_resume;' if resume else 'return;'
@@ -833,17 +1156,20 @@ def emit_function(entry, body, funcs):
         kind, t = m.group(1), int(m.group(2), 16)
         if kind == 'C':
             return f'fn_{t:08x}(c);'
-        if t in body:
-            return f'goto L_{t:08x};'
+        if kind == 'T':                                    # tail call into the other instruction set
+            return f'{{ fn_{t:08x}(c); {leave} }}' if t in funcs else f'TRAP(0x{t:08x}u, "branch to unknown code");'
+        if local(t):
+            return f'goto L_{t & ~1:08x};'
         if t in funcs:
             return f'{{ fn_{t:08x}(c); {leave} }}'
         return f'TRAP(0x{t:08x}u, "branch to unknown code");'
 
     order = sorted(body)
+    start = entry & ~1
     out = [f'void fn_{entry:08x}(CPU *c) {{', '  uint32_t ret_lr = c->r[14]; (void)ret_lr;']
-    if order[0] != entry:
-        labels.add(entry)
-        out.append(f'  goto L_{entry:08x};')
+    if order[0] != start:
+        labels.add(start)
+        out.append(f'  goto L_{start:08x};')
     for a in order:
         ins = body[a]
         if a in labels:
@@ -852,11 +1178,12 @@ def emit_function(entry, body, funcs):
         if resume:
             code = code.replace('IJUMP(', 'IJUMP_R(').replace('RET(', 'RET_R(')
         out.append(f'  if ({COND[ins.cond]}) {{ {code} }}' if ins.cond < 14 else f'  {{ {code} }}')
-        if ins.falls and (a + 4) not in body:
-            if (a + 4) in funcs:
-                out.append(f'  fn_{a + 4:08x}(c); {leave}')
+        nxt = a + ins.size
+        if ins.falls and nxt not in body:
+            if (nxt | tb) in funcs:
+                out.append(f'  fn_{nxt | tb:08x}(c); {leave}')
             else:
-                out.append(f'  TRAP(0x{a + 4:08x}u, "fell off the end of a function");')
+                out.append(f'  TRAP(0x{nxt:08x}u, "fell off the end of a function");')
     if resume:
         # a callee came back with r15 set: continue at that local address, or keep returning
         cases = ' '.join(f'case 0x{t:08x}u: {PLACEHOLDER.sub(resolve, G(t))}' for t in resume)
@@ -940,7 +1267,8 @@ def main():
 
     # idioms: found by pattern, recorded so the result is visible
     nonlocal_returns = idioms.detect_inline_data_calls(img, lay.text_base, lay.text_base, lay.text_end)
-    init_arrays = idioms.detect_relative_init_arrays(img, lay.text_base, lay.text_base, lay.text_end)
+    init_arrays = idioms.detect_relative_init_arrays(img, lay.text_base, lay.text_base, lay.text_end) + \
+        idioms.detect_relative_init_arrays_thumb(img, lay.text_base, lay.text_base, lay.text_end)
     specials = [{'kind': 'inline-data-call', 'target': f'0x{t:08x}', 'resume_offsets': list(o)} for t, o in sorted(nonlocal_returns.items())]
     specials += [{'kind': 'relative-init-array', 'range': [f'0x{a:08x}', f'0x{b:08x}']} for a, b in init_arrays]
     with open(os.path.join(outdir, 'specials.json'), 'w') as fh:
@@ -967,7 +1295,7 @@ def main():
     funcs -= not_code
     n_seed = len(funcs)
     _init(img_path, funcs, lay, nonlocal_returns)
-    funcs = {f for f in funcs if in_text(f)}
+    funcs = {f for f in funcs if is_key(f)}
 
     # pass 1: close the function set over direct call targets
     todo, rounds = sorted(funcs), 0

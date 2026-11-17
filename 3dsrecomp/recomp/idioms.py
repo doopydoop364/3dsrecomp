@@ -72,3 +72,49 @@ def detect_relative_init_arrays(img, base, text_start, text_end):
         if begin and end and begin < end:
             found.append((begin, end))
     return found
+
+
+# The same runner compiled as Thumb:
+#       ldr rA, [pc, #x] ; add rA, pc        (and the same for rB)
+#   loop:  ldr r0, [rA] ; adds r0, r0, rA ; blx r0 ; adds rA, #4
+#   test:  cmp rA, rB ; bne loop
+def _h(img, base, a):
+    return struct.unpack_from('<H', img, a - base)[0]
+
+
+def _thumb_pc_relative_pair(img, base, addr, reg):
+    for back in range(1, 16):
+        a = addr - 2 * back
+        h = _h(img, base, a)
+        if (h & 0xFF00) == (0x4800 | (reg << 8)):                                          # ldr reg, [pc, #x]
+            lit = ((a + 4) & ~3) + (h & 0xFF) * 4
+            if not (base <= lit < base + len(img) - 3):
+                return None
+            for k in (2, 4):                                                               # add reg, pc
+                if _h(img, base, a + k) == (0x4478 | reg):
+                    return (a + k + 4 + struct.unpack_from('<I', img, lit - base)[0]) & 0xFFFFFFFF
+            return None
+    return None
+
+
+def detect_relative_init_arrays_thumb(img, base, text_start, text_end):
+    found = []
+    for a in range(text_start, text_end - 16, 2):
+        h = _h(img, base, a)
+        if (h & 0xFFC7) != 0x6800:                                                         # ldr r0, [rA]
+            continue
+        ra = (h >> 3) & 7
+        if _h(img, base, a + 2) != (0x1800 | (ra << 6)) or _h(img, base, a + 4) != 0x4780:  # adds r0, r0, rA ; blx r0
+            continue
+        rb = None
+        for k in range(6, 16, 2):
+            c = _h(img, base, a + k)
+            if (c & 0xFFC7) == (0x4280 | ra):                                               # cmp rA, rB
+                rb = (c >> 3) & 7
+                break
+        if rb is None:
+            continue
+        begin, end = _thumb_pc_relative_pair(img, base, a, ra), _thumb_pc_relative_pair(img, base, a, rb)
+        if begin and end and begin < end:
+            found.append((begin, end))
+    return found
