@@ -46,4 +46,4 @@ Ludo.guide (stage 1-1 walkthrough, controls & copy abilities), Nintendo's electr
   abilities (e.g. Smash Bros. Kirby; Meta Knight/Link/Marth Sword; King Dedede Hammer; Mario/Luigi Fire; Peach Parasol...).
 - New 3DS reads amiibo under the touch screen; older models need the NFC Reader/Writer accessory.
 - Port: nfc:u in runtime/nfc.c; amiibo .bin dumps in <game>/amiibo/, F5 taps the next one, F6 removes it.
-  Not yet verified in-game (our test save has not unlocked the icon).
+  Verified in-game by the user (touch the icon, F5): Kirby inhaled the test Kirby amiibo.

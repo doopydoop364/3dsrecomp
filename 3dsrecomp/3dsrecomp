@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+"""3dsrecomp: native Linux builds of your own 3DS game dumps.
+
+    3dsrecomp extract <dump> [--out DIR]     decrypt and unpack a .cia / .3ds / .cxi into a game folder
+    3dsrecomp info <dump>                    show what a dump is (title, encryption) without extracting
+
+build and run come in later phases (see docs/general_tool_design.md, section 10).
+"""
+import os, sys
+
+ROOT = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.join(ROOT, "extract"))
+
+
+def info(argv):
+    import struct, json
+    import extract as X
+    if len(argv) != 1:
+        sys.exit("usage: 3dsrecomp info <dump>")
+    with open(argv[0], "rb") as f:
+        src, kind = X.open_ncch(argv[0], f)
+        n = src.read(0, 0x200)
+    flags = n[0x188:0x190]
+    tid = struct.unpack_from("<Q", n, 0x108)[0]
+    enc = "none" if flags[7] & 0x04 else "fixed key" if flags[7] & 0x01 else \
+          f"key slot 0x2C / {X.D.CRYPTO_MAP.get(flags[3], 0):#x}" + (" with seed" if flags[7] & 0x20 else "")
+    print(json.dumps({"file": argv[0], "container": kind, "title_id": f"{tid:016x}",
+                      "product_code": n[0x150:0x160].rstrip(b"\0").decode("ascii", "replace"), "encryption": enc}, indent=2))
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
+        print(__doc__.strip()); return
+    cmd, rest = sys.argv[1], sys.argv[2:]
+    if cmd == "extract":
+        import extract as X
+        X.main(rest)
+    elif cmd == "info":
+        info(rest)
+    elif cmd in ("build", "run"):
+        sys.exit(f"3dsrecomp {cmd}: not available yet (phase 4); for now see README.md, 'Rebuild'")
+    else:
+        sys.exit(f"unknown command '{cmd}' (try 3dsrecomp --help)")
+
+
+if __name__ == "__main__":
+    main()

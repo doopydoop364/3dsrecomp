@@ -9,3 +9,9 @@ docs/romfs_files.tsv
 settings.toml
 profile_*.txt
 screenshot_*.png
+
+# console data the user provides (seed database for seed-encrypted games)
+seeddb.bin
+
+# per-game work folders made by 3dsrecomp (extracted game data, builds)
+work/

@@ -6,9 +6,10 @@ The first (and so far only) game is Kirby: Planet Robobot (CTR-P-AT3A), which is
 one-command tool for any CIA is in `docs/general_tool_design.md` (section 10).
 
 ## Layout
-- `extract/` CIA and NCCH handling: `decrypt_cia.py` / `decrypt_3ds.py` (the original decryption tool this repository
-  started from, by aszuraz), `extract_seeded.py` (CIA -> `game/`, needs the title seed), `extract_ncch.py`,
-  `romfs_list.py`, `make_cxi.py`, `make_shared_font.py`
+- `3dsrecomp` the command-line tool (`./3dsrecomp extract`, `./3dsrecomp info`; build/run come in later phases)
+- `extract/` dumps: `extract.py` (the extract stage), `decrypt_cia.py` / `decrypt_3ds.py` (the original decryption
+  tool this repository started from, by aszuraz; its key tables are reused), `extract_ncch.py`, `romfs_list.py`,
+  `make_cxi.py`, `make_shared_font.py`
 - `analyze/` code discovery: `find_pointer_functions.py` (code only reachable through stored pointers), `svc_scan.py`
 - `recomp/armrecomp.py` the recompiler (ARMv6K + VFPv2, ARM mode -> C); `recomp/layout.py` reads the memory layout
   and title id from `game/exheader.bin` and writes `build/gen/layout.h`; `recomp/idioms.py` pattern detectors
@@ -20,6 +21,15 @@ one-command tool for any CIA is in `docs/general_tool_design.md` (section 10).
   scripted runs (`play.sh`, in `build/testgame/`)
 - `tools/` debugging helpers: `disasm.py`, framebuffer/texture dumps, `shader_trace.py`, `azahar_capture.gdb`
 - `docs/` design notes, PICA facts, Robobot gameplay notes; `build/` generated C, objects and binaries
+
+## Extract a game
+    ./3dsrecomp extract "My Game.cia"          # -> work/<title id>/game/ (or --out game)
+Takes an original .cia (encrypted or not), a .3ds/.cci cartridge dump or a .cxi, decrypts on the fly and writes
+exheader, code (also decompressed), icon, banner, RomFS and title.json. Seed-encrypted games (most from 2015 on) need
+their seed: put `seeddb.bin` (from your console, e.g. dumped with GodMode9) in this folder, or pass `--seeddb`, or use
+`--fetch-seeds` to ask Nintendo's seed server (every seed is checked against the game's header first).
+`./3dsrecomp info "My Game.cia"` shows the title and encryption without extracting. A CIA "decrypted" by a tool that
+had no seed still has an encrypted RomFS; use the original dump.
 
 ## Rebuild
     ./build.sh            # or: python3 recomp/armrecomp.py game/code_decompressed.bin games/<title id>/functions_rea.txt build/gen; make -j12
@@ -95,8 +105,8 @@ Put a file at `game/romfs_override/<path inside the RomFS>` and the game loads i
 Put amiibo dumps (540-byte `.bin` files read from your figures) in `game/amiibo/`. When the game asks for an amiibo,
 F5 taps the next one and F6 takes it away (it is also removed 3 seconds after the game stops reading it, as in Azahar).
 The game gets the figure's ID and serial number, which need no console keys; the figure's own save area is not
-available, and nothing is written back to the file. In Robobot the amiibo icon appears only after some story progress.
-Not yet tested in-game.
+available, and nothing is written back to the file. In Robobot the amiibo icon appears only after some story progress:
+touch it, then press F5. Tested in-game (Kirby inhaled the amiibo).
 
 ## Audio
 `runtime/dsp.c` decodes the game's 24 DSP voices (PCM8, PCM16, DSP-ADPCM), resamples them linearly, mixes the three

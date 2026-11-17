@@ -13,7 +13,7 @@ never what it produces.
 
 | Stage | Input | Output | State today |
 |---|---|---|---|
-| 1 extract | CIA (+ seeddb.bin) | code image, ExHeader, RomFS | works (`extract/extract_seeded.py`), seed passed by hand |
+| 1 extract | CIA / CCI / CXI (+ seeddb.bin) | code image, ExHeader, RomFS | done: `3dsrecomp extract` (phase 2) |
 | 2 analyze | code image, ExHeader | function entry list, special-case list | REA/Ghidra list + pointer scans, partly manual |
 | 3 recompile | code image, lists | C files | works, Robobot layout hard-coded |
 | 4 compile + link | C files, shared runtime | executable | works (Makefile) |
@@ -151,9 +151,9 @@ must still build it and pass `tests/regress.sh` plus the scripted stage-1 run.
 
 | # | Phase | Delivers | Done when |
 |---|---|---|---|
-| 0 | Housekeeping | root `.gitignore` for dumps (done), commits under the GitHub no-reply address, push the branch | the work is backed up on GitHub |
-| 1 | Repository shape | `robobot-port/` becomes the generic layout of section 7 (`3dsrecomp/` with extract, analyze, recomp, runtime, tests, games); Robobot is just `games/0004000000183600.toml` | Robobot builds from the new tree, regress passes |
-| 2 | Extract stage | `3dsrecomp extract game.cia`: decrypt (reusing `decrypt_cia.py`), seeds from `seeddb.bin`, ExeFS, code decompression, RomFS, icon/title, into `work/<title-id>/` | Robobot's CIA extracts to byte-identical files |
+| 0 | Housekeeping (done) | root `.gitignore` for dumps (done), commits under the GitHub no-reply address, push the branch | the work is backed up on GitHub |
+| 1 | Repository shape (done) | `robobot-port/` becomes the generic layout of section 7 (`3dsrecomp/` with extract, analyze, recomp, runtime, tests, games); Robobot is just `games/0004000000183600.toml` | Robobot builds from the new tree, regress passes |
+| 2 | Extract stage (done; .3ds untested for lack of a sample) | `3dsrecomp extract game.cia`: decrypt (reusing `decrypt_cia.py`), seeds from `seeddb.bin`, ExeFS, code decompression, RomFS, icon/title, into `work/<title-id>/` | Robobot's CIA extracts to byte-identical files |
 | 3 | Analysis without REA | recursive descent, data and constant pointer scans, idiom detectors, jump tables; writes `games/<id>.toml` | Robobot builds and plays with `functions_rea.txt` deleted; a coverage report shows what each pass found |
 | 4 | `3dsrecomp build/run` | one command, cached stages, the missing-function loop of section 5 (log, add, rebuild one file, restart) | `3dsrecomp run Robobot.cia` from a clean checkout reaches gameplay |
 | 5 | Second game | an ARM-only title from the user's library; fix the services, PICA features and idioms it needs | it reaches its first gameplay; audit counters show which PICA features it uses |
