@@ -65,6 +65,10 @@ int main(int argc, char **argv) {
         fatal("this executable was generated for title %016llx but %s/exheader.bin is for title %016llx (or has another layout); regenerate with build.sh",
               (unsigned long long)RECOMP_TITLE_ID, dir, (unsigned long long)title);
 
+    for (int i = 0; i < 28; i++) {                       /* ARM11 kernel capabilities: the kernel version descriptor */
+        uint32_t d = rd32le(exh + 0x370 + 4 * i);
+        if (d >> 24 == 0xfe) { linear_base = (d & 0xffff) < 0x22c ? 0x14000000u : 0x30000000u; break; }
+    }
     uint8_t *p_text = mem_map(text, text_sz, ".text", 4, 5);
     uint8_t *p_ro = mem_map(ro, ro_sz, ".rodata", 4, 1);
     uint8_t *p_data = mem_map(data, data_sz + bss_sz, ".data/.bss", 5, 3);

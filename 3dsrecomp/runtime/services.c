@@ -30,6 +30,7 @@ static void reply(uint32_t *cmd, int normal, int translate) {
 static void stub(KObject *s, uint32_t *cmd) {
     LOG(1, "STUB %-9s cmd %08x  args %08x %08x %08x %08x", s->name, cmd[0], cmd[1], cmd[2], cmd[3], cmd[4]);
     reply(cmd, 1, 0);
+    memset(cmd + 2, 0, 6 * 4);                 /* outputs a caller may read anyway: zero, not its own arguments */
 }
 
 /* ---- srv: the service manager ---- */
@@ -272,7 +273,10 @@ static uint32_t archive_open(uint32_t id, uint32_t psize, uint32_t pptr, HArchiv
                 LOG(1, "fs: created empty shared extra data %08x%08x (the system provides it on a real console)", hi, lo);
             } else { LOG(1, "fs: extra data %08x%08x does not exist", hi, lo); return FS_ARCHIVE_NOT_FOUND; }
         }
-    } else if (id == 4 || id == 8 || id == 0x567890b2 || id == 0x567890b4) {
+    } else if (id == 4 || id == 0x567890b2) {                          /* the game's save data: exists once formatted */
+        snprintf(a->root, sizeof a->root, "%s/save", game_dir);
+        if (stat(a->root, &st)) { LOG(1, "fs: save data is not formatted yet"); return FS_NOT_FORMATTED; }
+    } else if (id == 8 || id == 0x567890b4) {
         snprintf(a->root, sizeof a->root, "%s/save", game_dir); mkdir(a->root, 0755);
     } else if (id == 9) {
         snprintf(a->root, sizeof a->root, "%s/sdmc", game_dir); mkdir(a->root, 0755);
@@ -295,7 +299,7 @@ static void fs_user(KObject *s, uint32_t *cmd) {
     uint32_t id = cmd[0] >> 16, res, h = 0;
     char path[600];
     switch (id) {
-    case 0x0801: case 0x0861: case 0x0862: case 0x080e: case 0x080d: case 0x080f: case 0x084c: reply(cmd, 1, 0); break;
+    case 0x0801: case 0x0861: case 0x0862: case 0x080e: case 0x080d: case 0x080f: reply(cmd, 1, 0); break;
     case 0x0802:                                                       /* OpenFile */
         res = host_open(archive_get(cmd[2]), cmd[4], cmd[5], cmd[9], cmd[6], &h);
         reply(cmd, 1, 2); cmd[1] = res; cmd[2] = 0x10; cmd[3] = h; break;
@@ -386,6 +390,11 @@ static void fs_user(KObject *s, uint32_t *cmd) {
         char root[300]; struct stat st; extdata_root(root, sizeof root, cmd[1] == 0, cmd[2], cmd[3]);
         res = stat(root, &st) ? FS_ARCHIVE_NOT_FOUND : rm_tree(root) ? FS_NOT_FOUND : RES_OK;
         LOG(1, "fs: delete extra data %s -> %08x", root, res); reply(cmd, 1, 0); cmd[1] = res; break;
+    }
+    case 0x084c: {                                                     /* FormatSaveData: start with an empty save folder */
+        char root[300]; snprintf(root, sizeof root, "%s/save", game_dir);
+        if (cmd[1] == 4 || cmd[1] == 0x567890b2) { rm_tree(root); mkdir(root, 0755); LOG(1, "fs: formatted save data %s", root); }
+        reply(cmd, 1, 0); break;
     }
     case 0x0817: case 0x0818: reply(cmd, 2, 0); cmd[2] = 1; break;     /* IsSdmcDetected / IsSdmcWritable */
     case 0x0845: reply(cmd, 5, 0); cmd[2] = 0x20000; cmd[3] = 8; cmd[4] = 8; cmd[5] = 0; break;   /* GetFormatInfo */
@@ -559,6 +568,68 @@ static void dsp_cmd(KObject *s, uint32_t *cmd) {
     }
 }
 
+/* ---- Network and social services of a console that is offline: no StreetPass, SpotPass, friends or Wi-Fi. ---- */
+static KObject *offline_event(KObject **slot) { if (!*slot) *slot = k_event(0); return *slot; }
+static void cecd(KObject *s, uint32_t *cmd) {                         /* cecd:u, StreetPass */
+    static KObject *info_ev, *state_ev;
+    switch (cmd[0] >> 16) {
+    case 0x000e: reply(cmd, 2, 0); cmd[2] = 0; break;                  /* GetCecdState: idle */
+    case 0x000f: reply(cmd, 1, 2); cmd[2] = 0; cmd[3] = h_new(offline_event(&info_ev)); break;   /* GetCecInfoEventHandle */
+    case 0x0010: reply(cmd, 1, 2); cmd[2] = 0; cmd[3] = h_new(offline_event(&state_ev)); break;  /* GetChangeStateEventHandle */
+    case 0x0011: case 0x0012: {          /* OpenAndWrite / OpenAndRead(size, program id, path type, flags, pid, buffer): one file per box item */
+        uint32_t size = cmd[1], desc = cmd[7], ptr = cmd[8], n = 0;
+        char path[400]; snprintf(path, sizeof path, "%s/cecd", game_dir); mkdir(path, 0755);
+        snprintf(path, sizeof path, "%s/cecd/%08x_%u.bin", game_dir, cmd[2], cmd[3]);
+        uint32_t res = RES_OK;
+        if ((cmd[0] >> 16) == 0x0011) {
+            FILE *f = fopen(path, "wb");
+            if (f) { n = (uint32_t)fwrite((void *)(uintptr_t)ptr, 1, size, f); fclose(f); }
+            LOG(1, "cecd: wrote %s (%u bytes)", path, n);
+            reply(cmd, 1, 2); cmd[1] = res; cmd[2] = desc; cmd[3] = ptr;
+        } else {
+            FILE *f = fopen(path, "rb");
+            if (f) { n = (uint32_t)fread((void *)(uintptr_t)ptr, 1, size, f); fclose(f); }
+            else if (cmd[3] == 2 && size >= 0x60) {    /* box info: the title's StreetPass box exists and is empty */
+                uint8_t *b = (uint8_t *)(uintptr_t)ptr; memset(b, 0, 0x60);
+                b[0] = b[1] = 0x63; memcpy(b + 4, &cmd[2], 4); b[0x0c] = 1; n = 0x60;
+            } else res = 0xc8810befu;                  /* NoData, CEC, NotFound (as Azahar) */
+            LOG(1, "cecd: read %s -> %s", path, f ? "ok" : "not found");
+            reply(cmd, 2, 2); cmd[1] = res; cmd[2] = n; cmd[3] = desc; cmd[4] = ptr;
+        }
+        break;
+    }
+    default: stub(s, cmd);
+    }
+}
+static void boss(KObject *s, uint32_t *cmd) {                         /* boss:U, SpotPass: no tasks, nothing arrived */
+    switch (cmd[0] >> 16) {
+    case 0x0005: reply(cmd, 2, 0); cmd[2] = 0; break;                  /* GetNewArrivalFlag */
+    case 0x0007: reply(cmd, 2, 0); cmd[2] = 0; break;                  /* GetOptoutFlag */
+    case 0x000d: case 0x000e: case 0x0010: case 0x0011: case 0x0012:  /* task / step / ns data id lists: empty */
+        reply(cmd, 2, 0); cmd[2] = 0; break;
+    default: quiet_ok(s, cmd); memset(cmd + 2, 0, 6 * 4);
+    }
+}
+static void frd(KObject *s, uint32_t *cmd) {                          /* frd:u, friends: not logged in, no friends */
+    switch (cmd[0] >> 16) {
+    case 0x0001: case 0x0002: reply(cmd, 2, 0); cmd[2] = 0; break;     /* HasLoggedIn, IsOnline */
+    case 0x0011: reply(cmd, 2, 0); cmd[2] = 0; break;                  /* GetFriendKeyList: none */
+    case 0x0003: case 0x0004: case 0x0032: reply(cmd, 1, 0); break;    /* Login, Logout, SetClientSdkVersion */
+    default:                                                           /* per-friend queries for an empty list: nothing to fill */
+        LOG(2, "ok   %-9s cmd %08x", s->name, cmd[0]); reply(cmd, 1, 0); memset(cmd + 2, 0, 6 * 4);
+    }
+}
+static void ac(KObject *s, uint32_t *cmd) {                           /* ac:u / ac:i, Wi-Fi: never connected */
+    switch (cmd[0] >> 16) {
+    case 0x0005: reply(cmd, 1, 0); cmd[1] = 0xe0a09d2eu; break;        /* GetConnectResult: failed */
+    case 0x000c: reply(cmd, 2, 0); cmd[2] = 0; break;                  /* GetLastErrorCode */
+    case 0x000d: reply(cmd, 2, 0); cmd[2] = 0; break;                  /* GetStatus: not connected */
+    case 0x000e: case 0x0016: case 0x0017: reply(cmd, 2, 0); cmd[2] = 0; break;   /* GetWifiStatus, GetInfraPriority, ... */
+    case 0x003e: reply(cmd, 2, 0); cmd[2] = 0; break;                  /* IsConnected: no */
+    default: quiet_ok(s, cmd); memset(cmd + 2, 0, 6 * 4);
+    }
+}
+
 /* ---- err:f: the game reports an unrecoverable error (a console would show the error screen) ---- */
 static void errf(KObject *s, uint32_t *cmd) {
     if ((cmd[0] >> 16) == 0x0001)
@@ -571,6 +642,7 @@ static const struct { const char *name; ServiceFn fn; } table[] = {
     { "dsp::DSP", dsp }, { "y2r:u", y2r_service }, { "nfc:u", nfc_service }, { "nfc:m", nfc_service },
     { "hid:USER", hid }, { "hid:SPVR", hid }, { "gsp::Gpu", gsp_service },
     { "fs:USER", fs_user }, { "ndm:u", quiet_ok },
+    { "cecd:u", cecd }, { "boss:U", boss }, { "boss:P", boss }, { "frd:u", frd }, { "frd:a", frd }, { "ac:u", ac }, { "ac:i", ac },
     { "APT:A", apt }, { "APT:U", apt }, { "APT:S", apt },
     { "cfg:u", cfg }, { "cfg:s", cfg }, { "cfg:i", cfg },
     { "ptm:u", ptm }, { "ptm:s", ptm }, { "ptm:sysm", ptm }, { "ptm:gets", ptm }, { "ptm:play", ptm },

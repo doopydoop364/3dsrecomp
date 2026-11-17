@@ -40,7 +40,7 @@ void pica_counters(uint64_t out[9]) { out[0] = t_setup; out[1] = t_shade; out[2]
 static uint8_t *phys(uint32_t p, uint32_t size) {
     uint32_t v;
     if (p - 0x18000000u < 0x00600000u) v = p - 0x18000000u + 0x1f000000u;           /* VRAM */
-    else if (p - 0x20000000u < 0x08000000u) v = p - 0x20000000u + 0x30000000u;      /* FCRAM, linear mapping */
+    else if (p - 0x20000000u < 0x08000000u) v = p - 0x20000000u + LINEAR_BASE;      /* FCRAM, linear mapping */
     else return 0;
     return mem_valid(v, size ? size : 1) ? (uint8_t *)(uintptr_t)v : 0;
 }

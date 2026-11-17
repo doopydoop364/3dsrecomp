@@ -69,7 +69,8 @@ void call_indirect(CPU *c, uint32_t addr) {
 typedef struct { uint32_t base, size; int state, perm; const char *what; } Region;
 static Region regions[512];
 static int nregions;
-static uint32_t linear_next = LINEAR_BASE, shared_next = SHARED_BASE;
+uint32_t linear_base = 0x30000000u;
+static uint32_t linear_next, shared_next = SHARED_BASE;
 
 void *mem_map(uint32_t addr, uint32_t size, const char *what, int state, int perm) {
     size = (size + 0xfff) & ~0xfffu;
@@ -81,6 +82,7 @@ void *mem_map(uint32_t addr, uint32_t size, const char *what, int state, int per
     return p;
 }
 uint32_t linear_alloc(uint32_t size) {
+    if (!linear_next) linear_next = LINEAR_BASE;
     uint32_t a = linear_next; size = (size + 0xfff) & ~0xfffu;
     mem_map(a, size, "linear heap", 7, 3); linear_next += size; mem_used += size;
     return a;
@@ -483,6 +485,33 @@ void svc_call(CPU *c, uint32_t num, uint32_t addr) {
         r[0] = RES_OK; resched(); break;
     }
     case 0x35: r[1] = 10; r[0] = RES_OK; break;
+    /* Process/thread affinity and processor queries: one application core, ideal processor 0. */
+    case 0x04: case 0x06: case 0x0f: r[1] = num == 0x04 ? 1 : 0; r[0] = RES_OK; break;   /* Get*AffinityMask, Get*IdealProcessor */
+    case 0x05: case 0x07: case 0x0e: case 0x10: r[0] = RES_OK; break;                      /* Set* versions: accepted */
+    case 0x0d: { uint8_t one = 1; if (r[0] && r[2] >= 1) memcpy((void *)(uintptr_t)r[0], &one, 1); r[0] = RES_OK; break; }   /* GetThreadAffinityMask */
+    case 0x11: r[0] = 0; break;                                                             /* GetCurrentProcessorNumber */
+    case 0x34: { KObject *o = 0; for (int i = 0; i < nthreads; i++) if ((uint32_t)threads[i]->id == r[2]) o = threads[i]->obj;   /* OpenThread */
+                 r[0] = o ? RES_OK : 0xd8e007f7u; r[1] = o ? h_new(o) : 0; break; }
+    case 0x36: r[1] = 10; r[0] = RES_OK; break;                                             /* GetProcessIdOfThread */
+    /* Resource limits (values of the application category, per Azahar): a handle stands for the process's limit. */
+    case 0x38: { static KObject *rl; if (!rl) rl = k_new(K_PROCESS); r[1] = h_new(rl); r[0] = RES_OK; break; }   /* GetResourceLimit */
+    case 0x39: case 0x3a: {                                /* GetResourceLimitLimitValues / CurrentValues(values, limit, names, count) */
+        uint32_t out = r[0], names = r[2], count = r[3];
+        for (uint32_t i = 0; i < count; i++) {
+            uint32_t name = ld32(names + 4 * i); int64_t v = 0;
+            if (num == 0x39) {
+                static const int64_t lim[10] = { 0x18, 0x04000000, 0x20, 0x20, 0x20, 0x08, 0x08, 0x10, 0x02, 0x1e };
+                v = name < 10 ? lim[name] : 0;
+            } else switch (name) {
+                case 0: v = 0x18; break;                       /* priority */
+                case 1: v = mem_used; break;                   /* committed memory */
+                case 2: v = nthreads; break;                   /* threads */
+                default: v = 0;                                /* other kernel objects are not counted */
+            }
+            memcpy((void *)(uintptr_t)(out + 8 * i), &v, 8);
+        }
+        r[0] = RES_OK; break;
+    }
     case 0x37: { KObject *o = h_get(r[1]); r[1] = o && o->type == K_THREAD ? (uint32_t)o->thread->id : 0; r[0] = RES_OK; break; }
     case 0x3c: fatal("guest called Break (reason %u) from %08x", r[0], addr);
     case 0x3d: fprintf(stderr, "[guest] %.*s\n", (int)r[1], (const char *)(uintptr_t)r[0]); break;

@@ -14,10 +14,10 @@
 #define SHARED_PAGE   0x1ff81000u
 #define TLS_BASE      0x1ff82000u
 #define TLS_SIZE      0x200u
-/* Linear heap start. This title declares kernel 2.50 in its ExHeader and uses 0x30000000. Titles built
- * for other kernel versions may expect a different base; the rule has not been checked against the
- * 3dbrew documentation yet, so it is not selected from the ExHeader. */
-#define LINEAR_BASE   0x30000000u
+/* Linear heap start (FCRAM physical 0x20000000), chosen from the kernel version in the ExHeader: titles for
+ * kernels older than 2.44 use 0x14000000, newer ones 0x30000000 (as Azahar's Process::GetLinearHeapAreaAddress). */
+extern uint32_t linear_base;
+#define LINEAR_BASE   linear_base
 #define MAX_THREADS   64
 
 #define RES_OK        0u

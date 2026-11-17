@@ -122,7 +122,7 @@ def jt_bound(ins, rm):
     if ins.cond not in (9, 3):
         return None
     a = ins.addr - 4
-    for _ in range(32):
+    for _ in range(256):                                  # compilers may schedule long runs of stores in between
         if not in_text(a):
             return None
         p = rd32(a)
@@ -133,11 +133,25 @@ def jt_bound(ins, rm):
         cls = (p >> 25) & 7
         if cls == 5 or (p >> 28) != 0xE:                  # branch or conditional code in between
             return None
+        if cls in (2, 3) and (p & (1 << 20)) and ((p >> 12) & 0xF) == rm:   # ldr into the index register
+            return None
+        if cls == 4 and (p & (1 << 20)) and (p >> rm) & 1:                  # ldm that includes it
+            return None
+        if cls in (2, 3, 4) and (p & (1 << 21)) and ((p >> 16) & 0xF) == rm:  # base writeback to it
+            return None
+        if cls == 6 and (p & (1 << 21)) and ((p >> 16) & 0xF) == rm:    # vldm / vstm writeback to it
+            return None
+        if cls == 7 and ((p >> 24) & 1 or ((p & 0x10) and (p & (1 << 20)) and ((p >> 12) & 0xF) in (rm, 15))):
+            return None                                   # svc, or vmov / vmrs into it or into the flags
         if cls in (0, 1):
             is_load = (p & 0x0E000090) == 0x00000090 and (p >> 5) & 3
             if (p & (1 << 20)) and not is_load:           # sets flags
                 return None
             if ((p >> 12) & 0xF) == rm and not is_load:   # index register rewritten
+                return None
+            if is_load and (p & (1 << 20)) and ((p >> 12) & 0xF) == rm:   # ldrh / ldrsb / ldrsh into it
+                return None
+            if (p & 0x0F0000F0) == 0x00000090 and ((p >> 16) & 0xF) == rm:  # mul / mla into it
                 return None
         a -= 4
     return None

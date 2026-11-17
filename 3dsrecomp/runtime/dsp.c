@@ -50,7 +50,7 @@ static uint8_t *region(int r) { return (uint8_t *)(uintptr_t)(DSP_MEM + regions[
 
 static const uint8_t *phys_ptr(uint32_t p, uint32_t size) {
     uint32_t a;
-    if (p - 0x20000000u < 0x08000000u) a = p - 0x20000000u + 0x30000000u;        /* FCRAM, linear mapping */
+    if (p - 0x20000000u < 0x08000000u) a = p - 0x20000000u + LINEAR_BASE;        /* FCRAM, linear mapping */
     else if (p - 0x18000000u < 0x00600000u) a = p - 0x18000000u + 0x1f000000u;   /* VRAM */
     else if (p - 0x1ff00000u < 0x00080000u) a = p;                               /* DSP memory */
     else return 0;
