@@ -8,4 +8,4 @@ eval "$(python3 -c "
 import tomllib, shlex, sys
 t = tomllib.load(open(sys.argv[1], 'rb')).get('tests', {})
 print('IN=' + shlex.quote(t.get('input', '')), 'SH=' + shlex.quote(t.get('shots', '')), 'FR=' + str(t.get('frames', 600)))" "$f")"
-tests/play.sh "$IN" "$SH" "$FR"
+tests/play.sh "$IN" "$SH" "$FR" "$1"

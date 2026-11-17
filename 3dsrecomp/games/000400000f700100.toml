@@ -1,0 +1,8 @@
+# Xenoblade Chronicles 3D (New 3DS)
+# Per-game hints and PC defaults (see games/0004000000183600.toml for every section). It runs without hints.
+
+[tests]
+# tests/smoke.sh 000400000f700100: from a console where it never ran: title, main menu, New Game, the opening cutscene
+input = "900-905:A;1050-1055:A;1200-1205:A;1350-1355:A;1500-1505:A;1650-1655:A;1800-1805:A;1950-1955:A;2100-2105:A;2250-2255:A;2400-2405:A;2550-2555:A;2700-2705:A;2850-2855:A;3000-3005:A;3150-3155:A;3300-3305:A;3450-3455:A;3600-3605:A;3750-3755:A;3900-3905:A"
+shots = "1200,2400,4000"
+frames = 4000

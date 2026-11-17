@@ -1,0 +1,8 @@
+# Mario Kart 7
+# Per-game hints and PC defaults (see games/0004000000183600.toml for every section). It runs without hints.
+
+[tests]
+# tests/smoke.sh 0004000000030800: from a console where it never ran: save formatted, the "no Mii characters" notice, menus with A, a 50cc race holding A
+input = "1250-1256:A;1400-1406:A;1550-1556:A;1700-1706:A;1850-1856:A;2000-2006:A;2150-2156:A;2300-2306:A;2450-2456:A;2600-2606:A;2750-2756:A;2900-2906:A;3050-3056:A;3200-3206:A;3400-4000:A"
+shots = "1300,2050,3300,4000"
+frames = 4000

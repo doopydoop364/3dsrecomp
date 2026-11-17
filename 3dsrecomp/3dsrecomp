@@ -65,8 +65,11 @@ def build(tid, quiet=False):
     game, gen, obj, binp = (os.path.join(wd, n) for n in ("game", "gen", "obj", "native"))
     extra = os.path.join(wd, "extra_functions.txt")
     tools = sorted(glob.glob(os.path.join(ROOT, "recomp", "*.py")) + glob.glob(os.path.join(ROOT, "analyze", "*.py")))
-    key = _hash_files([os.path.join(game, "code_decompressed.bin"), os.path.join(game, "exheader.bin"),
-                       os.path.join(ROOT, "games", f"{tid}.toml"), extra] + tools)
+    key = _hash_files([os.path.join(game, "code_decompressed.bin"), os.path.join(game, "exheader.bin"), extra] + tools)
+    toml = os.path.join(ROOT, "games", f"{tid}.toml")
+    if os.path.exists(toml):                       # only the part the recompiler reads; controls and tests do not rebuild
+        import tomllib
+        key = hashlib.sha256((key + repr(tomllib.load(open(toml, "rb")).get("functions", {}))).encode()).hexdigest()
     stamp = os.path.join(gen, ".inputs")
     if not (os.path.exists(stamp) and open(stamp).read() == key):
         print(f"3dsrecomp: discovering and recompiling {tid} ...", flush=True)
