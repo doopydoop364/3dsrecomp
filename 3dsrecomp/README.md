@@ -10,13 +10,15 @@ one-command tool for any CIA is in `docs/general_tool_design.md` (section 10).
 - `extract/` dumps: `extract.py` (the extract stage), `decrypt_cia.py` / `decrypt_3ds.py` (the original decryption
   tool this repository started from, by aszuraz; its key tables are reused), `extract_ncch.py`, `romfs_list.py`,
   `make_cxi.py`, `make_shared_font.py`
-- `analyze/` code discovery: `find_pointer_functions.py` (code only reachable through stored pointers), `svc_scan.py`
+- `analyze/` code discovery: `discover.py` (all functions from the entry point: calls, stored pointers, jump tables,
+  initialisers, prologues, repeated to a fixed point), `find_pointer_functions.py` (the older pointer scan), `svc_scan.py`
 - `recomp/armrecomp.py` the recompiler (ARMv6K + VFPv2, ARM mode -> C); `recomp/layout.py` reads the memory layout
   and title id from `game/exheader.bin` and writes `build/gen/layout.h`; `recomp/idioms.py` pattern detectors
   (inline-data dispatcher, relative static-initialiser array), results in `build/gen/specials.json`
 - `runtime/` kernel, services, PICA200 renderers (software and Vulkan), audio, input, window: nothing game-specific
 - `games/<title id>.toml` per-game settings (function hints, PC defaults such as controls and layout);
-  `games/<title id>/` per-game data: `functions_rea.txt` (REA/Ghidra function list), `functions_extra.txt` (pointer scan)
+  `games/<title id>/` per-game data: Robobot keeps its old REA/Ghidra list (`functions_rea.txt`, `functions_extra.txt`)
+  for comparison only; builds no longer need it
 - `tests/` differential CPU test (`difftest.py`, `runner.c`), renderer replays and screenshots (`regress.sh`),
   scripted runs (`play.sh`, in `build/testgame/`)
 - `tools/` debugging helpers: `disasm.py`, framebuffer/texture dumps, `shader_trace.py`, `azahar_capture.gdb`
@@ -32,7 +34,9 @@ their seed: put `seeddb.bin` (from your console, e.g. dumped with GodMode9) in t
 had no seed still has an encrypted RomFS; use the original dump.
 
 ## Rebuild
-    ./build.sh            # or: python3 recomp/armrecomp.py game/code_decompressed.bin games/<title id>/functions_rea.txt build/gen; make -j12
+    ./build.sh            # discovers functions from the entry point, recompiles, builds (about 1 minute)
+Passing `-` instead of a function list to `recomp/armrecomp.py` runs discovery (`analyze/discover.py`); the per-pass
+counts are in `build/gen/discovery.txt`. A list file (such as Robobot's old REA list) can still be passed instead.
     .venv/bin/python tests/difftest.py --variants 6 --seed 1
 
 ## Controls and settings

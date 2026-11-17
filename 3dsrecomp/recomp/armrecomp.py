@@ -935,12 +935,19 @@ def main():
         print(f'note: the inline-data-call pattern matched {len(nonlocal_returns)} functions; check specials.json')
     configure(img, lay, nonlocal_returns)
 
-    funcs = {int(l, 16) for l in open(fn_path) if l.strip()}
-    extra = os.path.join(os.path.dirname(fn_path), 'functions_extra.txt')
-    if os.path.exists(extra):
-        funcs |= {int(l.split()[0], 16) for l in open(extra) if l.strip() and not l.startswith('#')}
     game_extra, not_code = load_game_file(root, lay.title_id)
-    funcs |= game_extra
+    if fn_path == '-':                     # no list: discover every function from the entry point (analyze/discover.py)
+        sys.path.insert(0, os.path.join(root, 'analyze'))
+        import discover
+        funcs, report = discover.discover_all(img_path, lay, nonlocal_returns, {lay.text_base} | game_extra, not_code, jobs)
+        with open(os.path.join(outdir, 'discovery.txt'), 'w') as fh:
+            fh.write('\n'.join(report) + '\n')
+    else:
+        funcs = {int(l, 16) for l in open(fn_path) if l.strip()}
+        extra = os.path.join(os.path.dirname(fn_path), 'functions_extra.txt')
+        if os.path.exists(extra):
+            funcs |= {int(l.split()[0], 16) for l in open(extra) if l.strip() and not l.startswith('#')}
+        funcs |= game_extra
     funcs -= not_code
     n_seed = len(funcs)
     _init(img_path, funcs, lay, nonlocal_returns)
