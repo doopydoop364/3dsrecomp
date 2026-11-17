@@ -245,6 +245,36 @@ static void resched(void) {
     for (int i = 0; i < nthreads; i++)
         if (threads[i]->state == T_READY && threads[i]->prio < cur->prio) { cur->state = T_READY; to_scheduler(); return; }
 }
+/* Other cores. Guest threads run one at a time on one host thread; a thread on another processor (a New 3DS game's
+ * worker on core 2, a system-core thread) would starve while a core-0 thread busy-waits for it. The recompiled code
+ * counts loop back-edges (recomp_budget, about a millisecond of 3DS CPU per budget); when the budget runs out and a
+ * thread that has made no system call for 64 budgets in a row is busy-waiting: each further budget is charged to the
+ * virtual clock as CPU time (so a busy wait does not stop time), and a ready thread on another core gets a turn. */
+int recomp_budget = PREEMPT_BUDGET;
+static int prefer_other_core = -1;                  /* next pick: a thread not on this core, if one is ready */
+static uint64_t svc_count, svc_at_preempt; static KThread *quiet_thread; static int quiet_budgets;
+uint64_t n_preempts, n_core_switches;
+void recomp_preempt(CPU *c) {
+    (void)c;
+    recomp_budget = PREEMPT_BUDGET;
+    if (!cur) return;
+    /* Only a thread that has run 64 budgets in a row (about 64 ms of 3DS CPU) without a single system call counts as
+     * busy-waiting; ordinary frames make system calls all the time and are left exactly as they were. */
+    if (svc_count != svc_at_preempt || cur != quiet_thread) { svc_at_preempt = svc_count; quiet_thread = cur; quiet_budgets = 0; return; }
+    if (++quiet_budgets < 64) return;
+    n_preempts++;
+    vclock += 1000000;                                     /* charge the budget's CPU time (about 1 ms) */
+    pace_v0 += 1000000;                                    /* ... without making the wall-clock pacing wait for it:
+                                                              a long load still finishes as fast as the PC can */
+    static uint64_t shown; if (getenv("RB_LOG_PREEMPT") && shown++ % 2000 == 0) {
+        fprintf(stderr, "preempt: thread %d (prio %d core %d) busy-waits; threads:", cur->id, cur->prio, cur->core);
+        for (int i = 0; i < nthreads; i++) fprintf(stderr, " %d:s%d/p%d/c%d", threads[i]->id, threads[i]->state, threads[i]->prio, threads[i]->core);
+        fprintf(stderr, "\n");
+    }
+    for (int i = 0; i < nthreads; i++)                     /* another core's thread gets a turn */
+        if (threads[i] != cur && threads[i]->state == T_READY && threads[i]->core != cur->core) { prefer_other_core = cur->core; n_core_switches++; break; }
+    cur->state = T_READY; cur->seq = ++seq_counter; to_scheduler();   /* deliver what is due (vblank, timers) */
+}
 static void thread_main(void) {
     KThread *t = cur;
     recomp_fn f = recomp_lookup(t->cpu.r[15]);
@@ -295,6 +325,15 @@ void k_run(void) {
             }
             if (t->state == T_READY && (!best || t->prio < best->prio || (t->prio == best->prio && t->seq < best->seq))) best = t;
         }
+        if (prefer_other_core >= 0) {                  /* a preempted thread gave another core its turn */
+            KThread *o = 0;
+            for (int i = 0; i < nthreads; i++) {
+                KThread *t = threads[i];
+                if (t->state == T_READY && t->core != prefer_other_core && (!o || t->prio < o->prio || (t->prio == o->prio && t->seq < o->seq))) o = t;
+            }
+            if (o) best = o;
+            prefer_other_core = -1;
+        }
         if (!alive) { fprintf(stderr, "all guest threads exited\n"); exit(0); }
         if (!best) {
             if (!timed && !nperiodic && !ntimers) {
@@ -335,6 +374,7 @@ static const char *svc_name(uint32_t n) {
 }
 
 void svc_call(CPU *c, uint32_t num, uint32_t addr) {
+    svc_count++;
     uint32_t *r = c->r;
     LOG(3, "svc %02x %s (%08x %08x %08x %08x) from %08x lr %08x", num, svc_name(num), r[0], r[1], r[2], r[3], addr, r[14]);
     switch (num) {
@@ -372,7 +412,8 @@ void svc_call(CPU *c, uint32_t num, uint32_t addr) {
     case 0x03: fprintf(stderr, "guest called ExitProcess\n"); exit(0);
     case 0x08: {                                           /* CreateThread */
         KThread *t = k_thread_create(r[1], r[2], r[3], (int)r[0]);
-        LOG(1, "CreateThread entry %08x arg %08x stack %08x prio %d -> thread %d", r[1], r[2], r[3], r[0], t->id);
+        t->core = (int)r[4] < 0 ? 0 : (int)r[4];
+        LOG(1, "CreateThread entry %08x arg %08x stack %08x prio %d core %d -> thread %d", r[1], r[2], r[3], r[0], (int)r[4], t->id);
         r[1] = h_new(t->obj); r[0] = RES_OK; resched(); break;
     }
     case 0x09:                                             /* ExitThread */

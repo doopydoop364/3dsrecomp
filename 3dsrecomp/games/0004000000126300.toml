@@ -3,7 +3,7 @@
 
 [tests]
 # tests/smoke.sh 0004000000126300: from a console where it never ran: save formatted, extra data created,
-# the Circle Pad Pro check
-input = "1500-1506:A;1700-1706:A;1900-1906:A;2100-2106:A;2300-2306:A"
-shots = "600,1800,2400"
-frames = 2400
+# the Circle Pad Pro check, the Capcom logo, the title menu (New Game), character creation
+input = "1500-1506:A;1650-1656:A;1800-1806:A;1950-1956:A;2100-2106:A;2250-2256:A;2400-2406:A;2550-2556:A;2700-2706:A;2850-2856:A;3000-3006:A;3150-3156:A;3300-3306:A;3450-3456:A;3600-3606:A;3750-3756:A;3900-3906:A;4050-4056:A;4200-4206:A;4350-4356:A;4500-4506:A;4650-4656:A;4800-4806:A;4950-4956:A;5100-5106:A;5250-5256:A;5400-5406:A;5550-5556:A;5700-5706:A;5850-5856:A;6000-6006:A"
+shots = "2400,3300,4500,6000"
+frames = 6000

@@ -1159,6 +1159,8 @@ def emit_function(entry, body, funcs):
         if kind == 'T':                                    # tail call into the other instruction set
             return f'{{ fn_{t:08x}(c); {leave} }}' if t in funcs else f'TRAP(0x{t:08x}u, "branch to unknown code");'
         if local(t):
+            if (t & ~1) <= here[0]:                        # loop back-edge: count it (other cores, busy waits)
+                return f'{{ BACKEDGE(); goto L_{t & ~1:08x}; }}'
             return f'goto L_{t & ~1:08x};'
         if t in funcs:
             return f'{{ fn_{t:08x}(c); {leave} }}'
@@ -1166,11 +1168,13 @@ def emit_function(entry, body, funcs):
 
     order = sorted(body)
     start = entry & ~1
+    here = [0]                                             # address being emitted, for back-edge checks
     out = [f'void fn_{entry:08x}(CPU *c) {{', '  uint32_t ret_lr = c->r[14]; (void)ret_lr;']
     if order[0] != start:
         labels.add(start)
         out.append(f'  goto L_{start:08x};')
     for a in order:
+        here[0] = a
         ins = body[a]
         if a in labels:
             out.append(f'L_{a:08x}:;')

@@ -50,6 +50,12 @@ static inline void recomp_table_build(const void *list, uint32_t count, void *(*
     }
 }
 
+/* Loop back-edges count down recomp_budget; at zero the runtime may let another core's thread run (kernel.c). */
+#define PREEMPT_BUDGET 25000
+extern int recomp_budget;
+void recomp_preempt(CPU *c);
+#define BACKEDGE() do { if (__builtin_expect(--recomp_budget < 0, 0)) recomp_preempt(c); } while (0)
+
 /* Returns record the guest return target in r15. Builds with RECOMP_CHECK_RETURNS verify at
  * every call site that the callee came back to the instruction after the call. */
 #define RET(t) do { c->r[15] = (t); return; } while (0)

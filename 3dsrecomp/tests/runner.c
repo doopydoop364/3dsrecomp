@@ -44,6 +44,8 @@ void call_indirect(CPU *c, uint32_t addr) {
     if (!f) recomp_trap(c, addr, 0, "indirect call to unknown function");
     f(c);
 }
+int recomp_budget = PREEMPT_BUDGET;
+void recomp_preempt(CPU *c) { (void)c; recomp_budget = PREEMPT_BUDGET; }
 void svc_call(CPU *c, uint32_t num, uint32_t addr) { recomp_trap(c, addr, num, "svc"); }
 
 static void on_signal(int sig) {

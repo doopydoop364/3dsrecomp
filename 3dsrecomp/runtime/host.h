@@ -47,6 +47,7 @@ struct KThread {
     CPU cpu;
     KObject *obj;
     int id, state, prio;
+    int core;                            /* processor the thread asked for (the default -2 is core 0) */
     uint64_t seq;
     KObject *wait[32]; int nwait, wait_all;
     uint64_t wake_ns;
