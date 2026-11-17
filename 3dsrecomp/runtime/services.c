@@ -299,7 +299,7 @@ static void fs_user(KObject *s, uint32_t *cmd) {
     uint32_t id = cmd[0] >> 16, res, h = 0;
     char path[600];
     switch (id) {
-    case 0x0801: case 0x0861: case 0x0862: case 0x080e: case 0x080d: case 0x080f: reply(cmd, 1, 0); break;
+    case 0x0801: case 0x0861: case 0x0862: case 0x080e: case 0x080d: reply(cmd, 1, 0); break;
     case 0x0802:                                                       /* OpenFile */
         res = host_open(archive_get(cmd[2]), cmd[4], cmd[5], cmd[9], cmd[6], &h);
         reply(cmd, 1, 2); cmd[1] = res; cmd[2] = 0x10; cmd[3] = h; break;
@@ -391,13 +391,15 @@ static void fs_user(KObject *s, uint32_t *cmd) {
         res = stat(root, &st) ? FS_ARCHIVE_NOT_FOUND : rm_tree(root) ? FS_NOT_FOUND : RES_OK;
         LOG(1, "fs: delete extra data %s -> %08x", root, res); reply(cmd, 1, 0); cmd[1] = res; break;
     }
-    case 0x084c: {                                                     /* FormatSaveData: start with an empty save folder */
+    case 0x084c: case 0x080f: {                                        /* FormatSaveData, FormatThisUserSaveData: empty save folder */
         char root[300]; snprintf(root, sizeof root, "%s/save", game_dir);
-        if (cmd[1] == 4 || cmd[1] == 0x567890b2) { rm_tree(root); mkdir(root, 0755); LOG(1, "fs: formatted save data %s", root); }
+        if (id == 0x080f || cmd[1] == 4 || cmd[1] == 0x567890b2) { rm_tree(root); mkdir(root, 0755); LOG(1, "fs: formatted save data %s", root); }
         reply(cmd, 1, 0); break;
     }
     case 0x0817: case 0x0818: reply(cmd, 2, 0); cmd[2] = 1; break;     /* IsSdmcDetected / IsSdmcWritable */
-    case 0x0845: reply(cmd, 5, 0); cmd[2] = 0x20000; cmd[3] = 8; cmd[4] = 8; cmd[5] = 0; break;   /* GetFormatInfo */
+    case 0x0845: { char root[300]; struct stat st; snprintf(root, sizeof root, "%s/save", game_dir);   /* GetFormatInfo */
+                   if (cmd[1] == 4 && stat(root, &st)) { reply(cmd, 1, 0); cmd[1] = FS_NOT_FORMATTED; break; } }
+                 reply(cmd, 5, 0); cmd[2] = 0x20000; cmd[3] = 8; cmd[4] = 8; cmd[5] = 0; break;   /* GetFormatInfo */
     case 0x0863: reply(cmd, 2, 0); cmd[2] = 0; break;                  /* GetPriority */
     default: stub(s, cmd);
     }
