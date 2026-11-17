@@ -1,0 +1,65 @@
+# Roadmap to 3dsrecomp 1.0
+
+Agreed with the user on 2026-11-16. Status is kept current as work lands; the phase details for 1-8 of the general
+tool are in `general_tool_design.md` section 10.
+
+## Done
+- Robobot fully playable (Vulkan renderer, audio, amiibo, PC settings, profiler).
+- Phases 0-5 of the general tool: `3dsrecomp build|run <dump>`, extraction with seeds, discovery from the entry
+  point, cached build stages; Mario Kart 7, Ocarina of Time 3D and Xenoblade Chronicles 3D boot and play.
+
+## 1. Phase 6: Thumb code — *in progress (2026-11-16 night)*
+16-bit Thumb (ARMv6K has no Thumb-2) beside ARM in the recompiler and in discovery; interworking through one
+dispatch on bit 0 of the address. A differential test against a reference emulator before any game.
+Target: Tomodachi Life and Monster Hunter 4 Ultimate boot; Smash as far as it goes before its CRO.
+
+## 2. Phase 7: CRO modules
+Pokémon X (134), Animal Crossing: New Leaf Welcome amiibo (39), Smash (1). Each module is recompiled ahead of time
+for a fixed load address that our `ldr:ro` service then uses, so nothing is emulated at run time.
+Target: all 8 games of the test library start.
+
+## 3. Updates and DLC
+`3dsrecomp` takes the base game plus update (0004000E) and DLC (0004008C) dumps together. The update's program
+replaces the base program before discovery; its RomFS patches the base RomFS; DLC content is served through
+`am`/`fs` like on a console. Smash's DLC is in the library.
+
+## 4. GPU features
+1. Geometry shaders (Mario Kart 7 skips 44 draws per race).
+2. The rest of the PICA200, driven by the feature audit over all 8 games first, then complete: procedural textures,
+   shadow maps, gas (fog volumes), min/max blending factors, logic ops, wrap modes 4-7, 16-bit colour blending.
+
+## 5. Audio
+DSP effects (biquad filters and the remaining mixer details), AAC decoding where games use it.
+
+## 6. Services
+- A default Mii, so games that need one (Mario Kart 7's notice) work; importing Miis from a QR code or a file.
+- Whatever the newly booting games turn up.
+
+## 7. Real hardware
+- Camera: the PC webcam (SDL camera) as the inner camera, webcam or a still image as the outer cameras.
+- Microphone: the PC microphone (SDL audio capture).
+- Wi-Fi, in steps: (1) internet for games: `soc:U` on host sockets and `ac` reporting a connection;
+  (2) local wireless between two copies on the network (as Azahar); (3) online play through Pretendo Network
+  (Mario Kart 7 is supported there): accounts, friends, `ssl:C`/`http:C`. Research first, then commit.
+
+## 8. Phase 8: a finished tool
+- One shared `settings.toml` for controls and video; game files keep only game-specific defaults.
+- Save states.
+- Amiibo library: the full list of amiibo (names, ids, series) from a public database as a data file; a searchable
+  picker with favourites in the Esc menu; hotkeys to cycle favourites (F5/F6 tap/remove stay).
+- Save import/export: Checkpoint / JKSM formats (real 3DS) and Azahar.
+- Performance pass on the heaviest games (Smash, Xenoblade, Pokémon); GPU vertex shaders if the CPU path limits.
+- `3dsrecomp list`, clear progress and plain errors; the missing-function loop and `.3ds` dumps checked on real cases.
+- One command that runs every game's smoke test and the regression checks.
+- Desktop integration: a launcher entry per game with its icon and title from the dump.
+- README: install, dumping your games, running, controls, settings; tested from a clean checkout.
+
+## 9. Optional extras
+Stereoscopic 3D (anaglyph, side-by-side for 3D TVs and VR), cheats (Action Replay / Gateway codes), widescreen,
+texture packs.
+
+## 1.0
+- All 8 library games boot and play through at least their first hour without crashes or obvious rendering bugs.
+- Any of the user's dumps goes from file to playing with one command.
+- Settings, controls, save states and fullscreen are there; every game has a passing smoke test.
+- Someone with a Linux PC and their own dumps can follow the README.
