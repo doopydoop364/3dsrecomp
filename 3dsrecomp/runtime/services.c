@@ -14,6 +14,14 @@
 #include <unistd.h>
 
 static const char *game_dir;
+/* System data shared by all games (shared font, system archives): <game>/sysarchives/<name>, else the folder in
+ * $RB_SYSTEM_DIR (3dsrecomp run sets it), else system/sysarchives/<name> under the current folder. */
+static void sys_path(char *out, size_t n, const char *name) {
+    snprintf(out, n, "%s/sysarchives/%s", game_dir, name);
+    if (!access(out, R_OK)) return;
+    const char *sd = getenv("RB_SYSTEM_DIR");
+    snprintf(out, n, "%s/sysarchives/%s", sd ? sd : "system", name);
+}
 
 static void reply(uint32_t *cmd, int normal, int translate) {
     cmd[0] = (cmd[0] & 0xffff0000u) | ((uint32_t)normal << 6) | (uint32_t)translate;
@@ -76,7 +84,7 @@ static void apt(KObject *s, uint32_t *cmd) {
         static KObject *font;
         if (!font) {
             font = k_shmem(0x332000); font->prefer = 0x18000000;       /* the font block has a fixed address */
-            char fp[600]; snprintf(fp, sizeof fp, "%s/sysarchives/shared_font.bin", game_dir);
+            char fp[600]; sys_path(fp, sizeof fp, "shared_font.bin");
             FILE *f = fopen(fp, "rb");
             size_t n = f ? fread(font->mem, 1, font->size, f) : 0;
             if (f) fclose(f);
@@ -302,7 +310,7 @@ static void fs_user(KObject *s, uint32_t *cmd) {
             HArchive *a = 0;
             if (arch == 0x2345678a) {                                  /* content of another (system) title */
                 uint32_t ap = cmd[10];
-                char sp[600]; snprintf(sp, sizeof sp, "%s/sysarchives/%08x%08x.romfs", game_dir, ld32(ap + 4), ld32(ap));
+                char nm[64], sp[600]; snprintf(nm, sizeof nm, "%08x%08x.romfs", ld32(ap + 4), ld32(ap)); sys_path(sp, sizeof sp, nm);
                 int fd = open(sp, O_RDONLY); struct stat st;
                 if (fd >= 0 && !fstat(fd, &st)) {                      /* user-supplied dump of the system archive's RomFS */
                     HFile *f = calloc(1, sizeof *f); f->fd = fd; f->size = (uint64_t)st.st_size; f->fixed = 1;

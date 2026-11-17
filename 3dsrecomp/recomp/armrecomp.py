@@ -936,6 +936,8 @@ def main():
     configure(img, lay, nonlocal_returns)
 
     game_extra, not_code = load_game_file(root, lay.title_id)
+    if opts.get('--extra') and os.path.exists(opts['--extra']):     # functions the runtime found missing (3dsrecomp run)
+        game_extra |= {int(l.split()[0], 16) for l in open(opts['--extra']) if l.strip() and not l.startswith('#')}
     if fn_path == '-':                     # no list: discover every function from the entry point (analyze/discover.py)
         sys.path.insert(0, os.path.join(root, 'analyze'))
         import discover

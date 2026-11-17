@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """3dsrecomp: native Linux builds of your own 3DS game dumps.
 
-    3dsrecomp extract <dump> [--out DIR]     decrypt and unpack a .cia / .3ds / .cxi into a game folder
-    3dsrecomp info <dump>                    show what a dump is (title, encryption) without extracting
+    3dsrecomp run <dump | title id> [game options]   build if needed, then play (e.g. --scale 2, --fullscreen)
+    3dsrecomp build <dump | title id>                 extract, discover, recompile and compile into work/<title id>/
+    3dsrecomp extract <dump> [--out DIR]              only decrypt and unpack a .cia / .3ds / .cxi into a game folder
+    3dsrecomp info <dump>                             show what a dump is (title, encryption) without extracting
 
-build and run come in later phases (see docs/general_tool_design.md, section 10).
+Everything for a game lives in work/<title id>/: game/ (its data and saves), gen/ and obj/ (generated code), native
+(the executable). Each stage is skipped when its inputs did not change. If the game reaches code the analysis missed,
+run records it, rebuilds and starts the game again.
 """
-import os, sys
+import glob, hashlib, os, re, subprocess, sys
 
 ROOT = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, os.path.join(ROOT, "extract"))
@@ -28,6 +32,90 @@ def info(argv):
                       "product_code": n[0x150:0x160].rstrip(b"\0").decode("ascii", "replace"), "encryption": enc}, indent=2))
 
 
+def resolve(target):
+    """A dump file (extracted on first use), a title id, or a game folder -> title id (16 hex digits)."""
+    import struct
+    import extract as X
+    if re.fullmatch(r"[0-9a-fA-F]{16}", target):
+        tid = target.lower()
+        if not os.path.exists(os.path.join(ROOT, "work", tid, "game", "exheader.bin")):
+            sys.exit(f"no extracted game for {tid} in work/: give the dump file instead")
+        return tid
+    if os.path.isfile(target):
+        with open(target, "rb") as f:
+            src, _ = X.open_ncch(target, f)
+            tid = f"{struct.unpack_from('<Q', src.read(0, 0x200), 0x108)[0]:016x}"
+        game = os.path.join(ROOT, "work", tid, "game")
+        if not os.path.exists(os.path.join(game, "exheader.bin")):
+            X.extract(target, game)
+        return tid
+    sys.exit(f"{target}: not a dump file or title id")
+
+
+def _hash_files(paths):
+    h = hashlib.sha256()
+    for p in paths:
+        if os.path.exists(p):
+            h.update(p.encode()); h.update(open(p, "rb").read())
+    return h.hexdigest()
+
+
+def build(tid, quiet=False):
+    wd = os.path.join(ROOT, "work", tid)
+    game, gen, obj, binp = (os.path.join(wd, n) for n in ("game", "gen", "obj", "native"))
+    extra = os.path.join(wd, "extra_functions.txt")
+    tools = sorted(glob.glob(os.path.join(ROOT, "recomp", "*.py")) + glob.glob(os.path.join(ROOT, "analyze", "*.py")))
+    key = _hash_files([os.path.join(game, "code_decompressed.bin"), os.path.join(game, "exheader.bin"),
+                       os.path.join(ROOT, "games", f"{tid}.toml"), extra] + tools)
+    stamp = os.path.join(gen, ".inputs")
+    if not (os.path.exists(stamp) and open(stamp).read() == key):
+        print(f"3dsrecomp: discovering and recompiling {tid} ...", flush=True)
+        os.makedirs(gen, exist_ok=True)
+        with open(os.path.join(wd, "recomp.log"), "w") as log:
+            r = subprocess.run([sys.executable, os.path.join(ROOT, "recomp", "armrecomp.py"), os.path.join(game, "code_decompressed.bin"),
+                                "-", gen, "--extra", extra], stdout=log, stderr=subprocess.STDOUT, cwd=ROOT)
+        if r.returncode:
+            sys.exit(f"recompiling failed, see {os.path.join(wd, 'recomp.log')}")
+        for line in open(os.path.join(gen, "discovery.txt")):
+            print("  " + line.rstrip())
+        open(stamp, "w").write(key)
+    print(f"3dsrecomp: compiling {tid} ...", flush=True)
+    r = subprocess.run(["make", f"-j{os.cpu_count()}", f"GEN={gen}", f"OBJ={obj}", f"BIN={binp}", binp],
+                       cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    if r.returncode:
+        print("\n".join(l for l in r.stdout.splitlines() if "error" in l)[-4000:])
+        sys.exit("compiling failed")
+    if not quiet:
+        print(f"3dsrecomp: built {binp}")
+    return binp
+
+
+def run(tid, args):
+    wd = os.path.join(ROOT, "work", tid)
+    game, extra = os.path.join(wd, "game"), os.path.join(wd, "extra_functions.txt")
+    missing = os.path.join(game, "missing_functions.txt")
+    env = dict(os.environ, RB_SYSTEM_DIR=os.path.join(ROOT, "system"))
+    for attempt in range(10):
+        binp = build(tid, quiet=True)
+        if os.path.exists(missing):
+            os.remove(missing)
+        print(f"3dsrecomp: starting {tid}", flush=True)
+        rc = subprocess.call([binp, game] + args, cwd=ROOT, env=env)
+        found = set()
+        if os.path.exists(missing):
+            found = {l.split()[0] for l in open(missing) if l.strip()}
+            os.remove(missing)
+        known = {l.split()[0] for l in open(extra)} if os.path.exists(extra) else set()
+        new = sorted(found - known)
+        if rc == 0 or not new:
+            return rc
+        with open(extra, "a") as f:
+            f.writelines(f"{a} # found at run time\n" for a in new)
+        print(f"3dsrecomp: the game reached {len(new)} function(s) the analysis missed ({', '.join(new)}); rebuilding and restarting")
+    print("3dsrecomp: still finding missing functions after 10 restarts; stopping")
+    return 1
+
+
 def main():
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
         print(__doc__.strip()); return
@@ -37,8 +125,14 @@ def main():
         X.main(rest)
     elif cmd == "info":
         info(rest)
-    elif cmd in ("build", "run"):
-        sys.exit(f"3dsrecomp {cmd}: not available yet (phase 4); for now see README.md, 'Rebuild'")
+    elif cmd == "build":
+        if len(rest) != 1:
+            sys.exit("usage: 3dsrecomp build <dump | title id>")
+        build(resolve(rest[0]))
+    elif cmd == "run":
+        if not rest:
+            sys.exit("usage: 3dsrecomp run <dump | title id> [game options]")
+        sys.exit(run(resolve(rest[0]), rest[1:]))
     else:
         sys.exit(f"unknown command '{cmd}' (try 3dsrecomp --help)")
 

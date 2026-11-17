@@ -15,3 +15,7 @@ seeddb.bin
 
 # per-game work folders made by 3dsrecomp (extracted game data, builds)
 work/
+
+# compatibility link to Robobot's game folder, and console system data the user provides
+game
+system/

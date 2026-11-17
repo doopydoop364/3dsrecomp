@@ -155,7 +155,7 @@ must still build it and pass `tests/regress.sh` plus the scripted stage-1 run.
 | 1 | Repository shape (done) | `robobot-port/` becomes the generic layout of section 7 (`3dsrecomp/` with extract, analyze, recomp, runtime, tests, games); Robobot is just `games/0004000000183600.toml` | Robobot builds from the new tree, regress passes |
 | 2 | Extract stage (done; .3ds untested for lack of a sample) | `3dsrecomp extract game.cia`: decrypt (reusing `decrypt_cia.py`), seeds from `seeddb.bin`, ExeFS, code decompression, RomFS, icon/title, into `work/<title-id>/` | Robobot's CIA extracts to byte-identical files |
 | 3 | Analysis without REA (done: Robobot's stage-1 run is identical; Mario Kart 7 and Tomodachi Life discover 32k and 42k functions) | recursive descent, data and constant pointer scans, idiom detectors, jump tables; writes `games/<id>.toml` | Robobot builds and plays with `functions_rea.txt` deleted; a coverage report shows what each pass found |
-| 4 | `3dsrecomp build/run` | one command, cached stages, the missing-function loop of section 5 (log, add, rebuild one file, restart) | `3dsrecomp run Robobot.cia` from a clean checkout reaches gameplay |
+| 4 | `3dsrecomp build/run` (done; the missing-function restart is not yet exercised by a real game) | one command, cached stages, the missing-function loop of section 5 (log, add, rebuild one file, restart) | `3dsrecomp run Robobot.cia` from a clean checkout reaches gameplay |
 | 5 | Second game | an ARM-only title from the user's library; fix the services, PICA features and idioms it needs | it reaches its first gameplay; audit counters show which PICA features it uses |
 | 6 | Thumb | Thumb decoding and translation in the recompiler, interworking (`bx`, `blx`), difftest coverage | a Thumb-using game builds; difftest passes on its Thumb functions |
 | 7 | CRO modules | recompile each `.cro` from RomFS at build time; `ldr:ro` service links them by their import/export tables | a CRO game (e.g. Pokemon, Smash) loads its modules |
@@ -170,3 +170,4 @@ services. Save states and widescreen stay on the PC-experience list.
 - Mario Kart 7 (0004000000030800): ARM only, no CRO, 32,024 functions, 16 untranslated instructions: the natural
   second game for phase 5.
 - Tomodachi Life (000400000008c300): about 3,000 ARM-to-Thumb calls, so it needs phase 6 first; no CRO.
+- First `3dsrecomp run` of Mario Kart 7: builds and starts, stops at svc 0x38 GetResourceLimit (phase 5 starts there).

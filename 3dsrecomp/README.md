@@ -24,6 +24,16 @@ one-command tool for any CIA is in `docs/general_tool_design.md` (section 10).
 - `tools/` debugging helpers: `disasm.py`, framebuffer/texture dumps, `shader_trace.py`, `azahar_capture.gdb`
 - `docs/` design notes, PICA facts, Robobot gameplay notes; `build/` generated C, objects and binaries
 
+## Play a game (one command)
+    ./3dsrecomp run "My Game.cia"              # first time: extract, discover, recompile, compile (about a minute)
+    ./3dsrecomp run 0004000000183600 --scale 2 # later: by title id; game options are passed through
+Everything for a game lives in `work/<title id>/`: `game/` (its data, saves, amiibo), `gen/` and `obj/` (generated
+code), `native` (the executable). `./3dsrecomp build` does everything but start the game. Each stage is skipped when its
+inputs did not change. If the game reaches code the analysis missed, `run` adds it to `work/<title id>/extra_functions.txt`,
+rebuilds and restarts. Console system data shared by all games (the shared font, the Mii archive) goes in
+`system/sysarchives/`. Robobot's folder moved to `work/0004000000183600/game`; `game` links to it, so
+`./build/robobot-stable game` still works. Status: Robobot plays; other games build and start but need phase 5 work.
+
 ## Extract a game
     ./3dsrecomp extract "My Game.cia"          # -> work/<title id>/game/ (or --out game)
 Takes an original .cia (encrypted or not), a .3ds/.cci cartridge dump or a .cxi, decrypts on the fly and writes
