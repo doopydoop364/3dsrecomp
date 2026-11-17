@@ -24,6 +24,13 @@ dpad_up = "Up"
 dpad_down = "Down"
 dpad_left = "Left"
 dpad_right = "Right"
+# New 3DS only (games that use them): ZL / ZR and the C-stick; on a gamepad the triggers and the right stick
+zl = "1"
+zr = "2"
+cstick_up = "T"
+cstick_down = "G"
+cstick_left = "F"
+cstick_right = "H"
 # fast-forward while held (or press to toggle with fast_forward_mode = "toggle")
 fast_forward = "Tab"
 fast_forward_mode = "hold"

@@ -102,7 +102,7 @@ static void apt(KObject *s, uint32_t *cmd) {
     case 0x004f: apt_cpu_percent = cmd[2]; reply(cmd, 1, 0); break;    /* SetAppCpuTimeLimit */
     case 0x0050: reply(cmd, 2, 0); cmd[2] = apt_cpu_percent; break;    /* GetAppCpuTimeLimit */
     case 0x0051: reply(cmd, 2, 2); cmd[2] = 0; cmd[3] = 2; cmd[4] = staticbufs()[1]; break;   /* GetStartupArgument: none */
-    case 0x0101: case 0x0102: reply(cmd, 2, 0); cmd[2] = 0; break;     /* CheckNew3DSApp / CheckNew3DS: old 3DS */
+    case 0x0101: case 0x0102: reply(cmd, 2, 0); cmd[2] = (uint32_t)is_new_3ds; break;   /* CheckNew3DSApp / CheckNew3DS */
     default: stub(s, cmd);
     }
 }
@@ -149,6 +149,7 @@ static void ptm(KObject *s, uint32_t *cmd) {
     case 0x0008: reply(cmd, 2, 0); cmd[2] = 0; break;                  /* GetBatteryChargeState */
     case 0x0009: reply(cmd, 2, 0); cmd[2] = 0; break;                  /* GetPedometerState */
     case 0x000c: reply(cmd, 2, 0); cmd[2] = 0; break;                  /* GetTotalStepCount */
+    case 0x040a: reply(cmd, 2, 0); cmd[2] = (uint32_t)is_new_3ds; break;   /* ptm:sysm CheckNew3DS */
     default: stub(s, cmd);
     }
 }
@@ -422,7 +423,7 @@ static void hid_section(uint8_t *b, uint32_t *idx, uint32_t count, uint32_t entr
 static void hid_pad_tick(void) {
     uint8_t *m = hid_mem->mem;
     InputState in; input_get(&in);
-    uint32_t state = in.buttons & 0x0fffffffu;
+    uint32_t state = in.buttons & 0x0fffffffu & ~(uint32_t)(BTN_ZL | BTN_ZR);
     int r2 = in.cx * in.cx + in.cy * in.cy;
     if (r2 > 40 * 40) {                                                /* circle pad direction bits, 30/60 degree sectors */
         int ax = in.cx < 0 ? -in.cx : in.cx, ay = in.cy < 0 ? -in.cy : in.cy;
@@ -632,6 +633,60 @@ static void ac(KObject *s, uint32_t *cmd) {                           /* ac:u / 
     }
 }
 
+/* ---- ir:rst: the New 3DS ZL / ZR buttons and C-stick (layout per Azahar) ---- */
+static KObject *rst_mem, *rst_ev;
+static uint32_t rst_idx = 7, rst_state; static int rst_on;
+static void rst_tick(void) {
+    if (!rst_on) return;
+    uint8_t *m = rst_mem->mem;
+    InputState in; input_get(&in);
+    uint32_t st = in.buttons & (BTN_ZL | BTN_ZR);
+    if (in.sx * in.sx + in.sy * in.sy > 40 * 40) {                   /* C-stick direction bits */
+        int ax = in.sx < 0 ? -in.sx : in.sx, ay = in.sy < 0 ? -in.sy : in.sy;
+        if (ax * 1000 > ay * 577) st |= in.sx > 0 ? 1u << 24 : 1u << 25;
+        if (ay * 1000 > ax * 577) st |= in.sy > 0 ? 1u << 26 : 1u << 27;
+    }
+    uint32_t e[4] = { st, st & ~rst_state, rst_state & ~st, (uint32_t)(uint16_t)in.sx | (uint32_t)(uint16_t)in.sy << 16 };
+    rst_state = st;
+    hid_section(m, &rst_idx, 8, 0x18, 16, e);
+    k_signal(rst_ev);
+}
+static void irrst(KObject *s, uint32_t *cmd) {
+    if (!rst_mem) { rst_mem = k_shmem(0x1000); rst_ev = k_event(0); }
+    switch (cmd[0] >> 16) {
+    case 0x0001: reply(cmd, 1, 3); cmd[2] = 0x14000000; cmd[3] = h_new(rst_mem); cmd[4] = h_new(rst_ev); break;   /* GetHandles */
+    case 0x0002: {                                                     /* Initialize(update period ms, raw C-stick) */
+        static int ticking; uint32_t ms = cmd[1] ? cmd[1] : 10;
+        rst_on = 1; if (!ticking++) k_add_periodic(rst_tick, (uint64_t)ms * 1000000ull);
+        LOG(1, "ir:rst: ZL/ZR and C-stick every %u ms", ms); reply(cmd, 1, 0); break;
+    }
+    case 0x0003: rst_on = 0; reply(cmd, 1, 0); break;                  /* Shutdown */
+    default: stub(s, cmd);
+    }
+}
+/* ---- ir:USER: infrared accessories (Circle Pad Pro); none is attached ---- */
+static void iruser(KObject *s, uint32_t *cmd) {
+    static KObject *conn_ev, *send_ev, *recv_ev, *mem;
+    if (!conn_ev) { conn_ev = k_event(0); send_ev = k_event(0); recv_ev = k_event(0); }
+    switch (cmd[0] >> 16) {
+    case 0x0018:                                                       /* InitializeIrNopShared(..., shared memory) */
+        mem = h_get(cmd[8]);
+        if (mem && mem->mem) { memset(mem->mem, 0, 16); mem->mem[0x0e] = 1; }
+        reply(cmd, 1, 0); break;
+    case 0x0006:                                                       /* RequireConnection: nothing answers */
+        if (mem && mem->mem) { mem->mem[0x08] = 1; mem->mem[0x09] = 2; }
+        reply(cmd, 1, 0); break;
+    case 0x0009: if (mem && mem->mem) { mem->mem[0x08] = 0; mem->mem[0x0c] = 0; } reply(cmd, 1, 0); break;   /* Disconnect */
+    case 0x0002: mem = 0; reply(cmd, 1, 0); break;                     /* FinalizeIrNop */
+    case 0x000a: reply(cmd, 1, 2); cmd[2] = 0; cmd[3] = h_new(recv_ev); break;   /* GetReceiveEvent */
+    case 0x000b: reply(cmd, 1, 2); cmd[2] = 0; cmd[3] = h_new(send_ev); break;   /* GetSendEvent */
+    case 0x000c: reply(cmd, 1, 2); cmd[2] = 0; cmd[3] = h_new(conn_ev); break;   /* GetConnectionStatusEvent */
+    case 0x000d: reply(cmd, 1, 0); cmd[1] = 0xc8a0000du; break;        /* SendIrNop: not connected (13, InvalidState; module not checked) */
+    case 0x0019: reply(cmd, 1, 0); cmd[1] = 0xc88003efu; break;        /* ReleaseReceivedData: no data (NoData, NotFound; module not checked) */
+    default: stub(s, cmd);
+    }
+}
+
 /* ---- err:f: the game reports an unrecoverable error (a console would show the error screen) ---- */
 static void errf(KObject *s, uint32_t *cmd) {
     if ((cmd[0] >> 16) == 0x0001)
@@ -644,6 +699,7 @@ static const struct { const char *name; ServiceFn fn; } table[] = {
     { "dsp::DSP", dsp }, { "y2r:u", y2r_service }, { "nfc:u", nfc_service }, { "nfc:m", nfc_service },
     { "hid:USER", hid }, { "hid:SPVR", hid }, { "gsp::Gpu", gsp_service },
     { "fs:USER", fs_user }, { "ndm:u", quiet_ok },
+    { "ir:rst", irrst }, { "ir:USER", iruser },
     { "cecd:u", cecd }, { "boss:U", boss }, { "boss:P", boss }, { "frd:u", frd }, { "frd:a", frd }, { "ac:u", ac }, { "ac:i", ac },
     { "APT:A", apt }, { "APT:U", apt }, { "APT:S", apt },
     { "cfg:u", cfg }, { "cfg:s", cfg }, { "cfg:i", cfg },

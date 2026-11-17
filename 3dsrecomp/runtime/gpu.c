@@ -73,11 +73,11 @@ static uint32_t morton(uint32_t x, uint32_t y, uint32_t bpp) {
 }
 
 static void memory_fill(uint32_t start, uint32_t value, uint32_t end, uint32_t ctl) {
-    if (end <= start || !mem_valid(start, end - start + 2)) { LOG(1, "gx: memory fill %08x..%08x skipped (bad range)", start, end); return; }
-    uint8_t *p = (uint8_t *)(uintptr_t)start, *e = (uint8_t *)(uintptr_t)end;
-    if (ctl & 0x100) for (; p < e; p += 3) { p[0] = (uint8_t)value; p[1] = (uint8_t)(value >> 8); p[2] = (uint8_t)(value >> 16); }
+    if (end <= start || !mem_valid(start, end - start)) { LOG(1, "gx: memory fill %08x..%08x skipped (bad range)", start, end); return; }
+    uint8_t *p = (uint8_t *)(uintptr_t)start, *e = (uint8_t *)(uintptr_t)end;   /* end is exclusive */
+    if (ctl & 0x100) for (; p + 3 <= e; p += 3) { p[0] = (uint8_t)value; p[1] = (uint8_t)(value >> 8); p[2] = (uint8_t)(value >> 16); }
     else if (ctl & 0x200) for (; p + 4 <= e; p += 4) memcpy(p, &value, 4);
-    else for (; p < e; p += 2) { p[0] = (uint8_t)value; p[1] = (uint8_t)(value >> 8); }
+    else for (; p + 2 <= e; p += 2) { p[0] = (uint8_t)value; p[1] = (uint8_t)(value >> 8); }
 }
 static void display_transfer(uint32_t in, uint32_t out, uint32_t in_dim, uint32_t out_dim, uint32_t flags) {
     uint32_t iw = in_dim & 0xffff, ih = in_dim >> 16, ow = out_dim & 0xffff, oh = out_dim >> 16;

@@ -111,7 +111,9 @@ static const struct { const char *name, *def; uint32_t bit; } binds_def[] = {
     { "a", "L", BTN_A }, { "b", "K", BTN_B }, { "x", "I", BTN_X }, { "y", "J", BTN_Y }, { "l", "Q", BTN_L }, { "r", "E", BTN_R },
     { "start", "=", BTN_START }, { "select", "-", BTN_SELECT },
     { "dpad_up", "Up", BTN_UP }, { "dpad_down", "Down", BTN_DOWN }, { "dpad_left", "Left", BTN_LEFT }, { "dpad_right", "Right", BTN_RIGHT },
-    { "circle_up", "W", 0 }, { "circle_down", "S", 0 }, { "circle_left", "A", 0 }, { "circle_right", "D", 0 } };
+    { "circle_up", "W", 0 }, { "circle_down", "S", 0 }, { "circle_left", "A", 0 }, { "circle_right", "D", 0 },
+    { "zl", "1", BTN_ZL }, { "zr", "2", BTN_ZR },                                          /* New 3DS */
+    { "cstick_up", "T", 0 }, { "cstick_down", "G", 0 }, { "cstick_left", "F", 0 }, { "cstick_right", "H", 0 } };
 #define NBINDS (sizeof binds_def / sizeof *binds_def)
 #define NALT 4                                          /* keys per control: "Left Shift, Q" binds both */
 static SDL_Scancode binds[NBINDS][NALT];
@@ -145,6 +147,13 @@ static void poll_host_input(void) {
     if (bind_down(k, 13)) cy -= 154;
     if (bind_down(k, 14)) cx -= 154;
     if (bind_down(k, 15)) cx += 154;
+    if (bind_down(k, 16)) s.buttons |= BTN_ZL;
+    if (bind_down(k, 17)) s.buttons |= BTN_ZR;
+    int sx = 0, sy = 0;
+    if (bind_down(k, 18)) sy += 156;
+    if (bind_down(k, 19)) sy -= 156;
+    if (bind_down(k, 20)) sx -= 156;
+    if (bind_down(k, 21)) sx += 156;
     if (pad) {                                         /* positional (Nintendo) layout: east = A, south = B */
         static const struct { SDL_GamepadButton b; uint32_t bit; } pb[] = {
             { SDL_GAMEPAD_BUTTON_EAST, BTN_A }, { SDL_GAMEPAD_BUTTON_SOUTH, BTN_B }, { SDL_GAMEPAD_BUTTON_NORTH, BTN_X },
@@ -161,7 +170,12 @@ static void poll_host_input(void) {
             input_set_motion(a, g, 1);
         }
         if (ax * ax + ay * ay > 6000 * 6000) { cx = ax * 154 / 32767; cy = -ay * 154 / 32767; }
+        int rx = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTX), ry = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTY);
+        if (rx * rx + ry * ry > 6000 * 6000) { sx = rx * 156 / 32767; sy = -ry * 156 / 32767; }   /* right stick: C-stick */
+        if (SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 16000) s.buttons |= BTN_ZL;
+        if (SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 16000) s.buttons |= BTN_ZR;
     }
+    s.sx = (int16_t)(sx < -156 ? -156 : sx > 156 ? 156 : sx); s.sy = (int16_t)(sy < -156 ? -156 : sy > 156 ? 156 : sy);
     s.cx = (int16_t)(cx < -154 ? -154 : cx > 154 ? 154 : cx); s.cy = (int16_t)(cy < -154 ? -154 : cy > 154 ? 154 : cy);
     float mx, my;
     if (r_bot.w > 0 && (SDL_GetMouseState(&mx, &my) & SDL_BUTTON_LMASK)) {   /* stylus: left mouse on the bottom screen */

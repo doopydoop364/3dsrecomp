@@ -16,7 +16,8 @@
 #define TLS_SIZE      0x200u
 /* Linear heap start (FCRAM physical 0x20000000), chosen from the kernel version in the ExHeader: titles for
  * kernels older than 2.44 use 0x14000000, newer ones 0x30000000 (as Azahar's Process::GetLinearHeapAreaAddress). */
-extern uint32_t linear_base;
+extern uint32_t linear_base, app_mem_size;   /* app_mem_size: application memory of the memory mode */
+extern int is_new_3ds;
 #define LINEAR_BASE   linear_base
 #define MAX_THREADS   64
 

@@ -89,7 +89,6 @@ int main(int argc, char **argv) {
 
     /* kernel configuration page: firmware 2.50, retail unit, 64 MB application memory */
     cfg[0x02] = 50; cfg[0x03] = 2; cfg[0x14] = 1; cfg[0x10] = 2;
-    *(uint32_t *)(cfg + 0x40) = 0x04000000; *(uint32_t *)(cfg + 0x44) = 0x02c00000; *(uint32_t *)(cfg + 0x48) = 0x01400000;
     cfg[0x62] = 50; cfg[0x63] = 2; cfg[0x64] = 2;
     /* shared page: clock, retail hardware, 3D slider off, full battery */
     struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
@@ -116,6 +115,22 @@ int main(int argc, char **argv) {
     if (!getenv("RB_ANISOTROPY")) setenv("RB_ANISOTROPY", settings_get("video.anisotropy", "1"), 1);
     if (!getenv("RB_TEX_FILTER")) setenv("RB_TEX_FILTER", settings_get("video.texture_filter", "console"), 1);
     if (!getenv("RB_RENDERER")) setenv("RB_RENDERER", settings_get("video.renderer", "vulkan"), 1);   /* vk.c reads it */
+    /* Memory mode from the ExHeader (ARM11 system capabilities). On a New 3DS (the default, as Azahar's), a title that
+     * asks for a New 3DS mode gets it; otherwise its Old 3DS mode. Sizes: application, system, base region. */
+    {
+        static const uint32_t old_mode[6][3] = { { 0x4000000, 0x2c00000, 0x1400000 }, { 0x4000000, 0x2c00000, 0x1400000 },
+            { 0x6000000, 0x0c00000, 0x1400000 }, { 0x5000000, 0x1c00000, 0x1400000 }, { 0x4800000, 0x2400000, 0x1400000 },
+            { 0x2000000, 0x4c00000, 0x1400000 } };
+        uint32_t om = (exh[0x20e] >> 4) & 15, nm = exh[0x20d] & 15, type = om < 6 ? om : 0;
+        const uint32_t *m = old_mode[type];
+        static const uint32_t new_124[3] = { 0x7c00000, 0x6400000, 0x2000000 }, new_178[3] = { 0xb200000, 0x2e00000, 0x2000000 };
+        is_new_3ds = settings_int("system.new_3ds", 1);
+        if (is_new_3ds && nm >= 1 && nm <= 3) { m = nm == 2 ? new_178 : new_124; type = nm == 2 ? 7 : 6; }
+        cfg[0x30] = (uint8_t)type;
+        *(uint32_t *)(cfg + 0x40) = m[0]; *(uint32_t *)(cfg + 0x44) = m[1]; *(uint32_t *)(cfg + 0x48) = m[2];
+        app_mem_size = m[0];
+        LOG(1, "system: %s 3DS, application memory %u MB", is_new_3ds ? "New" : "Old", m[0] >> 20);
+    }
     video_init("3dsrecomp");
     input_init();
     audio_init();

@@ -19,7 +19,7 @@ static uint32_t button_bit(const char *n, size_t len) {
     static const struct { const char *name; uint32_t bit; } names[] = {
         { "A", BTN_A }, { "B", BTN_B }, { "X", BTN_X }, { "Y", BTN_Y }, { "L", BTN_L }, { "R", BTN_R },
         { "START", BTN_START }, { "SELECT", BTN_SELECT }, { "UP", BTN_UP }, { "DOWN", BTN_DOWN },
-        { "LEFT", BTN_LEFT }, { "RIGHT", BTN_RIGHT } };
+        { "LEFT", BTN_LEFT }, { "RIGHT", BTN_RIGHT }, { "ZL", BTN_ZL }, { "ZR", BTN_ZR } };
     for (unsigned i = 0; i < sizeof names / sizeof *names; i++)
         if (strlen(names[i].name) == len && !strncmp(names[i].name, n, len)) return names[i].bit;
     return 0;
@@ -39,6 +39,7 @@ void input_init(void) {
         while (*s && *s != ';') {
             size_t n = strcspn(s, ",;");
             if (!strncmp(s, "circle=", 7)) { int x = 0, y = 0; sscanf(s + 7, "%d/%d", &x, &y); e.st.cx = (int16_t)x; e.st.cy = (int16_t)y; }
+            else if (!strncmp(s, "cstick=", 7)) { int x = 0, y = 0; sscanf(s + 7, "%d/%d", &x, &y); e.st.sx = (int16_t)x; e.st.sy = (int16_t)y; }
             else if (!strncmp(s, "touch=", 6)) { int x = 0, y = 0; sscanf(s + 6, "%d/%d", &x, &y); e.st.touch = 1; e.st.tx = (uint16_t)x; e.st.ty = (uint16_t)y; }
             else { uint32_t b = button_bit(s, n); if (!b) fprintf(stderr, "RB_INPUT: unknown item '%.*s'\n", (int)n, s); e.st.buttons |= b; }
             s += n;
@@ -60,6 +61,7 @@ void input_frame(uint64_t frame) {
         if (frame >= script[i].from && frame <= script[i].to) {
             current.buttons |= script[i].st.buttons;
             if (script[i].st.cx || script[i].st.cy) { current.cx = script[i].st.cx; current.cy = script[i].st.cy; }
+            if (script[i].st.sx || script[i].st.sy) { current.sx = script[i].st.sx; current.sy = script[i].st.sy; }
             if (script[i].st.touch) { current.touch = 1; current.tx = script[i].st.tx; current.ty = script[i].st.ty; }
         }
 }

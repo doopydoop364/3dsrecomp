@@ -69,7 +69,8 @@ void call_indirect(CPU *c, uint32_t addr) {
 typedef struct { uint32_t base, size; int state, perm; const char *what; } Region;
 static Region regions[512];
 static int nregions;
-uint32_t linear_base = 0x30000000u;
+uint32_t linear_base = 0x30000000u, app_mem_size = 0x4000000u;
+int is_new_3ds;
 static uint32_t linear_next, shared_next = SHARED_BASE;
 
 void *mem_map(uint32_t addr, uint32_t size, const char *what, int state, int perm) {
@@ -500,7 +501,7 @@ void svc_call(CPU *c, uint32_t num, uint32_t addr) {
         for (uint32_t i = 0; i < count; i++) {
             uint32_t name = ld32(names + 4 * i); int64_t v = 0;
             if (num == 0x39) {
-                static const int64_t lim[10] = { 0x18, 0x04000000, 0x20, 0x20, 0x20, 0x08, 0x08, 0x10, 0x02, 0x1e };
+                const int64_t lim[10] = { 0x18, app_mem_size, 0x20, 0x20, 0x20, 0x08, 0x08, 0x10, 0x02, 0x1e };
                 v = name < 10 ? lim[name] : 0;
             } else switch (name) {
                 case 0: v = 0x18; break;                       /* priority */

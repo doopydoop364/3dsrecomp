@@ -172,6 +172,22 @@ services. Save states and widescreen stay on the PC-experience list.
 - Tomodachi Life (000400000008c300): about 3,000 ARM-to-Thumb calls, so it needs phase 6 first; no CRO.
 - First `3dsrecomp run` of Mario Kart 7: builds and starts, stops at svc 0x38 GetResourceLimit (phase 5 starts there).
 
+### Phase 5 results (2026-11-16)
+All three games run with generic changes only (no per-game code or hints):
+- **Mario Kart 7**: title, menus, kart builder, races (3D track, HUD, map, rivals). Needed: resource-limit and
+  affinity SVCs; the linear heap at 0x14000000 for kernels older than 2.44 (ExHeader kernel version, as Azahar);
+  save data "not formatted" until FormatSaveData; offline cecd/boss/frd/ac; jump tables whose guarding `cmp` is far
+  back or has VFP code in between. Open: 44 geometry-shader draws per race are skipped (PICA geometry shaders are
+  not implemented); a "no Mii characters" notice on boot (empty Mii database, as on a console without Miis).
+- **Ocarina of Time 3D**: title, file select, name entry, intro and Kokiri Forest cutscenes. Needed:
+  FormatThisUserSaveData.
+- **Xenoblade Chronicles 3D**: title, menu, opening cutscene. Needed: New 3DS memory modes from the ExHeader
+  (124 MB; `system.new_3ds`, default on, as Azahar), CheckNew3DS, ir:USER without an accessory, ir:rst (ZL/ZR,
+  C-stick; bound to keys and the gamepad triggers / right stick, not yet seen used by a game), exclusive memory-fill
+  end. Robobot also asks for New 3DS mode and now gets it; its regress and smoke stay identical.
+- StreetPass: a title's box info reads as an existing empty box when none was saved, so games do not ask to create
+  StreetPass data on every boot (nothing writes it back yet).
+
 ### Test library (user's dumps in ~/3ds-games, 2026-11-16)
 | Game | Title id | Code | ARM->Thumb calls | CRO/CRS files | Needs |
 |---|---|---|---|---|---|
