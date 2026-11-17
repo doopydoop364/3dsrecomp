@@ -6,6 +6,7 @@
 #include "settings.h"
 #include <signal.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <time.h>
 #include <ucontext.h>
 #include <unistd.h>
@@ -32,6 +33,10 @@ static void usage(void) {
     exit(1);
 }
 int main(int argc, char **argv) {
+    /* RB_ALLOW_ATTACH=1: let a debugger or profiler attach to this process (gdb -p, perf -p) although the system
+     * only allows that for child processes (Yama ptrace_scope 1). It opens only this process, only when asked. */
+    if (getenv("RB_ALLOW_ATTACH") && prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0) == 0)
+        fprintf(stderr, "debugging: other processes of this user may attach to pid %d\n", (int)getpid());
     const char *dir = "game";
     prog_name = argv[0];
     static const char *cli[64][2]; int ncli = 0;
