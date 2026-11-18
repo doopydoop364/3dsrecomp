@@ -27,7 +27,11 @@ replaces the base program before discovery; its RomFS patches the base RomFS; DL
 
 ## 4. GPU features
 1. Geometry shaders — *point mode done (2026-11-17)*; variable-primitive and subdivision modes still log and skip.
-2. The rest of the PICA200, driven by the feature audit over all 8 games first, then complete: procedural textures,
+2. Speed: an overlap-aware surface cache. Games that reuse one block of VRAM for render targets of different sizes
+   (MH4U: a 256x512 target, a mipmap chain, a second target inside the first) force a GPU write-back and re-upload
+   at every overlap; copying between overlapping surfaces on the GPU would remove most of MH4U's and Xenoblade's
+   remaining sync time (speed pass 1, 2026-11-17, measured with tests/bench.sh).
+3. The rest of the PICA200, driven by the feature audit over all 8 games first, then complete: procedural textures,
    shadow maps, gas (fog volumes), min/max blending factors, logic ops, wrap modes 4-7, 16-bit colour blending.
 
 ## 5. Audio
