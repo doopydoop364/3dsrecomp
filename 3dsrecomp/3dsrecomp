@@ -92,7 +92,8 @@ def build_modules(tid, gen, mods, jobs):
     entries = []
     for idx, name in enumerate(sorted(mods)):
         data = mods[name]
-        key = hashlib.sha256(tools.encode() + data).hexdigest()
+        extra = os.path.join(os.path.dirname(gen), "cro", f"{name}.extra")
+        key = hashlib.sha256(tools.encode() + data + (open(extra, "rb").read() if os.path.exists(extra) else b"")).hexdigest()
         stamp = os.path.join(gen, f"mod_{idx}.stamp")
         info = None
         if os.path.exists(stamp):
@@ -104,7 +105,7 @@ def build_modules(tid, gen, mods, jobs):
                 os.remove(old)
             src = os.path.join(gen, f"mod_{idx}.cro")
             open(src, "wb").write(data)
-            r = subprocess.run([sys.executable, os.path.join(ROOT, "recomp", "armrecomp.py"), "--module", src, gen, str(idx), "--jobs", str(jobs)],
+            r = subprocess.run([sys.executable, os.path.join(ROOT, "recomp", "armrecomp.py"), "--module", src, gen, str(idx), "--jobs", str(jobs), "--extra", extra],
                                capture_output=True, text=True, cwd=ROOT)
             os.remove(src)
             line = [l for l in r.stdout.splitlines() if l.startswith("MODULE\t")]
@@ -132,7 +133,7 @@ def build(tid, quiet=False):
     if crs:                                        # what ldr:ro writes into the main program, and what modules call there
         import cro as C
         new_dyn = "".join(f"{a:08x}\n" for a in sorted(C.main_program_words(crs, [C.Cro(b) for b in mods.values()])))
-        new_seeds = "".join(f"{a:08x}\n" for a in sorted(C.main_program_seeds(crs)))
+        new_seeds = "".join(f"{a:08x}\n" for a in sorted(C.main_program_seeds(crs, [C.Cro(b) for b in mods.values()])))
         for path, text in ((dyn, new_dyn), (seeds, new_seeds)):
             if not os.path.exists(path) or open(path).read() != text:
                 open(path, "w").write(text)

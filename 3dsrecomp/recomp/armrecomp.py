@@ -1217,6 +1217,7 @@ def emit_function(entry, body, funcs):
 # ---------------------------------------------------------------- driver
 _FUNCS = None
 FILE_HEADER = ['#include "recomp.h"', '#include "funcs.h"', '']   # first lines of every generated file
+EXTRA_SEEDS = None                                     # module mode: file of offsets found at run time
 
 
 class ModuleLayout:
@@ -1300,6 +1301,8 @@ def module_main(cro_path, outdir, idx, jobs):
     nlr = idioms.detect_inline_data_calls(img, 0, lo, hi)
     configure(img, lay, nlr)
     seeds = {k for k in m.code_seeds() if is_key(k)}
+    if EXTRA_SEEDS and os.path.exists(EXTRA_SEEDS):         # offsets the runtime found the analysis missed
+        seeds |= {k for k in (int(l.split()[0], 16) for l in open(EXTRA_SEEDS) if l.strip()) if is_key(k)}
     funcs, report = discover.discover_all(img_path, lay, nlr, seeds, set(), jobs, log=lambda *_: None, stored_pointers=False)
     funcs = {f for f in funcs if is_key(f)}
     order = sorted(funcs)
@@ -1333,6 +1336,8 @@ def module_main(cro_path, outdir, idx, jobs):
 def main():
     if sys.argv[1] == '--module':                          # armrecomp.py --module <file.cro> <outdir> <index> [--jobs N]
         opts = dict(zip(sys.argv[5::2], sys.argv[6::2]))
+        global EXTRA_SEEDS
+        EXTRA_SEEDS = opts.get('--extra')
         name, size, n = module_main(sys.argv[2], sys.argv[3], int(sys.argv[4]), int(opts.get('--jobs', os.cpu_count())))
         print(f'MODULE\t{name}\t{size}\t{n}')
         return

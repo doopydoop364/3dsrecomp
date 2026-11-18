@@ -62,6 +62,24 @@ void modules_unloaded(uint32_t base) {
     for (int i = 0; i < nloaded; i++)
         if (loaded[i].base == base) { free(loaded[i].arm); free(loaded[i].thumb); loaded[i] = loaded[--nloaded]; return; }
 }
+/* Code of a loaded module that its analysis missed: <work>/cro/<name>.extra gets its offset (a seed for the next
+ * build) and missing_modules.txt the module, so 3dsrecomp run rebuilds and restarts. Returns 0 if not in a module. */
+int modules_note_missing(uint32_t a) {
+    for (int i = 0; i < nloaded; i++) {
+        Loaded *l = &loaded[i];
+        uint32_t o = (a & ~1u) - l->base;
+        if (o >= l->size) continue;
+        char dir[400], path[600]; work_dir(dir, sizeof dir);
+        snprintf(path, sizeof path, "%s/cro", dir); mkdir(path, 0755);
+        snprintf(path, sizeof path, "%s/cro/%s.extra", dir, l->rm->name);
+        FILE *f = fopen(path, "a"); if (f) { fprintf(f, "%08x\n", o | (a & 1)); fclose(f); }
+        snprintf(path, sizeof path, "%s/missing_modules.txt", host_game_dir);
+        f = fopen(path, "a"); if (f) { fprintf(f, "%s\n", l->rm->name); fclose(f); }
+        LOG(1, "modules: \"%s\" offset %x was not found by the analysis; noted for the next build", l->rm->name, o | (a & 1));
+        return 1;
+    }
+    return 0;
+}
 recomp_fn recomp_lookup_module(uint32_t a) {
     for (int i = 0; i < nloaded; i++) {
         Loaded *l = &loaded[i];

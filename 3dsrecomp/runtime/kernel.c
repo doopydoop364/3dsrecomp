@@ -44,13 +44,16 @@ void recomp_trap(CPU *c, uint32_t addr, uint32_t info, const char *why) {
     fprintf(stderr, "last computed return/jump was the instruction at %08x\n", recomp_site);
     if (!strncmp(why, "branch to unknown code", 22)) note_missing_function(addr);
     /* a computed jump to code that is not a known function looks like a return to the wrong place */
-    if (!strncmp(why, "callee returned to an unexpected address", 40) && info - RECOMP_TEXT_BASE < RECOMP_TEXT_USED && !recomp_lookup(info))
+    if (!strncmp(why, "callee returned to an unexpected address", 40) && !recomp_lookup(info) &&
+        (info - RECOMP_TEXT_BASE < RECOMP_TEXT_USED || recomp_lookup_module(info) == 0))
         note_missing_function(info);
     fatal("recompiled code trap: %s (addr %08x, info %08x)", why, addr, info);
 }
 const char *host_game_dir = ".";
 /* Code the static analysis missed: record it so a later rebuild can include it. */
+int modules_note_missing(uint32_t addr);   /* modules.c: inside a loaded module? */
 void note_missing_function(uint32_t addr) {
+    if (modules_note_missing(addr)) return;
     char path[600];
     snprintf(path, sizeof path, "%s/missing_functions.txt", host_game_dir);
     FILE *f = fopen(path, "a");
@@ -297,9 +300,13 @@ static void thread_main(void) {
     abort();
 }
 KThread *k_thread_create(uint32_t entry, uint32_t arg, uint32_t sp, int prio) {
-    if (nthreads == MAX_THREADS) fatal("too many threads");
+    /* a finished thread's slot (and its TLS area) is reused; its object stays, still finished, for open handles */
+    int slot = nthreads;
+    for (int i = 1; i < nthreads; i++) if (threads[i]->state == T_DEAD && threads[i] != cur) { slot = i; break; }
+    if (slot == MAX_THREADS) fatal("too many threads");
+    if (slot < nthreads) { munmap(threads[slot]->hstack, 4u << 20); threads[slot]->hstack = 0; }
     KThread *t = calloc(1, sizeof *t);
-    t->id = nthreads; t->prio = prio; t->state = T_READY; t->seq = ++seq_counter;
+    t->id = slot; t->prio = prio; t->state = T_READY; t->seq = ++seq_counter;
     t->obj = k_new(K_THREAD); t->obj->thread = t; t->obj->refs = 1;
     t->cpu.r[0] = arg; t->cpu.r[13] = sp; t->cpu.r[14] = 0xffff0ff0u; t->cpu.r[15] = entry;
     t->cpu.tls = TLS_BASE + (uint32_t)t->id * TLS_SIZE;
@@ -311,7 +318,8 @@ KThread *k_thread_create(uint32_t entry, uint32_t arg, uint32_t sp, int prio) {
     uc->uc_stack.ss_sp = t->hstack; uc->uc_stack.ss_size = hs; uc->uc_link = 0;
     makecontext(uc, thread_main, 0);
     t->ctx = uc;
-    threads[nthreads++] = t;
+    threads[slot] = t;
+    if (slot == nthreads) nthreads++;
     return t;
 }
 void k_run(void) {

@@ -120,10 +120,21 @@ def main_program_words(crs, modules):
     return words
 
 
-def main_program_seeds(crs):
-    """Main-program functions modules reach through static.crs's exports."""
+def main_program_seeds(crs, modules=()):
+    """Main-program functions modules reach: static.crs's named and indexed exports, and the positions modules
+    import from it anonymously (import module entries naming static.crs, with segment tags into its segments)."""
     lo, hi = crs.code_range()
     keys = set()
+    for m in modules:
+        for i in range(m.f('IMPMODNUM')):
+            e = m.f('IMPMOD') + 20 * i
+            name_off, _, _, anon_off, anon_num = struct.unpack_from('<5I', m.b, e)
+            if m.cstr(name_off) != crs.name:
+                continue
+            for j in range(anon_num):
+                v = crs.tag(m.u32(anon_off + 8 * j))
+                if v is not None and lo <= (v & ~1) < hi:
+                    keys.add(v)
     for i in range(crs.f('EXPNAMEDNUM')):
         v = crs.tag(crs.u32(crs.f('EXPNAMED') + 8 * i + 4))
         if v is not None and lo <= (v & ~1) < hi:
