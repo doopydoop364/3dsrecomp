@@ -54,11 +54,25 @@ DSP effects (biquad filters and the remaining mixer details), AAC decoding where
 - `3dsrecomp list`, clear progress and plain errors; the missing-function loop and `.3ds` dumps checked on real cases.
 - One command that runs every game's smoke test and the regression checks.
 - Desktop integration: a launcher entry per game with its icon and title from the dump.
+- **GameVault integration** (asked for 2026-11-17; the user runs the GameVault Linux client):
+  - `3dsrecomp package <dump>`: one self-contained archive per game (program, game data, launcher, icon), named
+    with the dump's official English title (and release year) so GameVault matches it to IGDB, which has the 3DS
+    as a platform, for its metadata; the archive name carries GameVault's Linux tag (check its docs first).
+  - A folder watcher (systemd service or container) that packages new `.cia`/`.3ds` dumps once their build works
+    and boots, and moves the dump to an archive folder: originals are kept, so later 3dsrecomp versions can rebuild.
+  - Saves outside the game folder (`~/.local/share/3dsrecomp/<title id>/`), so reinstalling or updating a game
+    from GameVault keeps them.
 - README: install, dumping your games, running, controls, settings; tested from a clean checkout.
 
 ## 9. Optional extras
 Stereoscopic 3D (anaglyph, side-by-side for 3D TVs and VR), cheats (Action Replay / Gateway codes), widescreen,
 texture packs.
+
+**Frame interpolation** (asked for 2026-11-17): smoother motion on high-refresh monitors by generating in-between
+frames from two rendered ones (motion estimation on the GPU, or game-assisted: per-vertex motion from the two
+frames' draws, which the renderer already sees). A big job with visible artifacts on 2D/UI layers, so it comes
+with a per-game switch. Related, simpler: a frame-rate cap that is a game-speed limit (in the speed pass), and
+per-game 60 fps patches for 30 fps games (with cheats).
 
 ## 1.0
 - All 8 library games boot and play through at least their first hour without crashes or obvious rendering bugs.

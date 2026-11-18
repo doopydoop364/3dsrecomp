@@ -119,6 +119,9 @@ int main(int argc, char **argv) {
     if (!getenv("RB_ANISOTROPY")) setenv("RB_ANISOTROPY", settings_get("video.anisotropy", "1"), 1);
     if (!getenv("RB_TEX_FILTER")) setenv("RB_TEX_FILTER", settings_get("video.texture_filter", "console"), 1);
     if (!getenv("RB_RENDERER")) setenv("RB_RENDERER", settings_get("video.renderer", "vulkan"), 1);   /* vk.c reads it */
+    if (!getenv("RB_VSYNC")) setenv("RB_VSYNC", settings_get("video.vsync", "mailbox"), 1);
+    { const char *c = settings_get("video.frame_cap", "60");     /* frame cap = game speed: cap / 60, unlimited = 0 */
+      double n = !strcmp(c, "unlimited") ? 0 : atof(c); k_set_speed(n > 0 ? n / 60.0 : 0); }
     /* Memory mode from the ExHeader (ARM11 system capabilities). On a New 3DS (the default, as Azahar's), a title that
      * asks for a New 3DS mode gets it; otherwise its Old 3DS mode. Sizes: application, system, base region. */
     {

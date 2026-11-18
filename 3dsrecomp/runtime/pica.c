@@ -16,6 +16,7 @@ static uintptr_t cur_word;
 static uint32_t top_list, cur_list;         /* top-level list of this submission, and the list now executing */                 /* host address of the command word being executed */
 static uintptr_t uni_src[96];              /* where each uniform's last upload came from */
 static PicaShader vs, gs;                  /* vertex and geometry shader units */
+static uint64_t vs_ver = 1, gs_ver = 1;     /* bumped on every program or swizzle write */
 static uint32_t uni_queue[4]; static int uni_n;
 static uint32_t gs_uni_queue[4]; static int gs_uni_n;
 static float dflt[16][4]; static uint32_t dflt_queue[3]; static int dflt_n;
@@ -126,13 +127,13 @@ static uint32_t write_reg(uint32_t id, uint32_t value, uint32_t mask) {
     }
     case 0x2cc: case 0x2cd: case 0x2ce: case 0x2cf: case 0x2d0: case 0x2d1: case 0x2d2: case 0x2d3: {
         uint32_t o = reg[0x2cb];
-        if (o < 512) { vs.code[o] = v; if (!(reg[0x244] & 1)) gs.code[o] = v; }   /* units not configured apart: shared */
+        if (o < 512) { vs.code[o] = v; vs_ver++; if (!(reg[0x244] & 1)) { gs.code[o] = v; gs_ver++; } }   /* units not configured apart: shared */
         reg[0x2cb] = o + 1;
         break;
     }
     case 0x2d6: case 0x2d7: case 0x2d8: case 0x2d9: case 0x2da: case 0x2db: case 0x2dc: case 0x2dd: {
         uint32_t o = reg[0x2d5];
-        if (o < 128) { vs.desc[o] = v; if (!(reg[0x244] & 1)) gs.desc[o] = v; }
+        if (o < 128) { vs.desc[o] = v; vs_ver++; if (!(reg[0x244] & 1)) { gs.desc[o] = v; gs_ver++; } }
         reg[0x2d5] = o + 1;
         break;
     }
@@ -154,13 +155,13 @@ static uint32_t write_reg(uint32_t id, uint32_t value, uint32_t mask) {
     }
     case 0x29c: case 0x29d: case 0x29e: case 0x29f: case 0x2a0: case 0x2a1: case 0x2a2: case 0x2a3: {
         uint32_t o = reg[0x29b];
-        if (o < 512) gs.code[o] = v;
+        if (o < 512) { gs.code[o] = v; gs_ver++; }
         reg[0x29b] = o + 1;
         break;
     }
     case 0x2a6: case 0x2a7: case 0x2a8: case 0x2a9: case 0x2aa: case 0x2ab: case 0x2ac: case 0x2ad: {
         uint32_t o = reg[0x2a5];
-        if (o < 128) gs.desc[o] = v;
+        if (o < 128) { gs.desc[o] = v; gs_ver++; }
         reg[0x2a5] = o + 1;
         break;
     }
@@ -1063,7 +1064,8 @@ static pthread_cond_t pool_start = PTHREAD_COND_INITIALIZER, pool_done = PTHREAD
 static uint64_t pool_gen; static int pool_pending;
 static const Fb *job_fb; static int32_t job_band;
 static FragStats job_stats[64];
-static int job_kind;                                   /* 0 rasterise bands, 1 shade vertices */
+static int job_kind;                                   /* 0 rasterise bands, 1 shade vertices, 2/3 geometry shader stages */
+static void run_job(int b);
 static uint32_t job_base, job_nv; static const uint32_t *job_vlist; static Vtx *job_vout;
 static void shade_vertex(uint32_t base, uint32_t vertex, Vtx *out);
 static uint32_t job_next;                               /* next vertex chunk to take (dynamic load balancing) */
@@ -1102,7 +1104,7 @@ static void *worker(void *arg) {
             pthread_mutex_unlock(&pool_mu);
         }
         seen = __atomic_load_n(&pool_gen, __ATOMIC_ACQUIRE);
-        if (job_kind == 0) run_band(b); else run_vertices(b, nworkers);
+        run_job(b);
         if (__atomic_sub_fetch(&pool_pending, 1, __ATOMIC_ACQ_REL) == 0) {
             pthread_mutex_lock(&pool_mu); pthread_cond_signal(&pool_done); pthread_mutex_unlock(&pool_mu);
         }
@@ -1127,7 +1129,7 @@ static void pool_run(int kind) {                       /* run a job on all threa
     __atomic_add_fetch(&pool_gen, 1, __ATOMIC_RELEASE);
     pthread_cond_broadcast(&pool_start);
     pthread_mutex_unlock(&pool_mu);
-    if (kind == 0) run_band(0); else run_vertices(0, nworkers);
+    run_job(0);
     uint64_t tw = pns();
     for (int spin = 0; __atomic_load_n(&pool_pending, __ATOMIC_ACQUIRE) && spin < POOL_SPIN * 4; spin++) cpu_relax();
     pthread_mutex_lock(&pool_mu);
@@ -1259,41 +1261,100 @@ static void audit_draw(void) {
  * collected; every gs_input_count of them become the geometry shader's inputs, placed by its input map. SETEMIT and
  * EMIT then produce vertices, mapped through the output semantics like a vertex shader's; an EMIT with the primitive
  * flag set completes a triangle of the three slots (winding swaps the first two). */
-static Vtx gs_slot[3];
-static const Fb *gs_fb;
+/* Done in two parallel steps: every distinct vertex is shaded once (its outputs kept raw), then the invocations run
+ * in chunks, each chunk collecting its triangles in its own list; the lists are rasterised in order afterwards, so
+ * the result is the same as running everything in sequence. */
 static void triangle(const Fb *fb, const Vtx *a, const Vtx *b, const Vtx *c);
-static void gs_emit(PicaEmitter *em, const float o[16][4]) {
-    if (em->vertex_id > 2) return;
-    map_outputs(o, reg[0x28d] & 0xffff, &gs_slot[em->vertex_id]);
-    if (em->prim_emit) {
-        if (em->winding) triangle(gs_fb, &gs_slot[1], &gs_slot[0], &gs_slot[2]);
-        else triangle(gs_fb, &gs_slot[0], &gs_slot[1], &gs_slot[2]);
+typedef struct { Vtx *v; uint32_t n, cap; } GsOut;          /* triangles of one chunk: 3 vertices each */
+typedef struct { PicaEmitter em; Vtx slot[3]; GsOut *out; } GsEm;
+static float (*gs_raw)[16][4];                              /* raw vertex shader outputs, compacted, by vertex index */
+static uint32_t gs_vs_n, gs_omask, gs_n_in, gs_vpi, gs_ninv, gs_count, gs_first, gs_i16, gs_indexed, gs_next;
+static const uint8_t *gs_ib;
+static uint64_t gs_map;
+static GsOut *gs_outs; static uint32_t gs_nouts;
+#define GS_CHUNK 16
+static void gs_emit(PicaEmitter *em_, const float o[16][4]) {
+    GsEm *em = (GsEm *)em_;
+    if (em_->vertex_id > 2) return;
+    map_outputs(o, reg[0x28d] & 0xffff, &em->slot[em_->vertex_id]);
+    if (!em_->prim_emit) return;
+    GsOut *out = em->out;
+    if (out->n + 3 > out->cap) { out->cap = out->cap ? out->cap * 2 : 96; out->v = realloc(out->v, out->cap * sizeof *out->v); if (!out->v) fatal("out of memory"); }
+    int w = em_->winding;
+    out->v[out->n++] = em->slot[w ? 1 : 0]; out->v[out->n++] = em->slot[w ? 0 : 1]; out->v[out->n++] = em->slot[2];
+}
+static void gs_shade_raw(uint32_t base, uint32_t vi) {
+    float in[16][4] = { { 0 } }, o[16][4] = { { 0 } };
+    load_vertex(base, vi, in);
+    pica_shader_run(&vs, reg[0x2ba] & 0xffff, in, o);
+    for (uint32_t r = 0, k = 0; r < 16 && k < gs_vs_n; r++)
+        if ((gs_omask >> r) & 1) memcpy(gs_raw[vi][k++], o[r], sizeof o[r]);
+}
+static void run_gs_vertices(void) {
+    for (;;) {
+        uint32_t i = __atomic_fetch_add(&job_next, 32, __ATOMIC_RELAXED);
+        if (i >= job_nv) break;
+        uint32_t e = i + 32 < job_nv ? i + 32 : job_nv;
+        for (; i < e; i++) gs_shade_raw(job_base, job_vlist[i]);
+    }
+}
+static uint32_t gs_index(uint32_t i) {
+    return gs_indexed ? (gs_i16 ? (uint32_t)(gs_ib[2 * i] | gs_ib[2 * i + 1] << 8) : gs_ib[i]) : gs_first + i;
+}
+static void run_gs_invocations(void) {
+    GsEm em; memset(&em, 0, sizeof em); em.em.emit = gs_emit;
+    for (;;) {
+        uint32_t c = __atomic_fetch_add(&gs_next, 1, __ATOMIC_RELAXED);
+        if (c >= gs_nouts) break;
+        em.out = &gs_outs[c]; em.out->n = 0;
+        uint32_t lo = c * GS_CHUNK, hi = lo + GS_CHUNK < gs_ninv ? lo + GS_CHUNK : gs_ninv;
+        for (uint32_t inv = lo; inv < hi; inv++) {
+            float gin[16][4] = { { 0 } }, gout[16][4] = { { 0 } };
+            uint32_t a = 0;
+            for (uint32_t v = 0; v < gs_vpi; v++) {
+                uint32_t vi = gs_index(inv * gs_vpi + v);
+                for (uint32_t k = 0; k < gs_vs_n && a < gs_n_in; k++, a++) memcpy(gin[(gs_map >> (4 * a)) & 15], gs_raw[vi][k], sizeof gin[0]);
+            }
+            em.em.vertex_id = 0; em.em.prim_emit = 0; em.em.winding = 0;
+            if (pica_shader_run_gs(&gs, reg[0x28a] & 0xffff, gin, gout, &em.em) < 0) LOG(1, "pica: geometry shader did not finish");
+        }
+    }
+}
+static void run_job(int b) {
+    switch (job_kind) {
+    case 0: run_band(b); break;
+    case 1: run_vertices(b, nworkers); break;
+    case 2: run_gs_vertices(); break;
+    default: run_gs_invocations();
     }
 }
 static uint64_t n_gs_runs;
-static void gs_draw(const Fb *fb, uint32_t base, const uint8_t *ib, int i16, int indexed, uint32_t first, uint32_t count) {
+static void pool_run(int kind);
+static void gs_draw(const Fb *fb, uint32_t base, const uint8_t *ib, int i16, int indexed, uint32_t first, uint32_t count,
+                    const uint32_t *vlist, uint32_t nuniq) {
     gs.bools = reg[0x280] & 0xffff;
     for (int k = 0; k < 4; k++) gs.ints[k] = reg[0x281 + k];
-    pica_shader_prepare(&gs);
-    gs_fb = fb;
-    uint32_t vs_n = (reg[0x24a] & 15) + 1, gs_n = (reg[0x289] & 15) + 1, omask = reg[0x2bd] & 0xffff;
-    uint64_t gmap = (uint64_t)reg[0x28c] << 32 | reg[0x28b];
-    float attrs[16][4]; uint32_t na = 0;
-    PicaEmitter em = { 0, 0, 0, gs_emit };
-    for (uint32_t i = 0; i < count; i++) {
-        uint32_t vi = indexed ? (i16 ? (uint32_t)(ib[2 * i] | ib[2 * i + 1] << 8) : ib[i]) : first + i;
-        float in[16][4] = { { 0 } }, o[16][4] = { { 0 } };
-        load_vertex(base, vi, in);
-        pica_shader_run(&vs, reg[0x2ba] & 0xffff, in, o);
-        for (uint32_t r = 0, k = 0; r < 16 && k < vs_n; r++)
-            if ((omask >> r) & 1) { if (na < 16) memcpy(attrs[na++], o[r], sizeof o[r]); k++; }
-        if (na >= gs_n) {
-            float gin[16][4] = { { 0 } }, gout[16][4] = { { 0 } };
-            for (uint32_t a = 0; a < gs_n; a++) memcpy(gin[(gmap >> (4 * a)) & 15], attrs[a], sizeof attrs[a]);
-            if (pica_shader_run_gs(&gs, reg[0x28a] & 0xffff, gin, gout, &em) < 0) LOG(1, "pica: geometry shader did not finish");
-            n_gs_runs++; na = 0;
-        }
-    }
+    pica_shader_prepare_ver(&gs, gs_ver);
+    gs_vs_n = (reg[0x24a] & 15) + 1; gs_n_in = (reg[0x289] & 15) + 1; gs_omask = reg[0x2bd] & 0xffff;
+    gs_map = (uint64_t)reg[0x28c] << 32 | reg[0x28b];
+    gs_vpi = gs_n_in / gs_vs_n;
+    if (!gs_vpi || gs_n_in % gs_vs_n) { if (!n_skipped_gs++) LOG(1, "pica: geometry shader inputs (%u) are not whole vertices (%u outputs each)", gs_n_in, gs_vs_n); return; }
+    if (!gs_raw) { gs_raw = malloc(65536 * sizeof *gs_raw); if (!gs_raw) fatal("out of memory"); }
+    pool_init();
+    /* 1: every distinct vertex once */
+    job_base = base; job_vlist = vlist; job_nv = nuniq; job_next = 0;
+    if (nworkers == 1 || nuniq < 48) { job_kind = 2; run_gs_vertices(); } else pool_run(2);
+    /* 2: the invocations, in chunks */
+    gs_ib = ib; gs_i16 = (uint32_t)i16; gs_indexed = (uint32_t)indexed; gs_first = first; gs_count = count;
+    gs_ninv = count / gs_vpi; n_gs_runs += gs_ninv;
+    uint32_t nchunks = (gs_ninv + GS_CHUNK - 1) / GS_CHUNK;
+    static uint32_t outs_cap;
+    if (nchunks > outs_cap) { gs_outs = realloc(gs_outs, nchunks * sizeof *gs_outs); memset(gs_outs + outs_cap, 0, (nchunks - outs_cap) * sizeof *gs_outs); outs_cap = nchunks; }
+    gs_nouts = nchunks; gs_next = 0;
+    if (nworkers == 1 || nchunks < 4) { job_kind = 3; run_gs_invocations(); } else pool_run(3);
+    /* 3: rasterise in order */
+    for (uint32_t c = 0; c < nchunks; c++)
+        for (uint32_t t = 0; t + 2 < gs_outs[c].n; t += 3) triangle(fb, &gs_outs[c].v[t], &gs_outs[c].v[t + 1], &gs_outs[c].v[t + 2]);
 }
 
 static void draw(int indexed) {
@@ -1356,9 +1417,9 @@ static void draw(int indexed) {
         if (vstamp[vi] != vgen) { vstamp[vi] = vgen; vlist[nuniq++] = vi; }
     }
     uint64_t tA = pns(); t_setup += tA - t_draw0;
-    pica_shader_prepare(&vs);
+    pica_shader_prepare_ver(&vs, vs_ver);
     if (use_gs) {                                                     /* geometry shader, point mode */
-        gs_draw(&fb, base, ib, i16, indexed, first, count);
+        gs_draw(&fb, base, ib, i16, indexed, first, count, vlist, nuniq);
         uint64_t tC = pns(); t_shade += tC - tA;
         if (vkr_on) { vk_submit(&fb, caddr, daddr); ntris = 0; }
         else flush_tris(&fb);
@@ -1440,7 +1501,7 @@ int pica_load_state(const char *path) {
     if (!f || fread(&st, sizeof st, 1, f) != 1 || st.magic != 0x50494341) { if (f) fclose(f); return -1; }
     fclose(f);
     if (st.version != 2) return -1;
-    memcpy(reg, st.reg, sizeof reg); vs = st.vs; memcpy(dflt, st.dflt, sizeof dflt); memcpy(lut, st.lut, sizeof lut);
+    memcpy(reg, st.reg, sizeof reg); vs = st.vs; vs_ver++; gs_ver++; memcpy(dflt, st.dflt, sizeof dflt); memcpy(lut, st.lut, sizeof lut);
     memcpy(uni_queue, st.uni_queue, sizeof uni_queue); uni_n = st.uni_n; memcpy(dflt_queue, st.dflt_queue, sizeof dflt_queue); dflt_n = st.dflt_n;
     return 0;
 }

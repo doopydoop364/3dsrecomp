@@ -377,6 +377,12 @@ static void vk_show(int overlay_on, int overlay_dirty) {
 static int menu_open;
 static const char *lnames_all[L_COUNT] = { "stacked", "large_top", "top_only", "side_by_side" };
 static const char *filters[3] = { "console", "nearest", "linear" }, *renderers[2] = { "vulkan", "software" };
+static const char *vsyncs[3] = { "mailbox", "on", "off" };
+static int m_vsync;
+/* frame cap: the game draws at most this many frames per second, i.e. runs at cap/60 of its normal speed */
+static const int caps[7] = { 30, 60, 90, 120, 144, 240, 0 };
+static int m_cap = 1;
+static void apply_cap(void) { k_set_speed(caps[m_cap] / 60.0); }
 static const int anisos[5] = { 1, 2, 4, 8, 16 };
 static int m_volume = 100, m_scale = 1, m_filter, m_aniso, m_renderer, m_saved_msg;
 static int bind_dirty[NBINDS], ffkey_dirty;
@@ -386,13 +392,17 @@ static void menu_init(void) {
     m_scale = settings_int("video.scale", 1); if (m_scale < 1 || m_scale > 4) m_scale = 1;
     m_filter = idx_of(settings_get("video.texture_filter", "console"), filters, 3);
     m_renderer = idx_of(settings_get("video.renderer", "vulkan"), renderers, 2);
+    m_vsync = idx_of(settings_get("video.vsync", "mailbox"), vsyncs, 3);
+    { const char *c = settings_get("video.frame_cap", "60"); int n = !strcmp(c, "unlimited") ? 0 : atoi(c); m_cap = 1;
+      for (int i = 0; i < 7; i++) if (caps[i] == n) m_cap = i;
+      apply_cap(); }
     int a = settings_int("video.anisotropy", 1); m_aniso = 0; for (int i = 0; i < 5; i++) if (anisos[i] <= a) m_aniso = i;
 }
 static void text(float x, float y, float sc, const char *t, uint8_t r, uint8_t g, uint8_t b) {
     SDL_SetRenderScale(ren, sc, sc); SDL_SetRenderDrawColor(ren, r, g, b, 255);
     SDL_RenderDebugText(ren, x / sc, y / sc, t); SDL_SetRenderScale(ren, 1, 1);
 }
-enum { MI_RESUME, MI_LAYOUT, MI_SWAP, MI_FULL, MI_VOLUME, MI_FPS, MI_FFMODE, MI_PAD, MI_AA, MI_SCALE, MI_FILTER, MI_ANISO, MI_RENDERER,
+enum { MI_RESUME, MI_LAYOUT, MI_SWAP, MI_FULL, MI_VOLUME, MI_FPS, MI_FFMODE, MI_PAD, MI_AA, MI_SCALE, MI_FILTER, MI_ANISO, MI_RENDERER, MI_VSYNC, MI_CAP,
        MI_CONTROLS, MI_SAVE, MI_QUIT, MI_N };
 static void item_text(int i, char *o, size_t n) {
     int full = (SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN) != 0;
@@ -410,6 +420,9 @@ static void item_text(int i, char *o, size_t n) {
     case MI_FILTER: snprintf(o, n, "Textures        < %s >  (restart)", filters[m_filter]); break;
     case MI_ANISO: snprintf(o, n, "Anisotropy      < %dx >  (restart)", anisos[m_aniso]); break;
     case MI_RENDERER: snprintf(o, n, "Renderer        < %s >  (restart)", renderers[m_renderer]); break;
+    case MI_VSYNC: snprintf(o, n, "Vsync           < %s >  (restart)", vsyncs[m_vsync]); break;
+    case MI_CAP: if (caps[m_cap]) snprintf(o, n, "Frame cap       < %d fps >  (%s)", caps[m_cap], caps[m_cap] == 60 ? "normal speed" : caps[m_cap] < 60 ? "slower" : "faster game");
+                 else snprintf(o, n, "Frame cap       < unlimited >  (as fast as possible)"); break;
     case MI_CONTROLS: snprintf(o, n, "Controls..."); break;
     case MI_SAVE: snprintf(o, n, m_saved_msg ? "Save settings   (saved to settings.toml)" : "Save settings"); break;
     default: snprintf(o, n, "Quit game");
@@ -429,6 +442,8 @@ static void item_change(int i, int d) {
     case MI_FILTER: m_filter = (m_filter + d + 3) % 3; break;
     case MI_ANISO: m_aniso = (m_aniso + d + 5) % 5; break;
     case MI_RENDERER: m_renderer = !m_renderer; break;
+    case MI_VSYNC: m_vsync = (m_vsync + d + 3) % 3; break;
+    case MI_CAP: m_cap = (m_cap + d + 7) % 7; apply_cap(); break;
     default: return;
     }
     m_saved_msg = 0;
@@ -446,6 +461,8 @@ static void menu_save(void) {
     settings_save("video.texture_filter", filters[m_filter]);
     snprintf(v, sizeof v, "%d", anisos[m_aniso]); settings_save("video.anisotropy", v);
     settings_save("video.renderer", renderers[m_renderer]);
+    settings_save("video.vsync", vsyncs[m_vsync]);
+    if (caps[m_cap]) { snprintf(v, sizeof v, "%d", caps[m_cap]); settings_save("video.frame_cap", v); } else settings_save("video.frame_cap", "unlimited");
     for (unsigned i = 0; i < NBINDS; i++) if (bind_dirty[i]) {
         char k[64]; snprintf(k, sizeof k, "controls.%s", binds_def[i].name);
         settings_save(k, SDL_GetScancodeName(binds[i][0]));

@@ -139,7 +139,10 @@ static Region *region_find(uint32_t addr) {
  * Wall-clock pacing keeps it from running faster than real time (RB_FAST=1 turns pacing off). */
 static uint64_t vclock = 1000000000ull, pace_wall0, pace_v0;
 static int pacing = -1, fast_forward;
+static double speed = 1.0;                       /* frame cap / 60: game time per wall time; 0 = unlimited */
 void k_set_fast_forward(int on) { fast_forward = on; }
+static uint64_t wall_ns(void);
+void k_set_speed(double s) { speed = s; pace_wall0 = wall_ns(); pace_v0 = vclock; }
 uint64_t k_paced_ns;                                  /* total time slept for pacing (FPS overlay) */   /* host hotkey: run as fast as the host can */
 static uint64_t wall_ns(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -150,11 +153,12 @@ static void advance_to(uint64_t t) {
     if (t <= vclock) return;
     vclock = t;
     if (pacing < 0) { pacing = getenv("RB_FAST") == 0; pace_wall0 = wall_ns(); pace_v0 = vclock; }
-    if (!pacing || fast_forward) return;
-    uint64_t target = pace_wall0 + (vclock - pace_v0), w = wall_ns();
-    if (target > w + 50000000ull) { pace_wall0 = w - (vclock - pace_v0); return; }   /* paused or debugging: resync */
+    if (!pacing || fast_forward || speed <= 0) return;
+    uint64_t gone = (uint64_t)((double)(vclock - pace_v0) / speed);              /* wall time this much game time takes */
+    uint64_t target = pace_wall0 + gone, w = wall_ns();
+    if (target > w + 50000000ull) { pace_wall0 = w - gone; return; }             /* paused or debugging: resync */
     if (target > w) { struct timespec ts = { (time_t)((target - w) / 1000000000ull), (long)((target - w) % 1000000000ull) }; nanosleep(&ts, 0); k_paced_ns += wall_ns() - w; }
-    else if (w > target + 34000000ull) pace_wall0 = w - (vclock - pace_v0);          /* behind by more than 2 frames: resync instead of
+    else if (w > target + 34000000ull) pace_wall0 = w - gone;                     /* behind by more than 2 frames: resync instead of
                                                                                         running fast to catch up (audio would be cut) */
 }
 KObject *k_new(KType t) { KObject *o = calloc(1, sizeof *o); o->type = t; return o; }
@@ -260,8 +264,16 @@ void recomp_preempt(CPU *c) {
     if (!cur) return;
     /* Only a thread that has run 64 budgets in a row (about 64 ms of 3DS CPU) without a single system call counts as
      * busy-waiting; ordinary frames make system calls all the time and are left exactly as they were. */
+    /* a loop that was already caught busy-waiting is recognised at once the next time (by its place in the code) */
+    static void *spin_sites[32]; static int nspin;
+    void *site = __builtin_return_address(0);
+    int known = 0;
+    static int nosites = -1; if (nosites < 0) nosites = getenv("RB_NO_SPINSITES") != 0;
+    if (!nosites) for (int i = 0; i < nspin; i++) if (spin_sites[i] == site) { known = 1; break; }
+    /* a budget with a system call in it is ordinary work, wherever it ran */
     if (svc_count != svc_at_preempt || cur != quiet_thread) { svc_at_preempt = svc_count; quiet_thread = cur; quiet_budgets = 0; return; }
-    if (++quiet_budgets < 64) return;
+    if (!known && ++quiet_budgets < 64) return;
+    if (!known && nspin < 32) spin_sites[nspin++] = site;
     n_preempts++;
     vclock += 1000000;                                     /* charge the budget's CPU time (about 1 ms) */
     pace_v0 += 1000000;                                    /* ... without making the wall-clock pacing wait for it:

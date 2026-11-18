@@ -56,7 +56,7 @@ typedef struct {
     uint32_t w;
 } DInst;
 /* Decoded programs, one slot per shader unit (vertex, geometry), so alternating units does not decode again. */
-typedef struct { const PicaShader *owner; DInst prog[512]; uint32_t code[512], desc[128]; int ok; } ProgCache;
+typedef struct { const PicaShader *owner; DInst prog[512]; uint32_t code[512], desc[128]; int ok; uint64_t ver; } ProgCache;
 static ProgCache caches[2];
 static ProgCache *cache_for(const PicaShader *sh) {
     if (caches[0].owner == sh) return &caches[0];
@@ -69,8 +69,16 @@ static void set_src(DInst *d, int k, uint32_t raw, uint32_t rel, uint32_t swz, u
     d->src[k] = (uint8_t)raw; d->rel[k] = (uint8_t)rel; d->neg[k] = (uint8_t)neg;
     for (int i = 0; i < 4; i++) d->swz[k][i] = (uint8_t)((swz >> (6 - 2 * i)) & 3);
 }
+void pica_shader_prepare_ver(const PicaShader *sh, uint64_t ver) {
+    ProgCache *pc_ = cache_for(sh);
+    static int off = -1; if (off < 0) off = getenv("RB_NO_SHVER") != 0;
+    if (!off && pc_->ok && ver && pc_->ver == ver) return;
+    pica_shader_prepare(sh);
+    pc_->ver = ver;
+}
 void pica_shader_prepare(const PicaShader *sh) {
     ProgCache *pc_ = cache_for(sh);
+    pc_->ver = 0;
     if (pc_->ok && !memcmp(pc_->code, sh->code, sizeof pc_->code) && !memcmp(pc_->desc, sh->desc, sizeof pc_->desc)) return;
     memcpy(pc_->code, sh->code, sizeof pc_->code); memcpy(pc_->desc, sh->desc, sizeof pc_->desc);
     DInst *prog = pc_->prog;

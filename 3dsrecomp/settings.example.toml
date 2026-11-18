@@ -44,6 +44,11 @@ layout = "stacked"
 fullscreen = false
 # vulkan (GPU, falls back to software if Vulkan 1.3 is missing) or software
 renderer = "vulkan"
+# "mailbox" (no tearing, lowest latency), "on" (classic vsync: steadiest with FreeSync / G-SYNC), "off"
+vsync = "mailbox"
+# frame cap: 60 is normal speed. 3DS games tie their speed to their frame rate, so a higher cap (90, 120, 144, 240,
+# "unlimited") makes the game run faster, not smoother; 30 runs it at half speed
+frame_cap = 60
 # window drawing: vulkan (fast, needed for anti-aliasing; falls back to sdl automatically) or sdl
 present = "vulkan"
 # anti-aliasing for the 3D screen (Vulkan window): off or fxaa

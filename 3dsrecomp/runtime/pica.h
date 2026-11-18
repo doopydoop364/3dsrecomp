@@ -18,6 +18,8 @@ typedef struct PicaEmitter {
 } PicaEmitter;
 
 void pica_shader_prepare(const PicaShader *sh);   /* decode the program when it changed (before running it) */
+/* The same, trusting a version number the caller bumps on every program or swizzle write (no comparison). */
+void pica_shader_prepare_ver(const PicaShader *sh, uint64_t ver);
 int pica_shader_run(const PicaShader *sh, uint32_t entry, const float in[16][4], float out[16][4]);
 int pica_shader_run_gs(const PicaShader *sh, uint32_t entry, const float in[16][4], float out[16][4], PicaEmitter *em);
 

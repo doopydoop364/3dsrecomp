@@ -250,7 +250,7 @@ static uint64_t hash_mem(const uint8_t *p, size_t n) {
  * image: write-backs average each scale x scale block (colour) or take its centre sample (depth, stencil). */
 static uint32_t scale = 1;
 struct Surf { int used, depth; uint32_t addr, size, w, h, fmt; Img im; int dirty; uint64_t hash, checked, last;
-              int display; uint8_t *hires; uint64_t hires_gen; Img small; };   /* small: native-size copy target (scale > 1) */   /* display: last download kept at full resolution */
+              int display; uint8_t *hires; uint64_t hires_gen; Img small; uint64_t ver; };   /* ver: draws into it so far */   /* small: native-size copy target (scale > 1) */   /* display: last download kept at full resolution */
 #define NSURF 64
 static Surf surf[NSURF];
 static int overlaps(uint32_t a, uint32_t an, uint32_t b, uint32_t bn) { return a < b + bn && b < a + an; }
@@ -464,7 +464,8 @@ int vkr_fill(uint32_t start, uint32_t end, uint32_t value, uint32_t ctl) {
 }
 
 /* ---- textures ---- */
-typedef struct { int used; uint32_t addr, size, w, h, fmt, levels, faces, face_addr[6]; Img im; uint64_t hash, checked, last; } Tex;
+typedef struct { int used; uint32_t addr, size, w, h, fmt, levels, faces, face_addr[6]; Img im; uint64_t hash, checked, last;
+                 Surf *src; uint64_t src_ver; } Tex;   /* src: copied on the GPU from this render target (at draw count src_ver) */
 #define NTEX 768
 static Tex texs[NTEX];
 static Img dummy;
@@ -472,7 +473,47 @@ static void invalidate_textures(uint32_t addr, uint32_t size) {
     for (int i = 0; i < NTEX; i++)
         if (texs[i].used && overlaps(addr, size, texs[i].addr, texs[i].size)) { if (texs[i].checked == gen) nstale++; texs[i].checked = 0; }
 }
+/* Render to texture: a texture that is exactly a render target the GPU holds newer contents of (same address, size
+ * and colour format) is copied from it on the GPU, without writing the target back to memory and decoding it again.
+ * A target's rows run top-down, a texture's bottom-up: the copy flips (and averages down when rendering scaled). */
+static uint64_t ntexfromsurf;
+static Tex *texture_from_surface(const VkrTex *t) {
+    static int off = -1; if (off < 0) off = getenv("RB_NO_RTT") != 0;   /* RB_NO_RTT=1: the old way, through memory */
+    if (off || t->faces != 1 || t->levels != 1) return 0;
+    Surf *s = 0;
+    for (int i = 0; i < NSURF; i++) {
+        Surf *x = &surf[i];
+        if (x->used && !x->depth && x->dirty && x->addr == t->addr && x->w == t->w && x->h == t->h && x->fmt == t->fmt) { s = x; break; }
+    }
+    if (!s) return 0;
+    Tex *e = 0, *lru = &texs[0];
+    for (int i = 0; i < NTEX; i++) {
+        Tex *x = &texs[i];
+        if (x->used && x->addr == t->addr && x->w == t->w && x->h == t->h && x->fmt == t->fmt && x->levels == 1 && x->faces == 1) { e = x; break; }
+        if (!x->used) { if (lru->used) lru = x; }
+        else if (lru->used && x->last < lru->last) lru = x;
+    }
+    if (e && e->src == s && e->src_ver == s->ver) { e->last = gen; return e; }
+    if (!e) {
+        e = lru;
+        if (e->used) bury(&e->im);
+        memset(e, 0, sizeof *e);
+        e->used = 1; e->addr = t->addr; e->w = t->w; e->h = t->h; e->fmt = t->fmt; e->size = t->size; e->levels = 1; e->faces = 1;
+        for (int f = 0; f < 6; f++) e->face_addr[f] = t->face_addr[f];
+        mkimg_full(&e->im, t->w, t->h, 1, 1, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+    }
+    begin_cmd(); end_render();
+    int32_t W = (int32_t)(s->w * scale), H = (int32_t)(s->h * scale);
+    VkImageBlit b = { .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .srcOffsets = { { 0, H, 0 }, { W, 0, 1 } },
+                      .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .dstOffsets = { { 0, 0, 0 }, { (int32_t)t->w, (int32_t)t->h, 1 } } };
+    vkCmdBlitImage(cmd, s->im.img, VK_IMAGE_LAYOUT_GENERAL, e->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &b, scale > 1 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+    barrier();
+    e->src = s; e->src_ver = s->ver; e->hash = 0; e->checked = 0; e->last = gen;
+    ntexfromsurf++;
+    return e;
+}
 static Tex *get_texture(const VkrTex *t, int unit, void (*decode)(int, int, int, uint8_t *)) {
+    { Tex *r = texture_from_surface(t); if (r) return r; }
     for (uint32_t f = 0; f < t->faces; f++) { vkr_why = 7; vkr_sync_range(t->face_addr[f], t->size, 0); }   /* render-to-texture: the bytes must be current */
     Tex *e = 0, *lru = &texs[0];
     for (int i = 0; i < NTEX; i++) {
@@ -502,7 +543,7 @@ static Tex *get_texture(const VkrTex *t, int unit, void (*decode)(int, int, int,
         vkCmdCopyBufferToImage(cmd, ring.buf, e->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
     }
     barrier();
-    e->hash = h; e->checked = gen; e->last = gen;
+    e->hash = h; e->checked = gen; e->last = gen; e->src = 0;
     ntexuploads++;
     return e;
 }
@@ -629,7 +670,7 @@ void vkr_draw(const VkrDraw *d, const void *tris, int ntris, void (*decode)(int,
     Surf *sc = d->caddr ? get_surface(d->caddr, d->width, d->height, d->cfmt, 0) : 0;
     Surf *sd = daddr ? get_surface(daddr, d->width, d->height, d->dfmt, 1) : 0;
     validate(sc); validate(sd);
-    if (sc) sc->last = gen;
+    if (sc) { sc->last = gen; sc->ver++; }
     if (sd) sd->last = gen;
 
     /* staging space for this draw: vertices, uniforms and (if changed) the lighting LUT, all in one go */
@@ -726,9 +767,9 @@ void vkr_frame(void) {
     static uint64_t frames;
     if (++frames % 300 == 0) {
         LOG(1, "vulkan: GPU wait %.2f s, write-back %.2f s, textures %.2f s, pipeline builds %.2f s, stale texture catches %llu", t_wait / 1e9, t_fin / 1e9, t_tex / 1e9, t_pipe / 1e9, (unsigned long long)nstale);
-        LOG(1, "vulkan: %llu submissions, %llu sync points, %llu surface downloads, %llu surface uploads, %llu texture uploads, %d pipelines, %llu frames not presented",
+        LOG(1, "vulkan: %llu submissions, %llu sync points, %llu surface downloads, %llu surface uploads, %llu texture uploads, %llu render-to-texture copies, %d pipelines, %llu frames not presented",
             (unsigned long long)nsubmits, (unsigned long long)nsyncs, (unsigned long long)ndownloads, (unsigned long long)nuploads,
-            (unsigned long long)ntexuploads, npipes, (unsigned long long)nskipped);
+            (unsigned long long)ntexuploads, (unsigned long long)ntexfromsurf, npipes, (unsigned long long)nskipped);
     }
 }
 
@@ -844,9 +885,14 @@ static int create_swapchain(uint32_t w, uint32_t h) {
     for (uint32_t i = 0; i < nf; i++) if (fm[i].format == VK_FORMAT_B8G8R8A8_UNORM || fm[i].format == VK_FORMAT_R8G8B8A8_UNORM) { f = fm[i]; break; }
     uint32_t npm = 0; vkGetPhysicalDeviceSurfacePresentModesKHR(pdev, vsurf, &npm, 0);
     VkPresentModeKHR pm[16]; if (npm > 16) npm = 16; vkGetPhysicalDeviceSurfacePresentModesKHR(pdev, vsurf, &npm, pm);
+    /* video.vsync: "mailbox" (default: never tears, never waits; immediate where mailbox is missing), "on" (classic
+     * vsync, FIFO: every frame shown for whole refreshes, the steadiest with FreeSync / G-SYNC), "off" (immediate) */
+    const char *vs = getenv("RB_VSYNC"); if (!vs) vs = "mailbox";
     VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
-    for (uint32_t i = 0; i < npm; i++) if (pm[i] == VK_PRESENT_MODE_IMMEDIATE_KHR) mode = pm[i];
-    for (uint32_t i = 0; i < npm; i++) if (pm[i] == VK_PRESENT_MODE_MAILBOX_KHR) mode = pm[i];
+    if (strcmp(vs, "on")) {
+        for (uint32_t i = 0; i < npm; i++) if (pm[i] == VK_PRESENT_MODE_IMMEDIATE_KHR) mode = pm[i];
+        if (strcmp(vs, "off")) for (uint32_t i = 0; i < npm; i++) if (pm[i] == VK_PRESENT_MODE_MAILBOX_KHR) mode = pm[i];
+    }
     uint32_t count = caps.minImageCount + 1;
     if (caps.maxImageCount && count > caps.maxImageCount) count = caps.maxImageCount;
     if (count > 8) count = 8;
