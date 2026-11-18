@@ -19,6 +19,20 @@ import idioms, layout as layout_mod
 
 # Set by configure(); never typed per game.
 BASE = TEXT_END = RO_END = None     # text start, end of code actually present, end of read-only memory
+CODE_LO = None                      # first code address (BASE, or a module's code segment start)
+MODULE = False                      # compiling a CRO module: addresses are offsets from its load base (see A)
+FNP = ''                            # function name prefix (modules: m<id>_)
+DYN = frozenset()                   # main-program words written at run time (static.crs imports): never folded
+
+
+def A(x):
+    """C expression for address x. Module code is position-independent: A(x) is the offset plus the module's base."""
+    return f'A(0x{x & 0xFFFFFFFF:08x}u)' if MODULE else f'0x{x & 0xFFFFFFFF:08x}u'
+
+
+def foldable(ea, n=4):
+    """May the word(s) at ea be read at compile time? Read-only memory of the main program, not written by ldr:ro."""
+    return not MODULE and BASE <= ea < RO_END - (n - 1) and not any((ea + k) in DYN for k in range(0, n, 4))
 
 # Functions that do not return to the instruction after the call (found by idioms.detect_inline_data_calls):
 # target address -> resume offsets relative to the `bl`.
@@ -33,8 +47,12 @@ IMG = b''
 
 def configure(img, lay, nonlocal_returns):
     """Install the image, layout and detected idioms. Called in every worker process."""
-    global IMG, BASE, TEXT_END, RO_END, NONLOCAL_RETURN
+    global IMG, BASE, TEXT_END, RO_END, NONLOCAL_RETURN, CODE_LO, MODULE, FNP, DYN
     IMG, BASE, TEXT_END, RO_END = img, lay.text_base, lay.text_end, lay.ro_end
+    CODE_LO = getattr(lay, 'code_lo', lay.text_base)
+    MODULE = getattr(lay, 'module', False)
+    FNP = getattr(lay, 'fn_prefix', '')
+    DYN = frozenset(getattr(lay, 'dynamic_words', ()))
     NONLOCAL_RETURN = nonlocal_returns
 
 
@@ -43,7 +61,7 @@ def rd32(a):
 
 
 def in_text(a):
-    return BASE <= a < TEXT_END and not (a & 3)
+    return CODE_LO <= a < TEXT_END and not (a & 3)
 
 
 def rd16(a):
@@ -52,7 +70,7 @@ def rd16(a):
 
 def in_text_t(a):
     """Thumb instruction address (halfword aligned) inside .text."""
-    return BASE <= a < TEXT_END - 1 and not (a & 1)
+    return CODE_LO <= a < TEXT_END - 1 and not (a & 1)
 
 
 def is_key(k):
@@ -67,7 +85,7 @@ def ror32(v, n):
 
 def rr(n, addr):
     """C expression reading guest register n at instruction addr."""
-    return f'0x{(addr + 8) & 0xFFFFFFFF:08x}u' if n == 15 else f'c->r[{n}]'
+    return A(addr + 8) if n == 15 else f'c->r[{n}]'
 
 
 class Unsup(Exception):
@@ -248,7 +266,7 @@ def dp(ins):
             ins.targets = list(dict.fromkeys(targets))
             ins.falls = False
             cases = ' '.join(f'case 0x{t:08x}u: {G(t)}' for t in ins.targets)
-            return (f'uint32_t t = c->r[{(w >> 16) & 0xF}] + c->r[{w & 0xF}]; switch (t) {{ {cases} }} '
+            return (f'uint32_t t = c->r[{(w >> 16) & 0xF}] + c->r[{w & 0xF}]; switch (t{" - MB" if MODULE else ""}) {{ {cases} }} '
                     f'IJUMP(t);')
     if (w & 0x0FFFFFF0) == 0x008FF100:                    # add pc, pc, rm, lsl #2
         n = jt_bound(ins, w & 0xF) or jt_run_of_branches(addr)
@@ -354,7 +372,7 @@ def ldr_str(ins):
     # literal pool load from read-only memory: fold to a constant
     if rn == 15 and not (w & (1 << 25)) and Ld and not B and rd != 15:
         ea = (addr + 8 + (w & 0xFFF if U else -(w & 0xFFF))) & 0xFFFFFFFF
-        if BASE <= ea < RO_END - 3:
+        if foldable(ea):
             v = rd32(ea)
             if is_key(v):
                 ins.ptr = v
@@ -375,7 +393,7 @@ def ldr_str(ins):
         else:
             L.append(f'c->r[{rd}] = ld32(ea);')
     else:
-        val = f'0x{(addr + 12) & 0xFFFFFFFF:08x}u' if rd == 15 else f'c->r[{rd}]'
+        val = A(addr + 12) if rd == 15 else f'c->r[{rd}]'
         L.append(f'uint32_t val = {val};')
         L.append(wb)
         L.append(f'st8(ea, val);' if B else 'st32(ea, val);')
@@ -439,7 +457,7 @@ def ldm_stm(ins):
             L.append(jump)
     else:
         for k, r in enumerate(regs):
-            v = f'0x{(addr + 12) & 0xFFFFFFFF:08x}u' if r == 15 else ('bs' if r == rn else f'c->r[{r}]')
+            v = A(addr + 12) if r == 15 else ('bs' if r == rn else f'c->r[{r}]')
             L.append(f'st32(a + {4 * k}, {v});')
         if W:
             L.append(f'c->r[{rn}] = {wbv};')
@@ -460,8 +478,8 @@ def branch(ins):
             ins.resume = [addr + o for o in NONLOCAL_RETURN[t] if in_text(addr + o)]
             ins.targets = list(ins.resume)
             ins.falls = False
-            return f'c->r[14] = 0x{addr + 4:08x}u; @C:{t:08x}@ goto L_resume;'
-        return f'c->r[14] = 0x{addr + 4:08x}u; @C:{t:08x}@ RET_CHECK(0x{addr + 4:08x}u);'
+            return f'c->r[14] = {A(addr + 4)}; @C:{t:08x}@ goto L_resume;'
+        return f'c->r[14] = {A(addr + 4)}; @C:{t:08x}@ RET_CHECK({A(addr + 4)});'
     ins.targets = [t]
     ins.falls = False
     return G(t)
@@ -478,7 +496,7 @@ def misc0(ins):
     if (w & 0x0FFFFFF0) == 0x012FFF10:                    # BX
         return ijump(ins, rr(w & 0xF, addr), (w & 0xF) == 14)
     if (w & 0x0FFFFFF0) == 0x012FFF30:                    # BLX reg
-        return f'uint32_t t = {rr(w & 0xF, addr)}; c->r[14] = 0x{addr + 4:08x}u; call_indirect(c, t); RET_CHECK(0x{addr + 4:08x}u);'
+        return f'uint32_t t = {rr(w & 0xF, addr)}; c->r[14] = {A(addr + 4)}; call_indirect(c, t); RET_CHECK({A(addr + 4)});'
     if (w & 0x0FFF0FF0) == 0x016F0F10:                    # CLZ
         return f'c->r[{f(12)}] = clz32(c->r[{f(0)}]);'
     if (w & 0x0FC000F0) == 0x00000090:                    # MUL / MLA
@@ -732,9 +750,9 @@ def vfp_ls(ins):
         words = 2 if dbl else 1
         if rn == 15:
             ea_c = (addr + 8 + (off8 * 4 if U else -off8 * 4)) & 0xFFFFFFFF
-            if Ld and BASE <= ea_c < RO_END - 7:
+            if Ld and foldable(ea_c, 8 if dbl else 4):
                 return ' '.join(f'c->s[{first + k}] = 0x{rd32(ea_c + 4 * k):08x}u;' for k in range(words))
-            ea = f'0x{ea_c:08x}u'
+            ea = A(ea_c)
         else:
             ea = f'c->r[{rn}] {"+" if U else "-"} {off8 * 4}'
         L = [f'uint32_t ea = {ea};']
@@ -760,7 +778,7 @@ TSHIFT = ('lsl', 'lsr', 'asr', 'ror')
 
 def tr(n, addr):
     """C expression reading register n from a Thumb instruction at addr (pc reads as addr + 4)."""
-    return f'0x{(addr + 4) & 0xFFFFFFFF:08x}u' if n == 15 else f'c->r[{n}]'
+    return A(addr + 4) if n == 15 else f'c->r[{n}]'
 
 
 def t_nz(v='res'):
@@ -775,7 +793,7 @@ def t_ijump(ins, expr, is_return=False):
 
 def t_literal(ins, ea):
     """Value of a literal-pool word at ea when it is read-only, else None; notes code pointers."""
-    if BASE <= ea < RO_END - 3 and not ea & 3:
+    if foldable(ea) and not ea & 3:
         v = rd32(ea)
         if is_key(v):
             ins.ptr = v
@@ -846,8 +864,8 @@ def thumb_body(ins):
             if h & 0x80:                                  # BLX rm
                 ins.falls = True
                 ret = (addr + 2) | 1
-                return (f'uint32_t t = {tr(rm, addr)}; c->r[14] = 0x{ret:08x}u; call_indirect(c, t); '
-                        f'RET_CHECK(0x{ret:08x}u);')
+                return (f'uint32_t t = {tr(rm, addr)}; c->r[14] = {A(ret)}; call_indirect(c, t); '
+                        f'RET_CHECK({A(ret)});')
             if rm == 15:                                  # BX pc: continue in ARM code at the next word
                 t = (addr + 4) & ~3
                 if not in_text(t):
@@ -887,7 +905,7 @@ def thumb_body(ins):
                 if (n & 0xFF07) == 0x4700 and ((n >> 3) & 15) == rd:
                     ins.calls = [v]
                     break
-        return f'c->r[{rd}] = 0x{v:08x}u;' if v is not None else f'c->r[{rd}] = ld32(0x{ea:08x}u);'
+        return f'c->r[{rd}] = 0x{v:08x}u;' if v is not None else f'c->r[{rd}] = ld32({A(ea)});'
     if (h >> 12) == 5:                                    # load / store, register offset
         op, rm, rn, rd = (h >> 9) & 7, (h >> 6) & 7, (h >> 3) & 7, h & 7
         ea = f'uint32_t ea = c->r[{rn}] + c->r[{rm}];'
@@ -915,7 +933,7 @@ def thumb_body(ins):
         v = (((addr + 4) & ~3) + off) & 0xFFFFFFFF
         if is_key(v):
             ins.ptr = v
-        return f'c->r[{rd}] = 0x{v:08x}u;'
+        return f'c->r[{rd}] = {A(v)};'
     if (h >> 12) == 11:                                   # miscellaneous
         if (h & 0xFF00) == 0xB000:                        # ADD / SUB sp, #imm7*4
             off = (h & 0x7F) * 4
@@ -1015,7 +1033,7 @@ def thumb_body(ins):
             raise Unsup('branch_out_of_text')
         ret = (addr + 4) | 1
         ins.calls = [key]
-        return f'c->r[14] = 0x{ret:08x}u; @C:{key:08x}@ RET_CHECK(0x{ret:08x}u);'
+        return f'c->r[14] = {A(ret)}; @C:{key:08x}@ RET_CHECK({A(ret)});'
     raise Unsup('thumb_undefined')
 
 
@@ -1033,7 +1051,7 @@ def decode_body(ins):
             if not in_text_t(t):
                 raise Unsup('branch_out_of_text')
             ins.calls = [t | 1]
-            return f'c->r[14] = 0x{addr + 4:08x}u; @C:{t | 1:08x}@ RET_CHECK(0x{addr + 4:08x}u);'
+            return f'c->r[14] = {A(addr + 4)}; @C:{t | 1:08x}@ RET_CHECK({A(addr + 4)});'
         raise Unsup('uncond')
     op = (w >> 25) & 7
     if op == 0:
@@ -1155,21 +1173,21 @@ def emit_function(entry, body, funcs):
     def resolve(m):
         kind, t = m.group(1), int(m.group(2), 16)
         if kind == 'C':
-            return f'fn_{t:08x}(c);'
+            return f'fn_{FNP}{t:08x}(c);'
         if kind == 'T':                                    # tail call into the other instruction set
-            return f'{{ fn_{t:08x}(c); {leave} }}' if t in funcs else f'TRAP(0x{t:08x}u, "branch to unknown code");'
+            return f'{{ fn_{FNP}{t:08x}(c); {leave} }}' if t in funcs else f'TRAP(0x{t:08x}u, "branch to unknown code");'
         if local(t):
             if (t & ~1) <= here[0]:                        # loop back-edge: count it (other cores, busy waits)
                 return f'{{ BACKEDGE(); goto L_{t & ~1:08x}; }}'
             return f'goto L_{t & ~1:08x};'
         if t in funcs:
-            return f'{{ fn_{t:08x}(c); {leave} }}'
+            return f'{{ fn_{FNP}{t:08x}(c); {leave} }}'
         return f'TRAP(0x{t:08x}u, "branch to unknown code");'
 
     order = sorted(body)
     start = entry & ~1
     here = [0]                                             # address being emitted, for back-edge checks
-    out = [f'void fn_{entry:08x}(CPU *c) {{', '  uint32_t ret_lr = c->r[14]; (void)ret_lr;']
+    out = [f'void fn_{FNP}{entry:08x}(CPU *c) {{', '  uint32_t ret_lr = c->r[14]; (void)ret_lr;']
     if order[0] != start:
         labels.add(start)
         out.append(f'  goto L_{start:08x};')
@@ -1185,25 +1203,35 @@ def emit_function(entry, body, funcs):
         nxt = a + ins.size
         if ins.falls and nxt not in body:
             if (nxt | tb) in funcs:
-                out.append(f'  fn_{nxt | tb:08x}(c); {leave}')
+                out.append(f'  fn_{FNP}{nxt | tb:08x}(c); {leave}')
             else:
                 out.append(f'  TRAP(0x{nxt:08x}u, "fell off the end of a function");')
     if resume:
         # a callee came back with r15 set: continue at that local address, or keep returning
         cases = ' '.join(f'case 0x{t:08x}u: {PLACEHOLDER.sub(resolve, G(t))}' for t in resume)
-        out.append(f'  return;\nL_resume:;\n  switch (c->r[15]) {{ {cases} default: return; }}')
+        out.append(f'  return;\nL_resume:;\n  switch (c->r[15]{" - MB" if MODULE else ""}) {{ {cases} default: return; }}')
     out.append('}')
     return '\n'.join(out)
 
 
 # ---------------------------------------------------------------- driver
 _FUNCS = None
+FILE_HEADER = ['#include "recomp.h"', '#include "funcs.h"', '']   # first lines of every generated file
 
 
-def _init(img_path, funcs, lay, nonlocal_returns):
-    global _FUNCS
+class ModuleLayout:
+    """Layout of a CRO module in offset space (picklable, for the worker processes)."""
+    def __init__(self, code_lo, code_hi, size, idx):
+        self.text_base, self.code_lo, self.text_end, self.ro_end = 0, code_lo, code_hi, size
+        self.module, self.fn_prefix, self.dynamic_words = True, f'm{idx}_', ()
+
+
+def _init(img_path, funcs, lay, nonlocal_returns, header=None):
+    global _FUNCS, FILE_HEADER
     configure(open(img_path, 'rb').read(), lay, nonlocal_returns)
     _FUNCS = funcs
+    if header:
+        FILE_HEADER = header
 
 
 def _scan_calls(entries):
@@ -1223,7 +1251,7 @@ def _emit_file(args):
     unsup_words = collections.Counter()
     bad_funcs = []
     covered = set()
-    parts = ['#include "recomp.h"', '#include "funcs.h"', '']
+    parts = list(FILE_HEADER)
     for e in entries:
         body = discover(e, _FUNCS)
         stats['insns'] += len(body)
@@ -1257,13 +1285,65 @@ def load_game_file(root, title_id):
     return set(t.get('extra', [])), set(t.get('not_code', []))
 
 
+def module_main(cro_path, outdir, idx, jobs):
+    """Recompile one CRO module, position-independent, into outdir/mod_<idx>_*.c, mod_<idx>_funcs.h and
+    mod_<idx>_table.c (functions by offset, its base variable). Prints the module's name and counts."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    sys.path.insert(0, os.path.join(root, 'analyze'))
+    import cro as C, discover
+    m = C.Cro(open(cro_path, 'rb').read())
+    lo, hi = m.code_range()
+    img = m.offset_image()
+    lay = ModuleLayout(lo, hi, len(img), idx)
+    img_path = os.path.join(outdir, f'mod_{idx}.img')
+    open(img_path, 'wb').write(img)
+    nlr = idioms.detect_inline_data_calls(img, 0, lo, hi)
+    configure(img, lay, nlr)
+    seeds = {k for k in m.code_seeds() if is_key(k)}
+    funcs, report = discover.discover_all(img_path, lay, nlr, seeds, set(), jobs, log=lambda *_: None, stored_pointers=False)
+    funcs = {f for f in funcs if is_key(f)}
+    order = sorted(funcs)
+    pre = f'm{idx}_'
+    header = ['#include "recomp.h"', f'#include "mod_{idx}_funcs.h"', f'extern uint32_t mb_m{idx};',
+              f'#define MB mb_m{idx}', '#define A(x) ((x) + MB)', '']
+    nfiles = max(1, min(32, len(order) // 400 + 1))
+    per = (len(order) + nfiles - 1) // nfiles
+    tmp = os.path.join(outdir, f'mod_{idx}.tmp')          # _emit_file writes rc_NNN.c: not next to the main program's
+    os.makedirs(tmp, exist_ok=True)
+    args = [(i, order[i * per:(i + 1) * per], tmp) for i in range(nfiles) if order[i * per:(i + 1) * per]]
+    with Pool(jobs, _init, (img_path, funcs, lay, nlr, header)) as pool:
+        results = pool.map(_emit_file, args)
+    for i, _ in enumerate(args):
+        os.replace(os.path.join(tmp, f'rc_{i:03d}.c'), os.path.join(outdir, f'mod_{idx}_{i:03d}.c'))
+    os.rmdir(tmp)
+    with open(os.path.join(outdir, f'mod_{idx}_funcs.h'), 'w') as fh:
+        fh.write('#pragma once\n' + ''.join(f'void fn_{pre}{a:08x}(CPU *c);\n' for a in order))
+    with open(os.path.join(outdir, f'mod_{idx}_table.c'), 'w') as fh:
+        fh.write(f'#include "recomp.h"\n#include "mod_{idx}_funcs.h"\nuint32_t mb_m{idx};\n')
+        fh.write(f'const ModFn mod_m{idx}_fns[] = {{\n' + ''.join(f'  {{0x{a:08x}u, fn_{pre}{a:08x}}},\n' for a in order) + '};\n')
+    os.remove(img_path)
+    stats = collections.Counter()
+    for st, _, _, _ in results:
+        stats.update(st)
+    un = sum(v for k, v in stats.items() if k.startswith('unsup:'))
+    print(f'module {m.name}: {len(order)} functions, {stats["insns"]} instructions, {un} unsupported')
+    return m.name, len(m.b), len(order)
+
+
 def main():
+    if sys.argv[1] == '--module':                          # armrecomp.py --module <file.cro> <outdir> <index> [--jobs N]
+        opts = dict(zip(sys.argv[5::2], sys.argv[6::2]))
+        name, size, n = module_main(sys.argv[2], sys.argv[3], int(sys.argv[4]), int(opts.get('--jobs', os.cpu_count())))
+        print(f'MODULE\t{name}\t{size}\t{n}')
+        return
     img_path, fn_path, outdir = sys.argv[1:4]
     opts = dict(zip(sys.argv[4::2], sys.argv[5::2]))
     nfiles, jobs = int(opts.get('--files', 96)), int(opts.get('--jobs', os.cpu_count()))
     os.makedirs(outdir, exist_ok=True)
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     lay = layout_mod.read_layout(os.path.join(os.path.dirname(img_path), 'exheader.bin'))
+    if opts.get('--dynamic') and os.path.exists(opts['--dynamic']):      # words ldr:ro writes (static.crs): never folded
+        object.__setattr__(lay, "dynamic_words", {int(l, 16) for l in open(opts["--dynamic"]) if l.strip()})
     img = open(img_path, 'rb').read()
     if len(img) != lay.image_size:
         sys.exit(f'{img_path} is {len(img):#x} bytes but the ExHeader describes {lay.image_size:#x}')
@@ -1282,6 +1362,8 @@ def main():
     configure(img, lay, nonlocal_returns)
 
     game_extra, not_code = load_game_file(root, lay.title_id)
+    if opts.get('--seeds') and os.path.exists(opts['--seeds']):     # main-program functions modules call (static.crs)
+        game_extra |= {int(l.split()[0], 16) for l in open(opts['--seeds']) if l.strip()}
     if opts.get('--extra') and os.path.exists(opts['--extra']):     # functions the runtime found missing (3dsrecomp run)
         game_extra |= {int(l.split()[0], 16) for l in open(opts['--extra']) if l.strip() and not l.startswith('#')}
     if fn_path == '-':                     # no list: discover every function from the entry point (analyze/discover.py)
@@ -1335,6 +1417,7 @@ def main():
         fh.write('const struct { uint32_t addr; recomp_fn fn; } recomp_functions[] = {\n')
         fh.write(''.join(f'  {{0x{a:08x}u, fn_{a:08x}}},\n' for a in order))
         fh.write(f'}};\nconst uint32_t recomp_function_count = {len(order)};\n')
+
     with open(os.path.join(outdir, 'functions_all.txt'), 'w') as fh:
         fh.write(''.join(f'{a:08x}\n' for a in order))
     with open(os.path.join(outdir, 'functions_unsupported.txt'), 'w') as fh:

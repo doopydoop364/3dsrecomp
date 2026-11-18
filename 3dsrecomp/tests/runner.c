@@ -45,6 +45,7 @@ void call_indirect(CPU *c, uint32_t addr) {
     f(c);
 }
 int recomp_budget = PREEMPT_BUDGET;
+recomp_fn recomp_lookup_module(uint32_t a) { (void)a; return 0; }
 void recomp_preempt(CPU *c) { (void)c; recomp_budget = PREEMPT_BUDGET; }
 void svc_call(CPU *c, uint32_t num, uint32_t addr) { recomp_trap(c, addr, num, "svc"); }
 

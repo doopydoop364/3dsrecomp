@@ -201,3 +201,31 @@ All three games run with generic changes only (no per-game code or hints):
 | Animal Crossing: New Leaf - Welcome amiibo | 0004000000198e00 | 7.6 MB | 5445 | 39 | phases 6, 7 |
 | Pokemon X | 0004000000055d00 | 4.4 MB | 1373 | 134 | phases 6, 7 |
 All nine extract with `3dsrecomp extract` (key slots 0x2C, 0x25, 0x18; Robobot with a seed).
+
+## 11. Phase 7: CRO modules (design, 2026-11-17)
+
+**What a CRO is.** A relocatable module (like a shared library) the game reads from its RomFS (or builds in memory)
+and hands to `ldr:ro`, which maps it at an address the game chooses, rebases its tables, relocates it and links it
+with the main program (described by `static.crs`) and the other loaded modules; the game then calls its `OnLoad`.
+Format and rules follow Azahar's `cro_helper.cpp` (header of 0x138 bytes after a 0x80-byte hash area; segments
+addressed by segment tags; named / indexed / anonymous exports and imports; relocation batches).
+
+**Facts from the library** (parsed from the dumps): every relocation in Smash, Pokémon X (134 modules) and Animal
+Crossing (39) is type 2, an absolute address written into a data word. Relocations never patch instructions.
+Smash's one module is not a plain `.cro` file in its RomFS, so modules are captured from memory when loaded.
+
+**Design.**
+- `ldr:ro` in the runtime: Initialize (map and rebase `static.crs`), LoadCRO / LoadCRO_New (map, rebase, internal /
+  static / exit relocations, link imports both ways, register in the module list, fix), UnloadCRO, LinkCRO /
+  UnlinkCRO, Shutdown — the same semantics as Azahar.
+- Module code is recompiled **position-independent**: every address the generated code computes (pc reads, return
+  addresses, literal addresses, table cases) is `A(offset)`, which is `offset + mb` with `mb` the module's current
+  base. One build per module file, whatever address the game loads it at, any number of times. The main program
+  uses the same emitter with `A(x) = x`, so its generated code is unchanged.
+- Literal words are not folded into constants in module code (relocations write them). In the main program, the
+  words `static.crs` relocates are excluded from folding too.
+- Discovery in a module starts from its exports, `OnLoad` / `OnExit` / `OnUnresolved`, and every internal relocation
+  whose symbol is in the code segment (vtables, callbacks): an exact list of code pointers, then the usual closure.
+- Function lookup: an address outside the main program is looked up in the loaded modules (by range) and their
+  offset tables. A module that loads without compiled code is saved to `work/<id>/cro/<name>.cro` and reported;
+  `3dsrecomp run` rebuilds with it and restarts, like the missing-function loop.

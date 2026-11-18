@@ -110,7 +110,7 @@ void mem_dump_all(const char *dir) {
 }
 /* ControlMemory MAP / UNMAP: the pages of src appear at dst, and src is not accessible meanwhile (its state is
  * "aliased" on a console), so the pages are moved and src keeps an inaccessible placeholder. */
-static int mem_alias(uint32_t dst, uint32_t src, uint32_t size, int unmap) {
+int mem_alias(uint32_t dst, uint32_t src, uint32_t size, int unmap) {
     size = (size + 0xfff) & ~0xfffu;
     uint32_t from = unmap ? dst : src, to = unmap ? src : dst;
     void *p = mremap((void *)(uintptr_t)from, size, size, MREMAP_MAYMOVE | MREMAP_FIXED, (void *)(uintptr_t)to);

@@ -108,7 +108,7 @@ def _idioms_chunk(rng):
     return found
 
 
-def discover_all(img_path, lay, nlr, seeds, not_code, jobs, log=print):
+def discover_all(img_path, lay, nlr, seeds, not_code, jobs, log=print, stored_pointers=True):
     """Returns (functions, report lines)."""
     img = open(img_path, 'rb').read()
     R.configure(img, lay, nlr)
@@ -138,9 +138,9 @@ def discover_all(img_path, lay, nlr, seeds, not_code, jobs, log=print):
         step = (nwords + jobs * 8 - 1) // (jobs * 8)
         tsteps = ((R.TEXT_END - R.BASE) // 4 + jobs * 8 - 1) // (jobs * 8)
         with Pool(jobs, _winit, (img_path, lay, nlr, funcs, bytes(cov))) as pool:
-            ptrs = pool.map(_words_chunk, [(i, min(i + step, nwords)) for i in range(0, nwords, step)])
+            ptrs = pool.map(_words_chunk, [(i, min(i + step, nwords)) for i in range(0, nwords, step)]) if stored_pointers else []
             idm = pool.map(_idioms_chunk, [(i, i + tsteps) for i in range(0, (R.TEXT_END - R.BASE) // 4, tsteps)])
-        new = set().union(*ptrs) - funcs - not_code
+        new = set().union(set(), *ptrs) - funcs - not_code
         added['stored pointers'] = len(new)
         found = {}
         for part in idm:

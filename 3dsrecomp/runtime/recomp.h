@@ -34,9 +34,16 @@ double vfp_nan1d(double a);
 /* RECOMP_TEXT_BASE / RECOMP_TEXT_SIZE and the other layout values: generated from the ExHeader */
 #include "layout.h"
 extern recomp_fn *recomp_table, *recomp_table_thumb;
+recomp_fn recomp_lookup_module(uint32_t a);      /* code of a loaded CRO module (modules.c) */
+/* Recompiled CRO modules (generated): functions by offset in the module (bit 0 set: Thumb); *mb is the base the
+ * module is loaded at, which its code adds to every address it computes. */
+typedef struct { uint32_t off; recomp_fn fn; } ModFn;
+typedef struct { const char *name; uint32_t file_size; const ModFn *fns; uint32_t nfns; uint32_t *mb; } RecompModule;
+extern const RecompModule recomp_modules[];
+extern const uint32_t recomp_module_count;
 static inline recomp_fn recomp_lookup(uint32_t a) {
     uint32_t o = (a & ~1u) - RECOMP_TEXT_BASE;
-    if (o >= RECOMP_TEXT_SIZE) return (recomp_fn)0;
+    if (o >= RECOMP_TEXT_SIZE) return recomp_lookup_module(a);
     if (a & 1) return recomp_table_thumb[o >> 1];
     return (a & 3) ? (recomp_fn)0 : recomp_table[o >> 2];
 }

@@ -60,12 +60,84 @@ def _hash_files(paths):
     return h.hexdigest()
 
 
+def modules(tid):
+    """The game's CRO modules: static.crs (or None) and {name: bytes} of the .cro files in its RomFS plus the ones the
+    runtime saved when they loaded (work/<id>/cro/)."""
+    sys.path.insert(0, os.path.join(ROOT, "analyze"))
+    import cro as C
+    wd = os.path.join(ROOT, "work", tid)
+    files = C.romfs_files(os.path.join(wd, "game", "romfs.bin"), lambda p: p.lower().endswith((".cro", ".crs")))
+    crs, mods = None, {}
+    for p, b in files:
+        try:
+            m = C.Cro(b, is_crs=p.lower().endswith(".crs"))
+        except ValueError:
+            continue
+        if m.is_crs:
+            crs = m
+        else:
+            mods.setdefault(m.name, b)
+    for p in sorted(glob.glob(os.path.join(wd, "cro", "*.cro"))):
+        try:
+            m = C.Cro(open(p, "rb").read())
+        except ValueError:
+            continue
+        mods.setdefault(m.name, m.b)
+    return crs, mods
+
+
+def build_modules(tid, gen, mods, jobs):
+    """Recompile each module (cached by its bytes and the tools) and write gen/modules.c, the table the runtime uses."""
+    tools = _hash_files(sorted(glob.glob(os.path.join(ROOT, "recomp", "*.py")) + glob.glob(os.path.join(ROOT, "analyze", "*.py"))))
+    entries = []
+    for idx, name in enumerate(sorted(mods)):
+        data = mods[name]
+        key = hashlib.sha256(tools.encode() + data).hexdigest()
+        stamp = os.path.join(gen, f"mod_{idx}.stamp")
+        info = None
+        if os.path.exists(stamp):
+            k, *rest = open(stamp).read().split("\t")
+            if k == key:
+                info = rest
+        if info is None:
+            for old in glob.glob(os.path.join(gen, f"mod_{idx}_*")):
+                os.remove(old)
+            src = os.path.join(gen, f"mod_{idx}.cro")
+            open(src, "wb").write(data)
+            r = subprocess.run([sys.executable, os.path.join(ROOT, "recomp", "armrecomp.py"), "--module", src, gen, str(idx), "--jobs", str(jobs)],
+                               capture_output=True, text=True, cwd=ROOT)
+            os.remove(src)
+            line = [l for l in r.stdout.splitlines() if l.startswith("MODULE\t")]
+            if r.returncode or not line:
+                sys.exit(f"recompiling module {name} failed:\n{r.stdout[-2000:]}{r.stderr[-2000:]}")
+            info = line[0].split("\t")[1:]
+            print(f"  module {name}: {info[2]} functions")
+            open(stamp, "w").write("\t".join([key] + info))
+        entries.append((idx, info[0], int(info[1]), int(info[2])))
+    with open(os.path.join(gen, "modules.c"), "w") as fh:
+        fh.write('#include "recomp.h"\n')
+        for idx, *_ in entries:
+            fh.write(f"extern const ModFn mod_m{idx}_fns[]; extern uint32_t mb_m{idx};\n")
+        fh.write("const RecompModule recomp_modules[] = {\n")
+        fh.write("".join(f'  {{"{name}", {size}u, mod_m{idx}_fns, {n}u, &mb_m{idx}}},\n' for idx, name, size, n in entries))
+        fh.write(f"}};\nconst uint32_t recomp_module_count = {len(entries)};\n")
+
+
 def build(tid, quiet=False):
     wd = os.path.join(ROOT, "work", tid)
     game, gen, obj, binp = (os.path.join(wd, n) for n in ("game", "gen", "obj", "native"))
     extra = os.path.join(wd, "extra_functions.txt")
+    crs, mods = modules(tid)
+    dyn, seeds = os.path.join(wd, "crs_words.txt"), os.path.join(wd, "crs_seeds.txt")
+    if crs:                                        # what ldr:ro writes into the main program, and what modules call there
+        import cro as C
+        new_dyn = "".join(f"{a:08x}\n" for a in sorted(C.main_program_words(crs, [C.Cro(b) for b in mods.values()])))
+        new_seeds = "".join(f"{a:08x}\n" for a in sorted(C.main_program_seeds(crs)))
+        for path, text in ((dyn, new_dyn), (seeds, new_seeds)):
+            if not os.path.exists(path) or open(path).read() != text:
+                open(path, "w").write(text)
     tools = sorted(glob.glob(os.path.join(ROOT, "recomp", "*.py")) + glob.glob(os.path.join(ROOT, "analyze", "*.py")))
-    key = _hash_files([os.path.join(game, "code_decompressed.bin"), os.path.join(game, "exheader.bin"), extra] + tools)
+    key = _hash_files([os.path.join(game, "code_decompressed.bin"), os.path.join(game, "exheader.bin"), extra, dyn, seeds] + tools)
     toml = os.path.join(ROOT, "games", f"{tid}.toml")
     if os.path.exists(toml):                       # only the part the recompiler reads; controls and tests do not rebuild
         import tomllib
@@ -76,12 +148,17 @@ def build(tid, quiet=False):
         os.makedirs(gen, exist_ok=True)
         with open(os.path.join(wd, "recomp.log"), "w") as log:
             r = subprocess.run([sys.executable, os.path.join(ROOT, "recomp", "armrecomp.py"), os.path.join(game, "code_decompressed.bin"),
-                                "-", gen, "--extra", extra], stdout=log, stderr=subprocess.STDOUT, cwd=ROOT)
+                                "-", gen, "--extra", extra, "--dynamic", dyn, "--seeds", seeds], stdout=log, stderr=subprocess.STDOUT, cwd=ROOT)
         if r.returncode:
             sys.exit(f"recompiling failed, see {os.path.join(wd, 'recomp.log')}")
         for line in open(os.path.join(gen, "discovery.txt")):
             print("  " + line.rstrip())
         open(stamp, "w").write(key)
+    for old in glob.glob(os.path.join(gen, "modules.c")):
+        os.remove(old)
+    if mods:
+        print(f"3dsrecomp: recompiling {len(mods)} module(s) ...", flush=True)
+        build_modules(tid, gen, mods, os.cpu_count())
     print(f"3dsrecomp: compiling {tid} ...", flush=True)
     r = subprocess.run(["make", f"-j{os.cpu_count()}", f"GEN={gen}", f"OBJ={obj}", f"BIN={binp}", binp],
                        cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -107,6 +184,12 @@ def run(tid, args):
             os.remove(missing)
         print(f"3dsrecomp: starting {tid}", flush=True)
         rc = subprocess.call([binp, game] + args, cwd=ROOT, env=env)
+        mm = os.path.join(game, "missing_modules.txt")
+        if os.path.exists(mm):                     # a module loaded without compiled code: it was saved, rebuild
+            names = sorted({l.strip() for l in open(mm) if l.strip()})
+            os.remove(mm)
+            print(f"3dsrecomp: the game loaded module(s) {', '.join(names)} for the first time; rebuilding and restarting")
+            continue
         found = set()
         if os.path.exists(missing):
             found = {l.split()[0] for l in open(missing) if l.strip()}

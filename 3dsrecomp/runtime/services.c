@@ -540,6 +540,7 @@ static uint64_t dsp_frames;
 void dsp_audio_frame(void);                                       /* dsp.c */
 void y2r_service(KObject *s, uint32_t *cmd);                     /* y2r.c */
 void nfc_service(KObject *s, uint32_t *cmd);                     /* nfc.c */
+void ldr_ro_service(KObject *s, uint32_t *cmd);                  /* ldr_ro.c */
 void nfc_set_dir(const char *game_dir);
 static void dsp_tick(void) {                                           /* one 160-sample audio frame */
     if (!dsp_on) return;
@@ -740,7 +741,7 @@ static const struct { const char *name; ServiceFn fn; } table[] = {
     { "dsp::DSP", dsp }, { "y2r:u", y2r_service }, { "nfc:u", nfc_service }, { "nfc:m", nfc_service },
     { "hid:USER", hid }, { "hid:SPVR", hid }, { "gsp::Gpu", gsp_service },
     { "fs:USER", fs_user }, { "ndm:u", quiet_ok },
-    { "ir:rst", irrst }, { "ir:USER", iruser },
+    { "ir:rst", irrst }, { "ir:USER", iruser }, { "ldr:ro", ldr_ro_service },
     { "cecd:u", cecd }, { "boss:U", boss }, { "boss:P", boss }, { "frd:u", frd }, { "frd:a", frd }, { "ac:u", ac }, { "ac:i", ac },
     { "APT:A", apt }, { "APT:U", apt }, { "APT:S", apt },
     { "cfg:u", cfg }, { "cfg:s", cfg }, { "cfg:i", cfg },
