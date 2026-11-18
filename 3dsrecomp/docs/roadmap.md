@@ -15,10 +15,11 @@ Tomodachi Life boots to its first-run screens (touch works); Monster Hunter 4 Ul
 shaders); Smash runs until it loads its CRO module (phase 7). Open: Tomodachi Life reports demo-version data on a
 fresh console (not understood yet); APT Wrap is a stub (called 520 times by Tomodachi Life).
 
-## 2. Phase 7: CRO modules
-Pokémon X (134), Animal Crossing: New Leaf Welcome amiibo (39), Smash (1). Each module is recompiled ahead of time
-for a fixed load address that our `ldr:ro` service then uses, so nothing is emulated at run time.
-Target: all 8 games of the test library start.
+## 2. Phase 7: CRO modules — *done (2026-11-18)*
+`ldr:ro` in the runtime (Azahar's rules, our code); module code recompiled once, position-independent (every address
+is the module's current base plus an offset), so modules run wherever and however often the game loads them.
+Smash reaches its character select; Pokémon X plays its intro with modules loading, unloading and reloading.
+Design and findings: `general_tool_design.md` section 11.
 
 ## 3. Updates and DLC
 `3dsrecomp` takes the base game plus update (0004000E) and DLC (0004008C) dumps together. The update's program

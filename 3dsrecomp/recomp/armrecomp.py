@@ -801,6 +801,46 @@ def t_literal(ins, ea):
     return None
 
 
+def thumb_switch(addr, rm):
+    """Inline Thumb jump table ending in `add pc, rm` (armcc): `add rm, pc ; ldrb rm, [rm, #k] ; adds rm, rm, rm`
+    (or ldrh with lsls #1), the table right after, bounded by an earlier `cmp rI, #n`. Returns the case targets
+    (Thumb addresses, without bit 0) or None."""
+    if not (in_text_t(addr - 6) and in_text_t(addr - 4) and in_text_t(addr - 2)):
+        return None
+    h1, h2, h3 = rd16(addr - 2), rd16(addr - 4), rd16(addr - 6)
+    if h1 not in (0x1800 | (rm << 6) | (rm << 3) | rm, 0x0040 | (rm << 3) | rm) or h3 != (0x4478 | rm):
+        return None
+    if (h2 & 0xF83F) == (0x7800 | (rm << 3) | rm):          # ldrb rm, [rm, #k]
+        size, k = 1, (h2 >> 6) & 31
+    elif (h2 & 0xF83F) == (0x8800 | (rm << 3) | rm):        # ldrh rm, [rm, #k*2]
+        size, k = 2, ((h2 >> 6) & 31) * 2
+    else:
+        return None
+    n = None
+    for back in range(1, 16):                               # cmp rI, #n before (with a bhs/bcs to the default)
+        a = addr - 6 - 2 * back
+        if not in_text_t(a):
+            break
+        h = rd16(a)
+        if (h >> 11) == 0x05:
+            n = h & 0xFF
+            break
+    if not n or n > 256:
+        return None
+    table = (addr - 6) + 4 + k                              # pc of `add rm, pc` + k (the index is added at run time)
+    targets = []
+    for i in range(n):
+        e = table + i * size
+        if not in_text_t(e & ~1) and not (BASE <= e < RO_END):
+            return None
+        v = IMG[e - BASE] if size == 1 else struct.unpack_from('<H', IMG, e - BASE)[0]
+        t = addr + 4 + 2 * v
+        if not in_text_t(t):
+            return None
+        targets.append(t)
+    return targets
+
+
 def thumb_body(ins):
     h, addr = ins.w & 0xFFFF, ins.addr
     top = h >> 11
@@ -892,6 +932,14 @@ def thumb_body(ins):
                 if (p & 7) == rd and (p >> 13) in (0, 1, 2) or (p >> 11) == 0x1E:   # rX rewritten, or a call
                     break
         val = f'{tr(rd, addr)} + {tr(rm, addr)}' if op == 0 else tr(rm, addr)
+        if rd == 15 and op == 0 and rm < 8:              # inline jump table: dispatch to local labels
+            tg = thumb_switch(addr, rm)
+            if tg:
+                ins.falls = False
+                ins.targets = list(dict.fromkeys(t | 1 for t in tg))
+                cases = ' '.join(f'case 0x{t:08x}u: {G(t | 1)}' for t in dict.fromkeys(tg))
+                return (f'uint32_t t = {val}; switch ((t & ~1u){" - MB" if MODULE else ""}) {{ {cases} }} '
+                        + t_ijump(ins, '(t | 1u)'))
         if rd == 15:                                      # ADD/MOV pc: stays in Thumb state
             return t_ijump(ins, f'(({val}) | 1u)', op == 2 and rm == 14)
         return f'c->r[{rd}] = {val};'
@@ -1151,7 +1199,7 @@ def is_clean_code(t, funcs):
         return False
     if t & 1:
         first = rd16(t & ~1)
-        if (first & 0xFF00) == 0xB500:
+        if (first & 0xFE00) == 0xB400 and first & 0x1FF:      # push {...} (with or without lr)
             return True
         return len(body) <= 64 and any((i.w & 0xFFFF) == 0x4770 or (i.w & 0xFF00) == 0xBD00 for i in body.values())
     return True
