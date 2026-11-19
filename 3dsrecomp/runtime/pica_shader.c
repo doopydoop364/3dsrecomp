@@ -188,10 +188,11 @@ int pica_shader_run_gs(const PicaShader *sh, uint32_t entry, const float in[16][
             store(out, &st, di->dest, di->mask, r);
         } else {                                                      /* flow control */
             uint32_t target = (w >> 10) & 0xfff, count = w & 0xff;
-            int bval = (sh->bools >> ((w >> 22) & 15)) & 1;
+            uint32_t bools = em && em->own_bools ? em->bools : sh->bools;
+            int bval = (bools >> ((w >> 22) & 15)) & 1;
             if (sh_test < 0) { const char *e = getenv("RB_SH_TEST"); sh_test = e ? atoi(e) : 0; }
             if (sh_test == 4 && op == 0x27) bval = !bval;                 /* test: invert IFU */
-            if (sh_test == 5) bval = (sh->bools >> (15 - ((w >> 22) & 15))) & 1;   /* test: reversed bool bit order */
+            if (sh_test == 5) bval = (bools >> (15 - ((w >> 22) & 15))) & 1;   /* test: reversed bool bit order */
             if (sh_test == 6 && (op == 0x26 || op == 0x2d)) bval = !bval;  /* test: invert CALLU/JMPU */
             switch (op) {
             case 0x20: case 0x23:                                     /* BREAK, BREAKC */

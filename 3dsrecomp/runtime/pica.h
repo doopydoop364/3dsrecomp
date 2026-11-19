@@ -15,6 +15,7 @@ typedef struct {
 typedef struct PicaEmitter {
     int vertex_id, prim_emit, winding;
     void (*emit)(struct PicaEmitter *em, const float out[16][4]);
+    int own_bools; uint32_t bools;     /* own_bools: this invocation's b0-b15 instead of the unit's (b15, see pica.c) */
 } PicaEmitter;
 
 void pica_shader_prepare(const PicaShader *sh);   /* decode the program when it changed (before running it) */

@@ -15,7 +15,7 @@ KThread *cur;
 int log_level = 1;
 recomp_fn *recomp_table;
 uint64_t gpu_frame(void) { return 0; }
-uint32_t linear_base = 0x14000000u;   /* the runtime's (kernel.c); replays use the old layout */
+uint32_t linear_base = 0x30000000u;   /* the runtime's (kernel.c); the captures load linear memory there */
 /* save states are not part of replays: pica.c's visitor links against these */
 int ss_loading(SS *s) { (void)s; return 0; }
 void ss_raw(SS *s, void *p, size_t n) { (void)s; (void)p; (void)n; }
@@ -46,7 +46,7 @@ int main(int argc, char **argv) {
     if (argc < 7) { fprintf(stderr, "usage: gpu_replay state vram linear list size out\n"); return 1; }
     load_region(0x1f000000u, argv[2]);
     load_region(0x30000000u, argv[3]);
-    if (pica_load_state(argv[1])) { fprintf(stderr, "cannot load PICA state %s\n", argv[1]); return 1; }
+    if (strcmp(argv[1], "-") && pica_load_state(argv[1])) { fprintf(stderr, "cannot load PICA state %s\n", argv[1]); return 1; }   /* "-": all registers zero */
     /* list "-" and size <file>: run every list named in the file (one "addr size" per line), a whole frame */
     uint32_t lists[64][2]; int nl = 0;
     if (!strcmp(argv[4], "-")) {

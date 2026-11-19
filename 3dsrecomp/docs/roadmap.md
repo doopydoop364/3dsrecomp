@@ -58,11 +58,14 @@ with the update, which is not in the library, so the base program never asks for
 Order inside the stage: what the playthroughs found first (crashes, stalls, then visible and audible errors), then
 the rest of each list.
 1. GPU (the whole PICA200):
-   - geometry shaders: variable-primitive and subdivision modes (point mode done 2026-11-17);
+   - geometry shaders — *done (2026-11-19)*: all three modes (point, variable primitive, fixed primitive) and b15
+     after each invocation, as Azahar; checked by tests/pica_synth.py (no library game uses the last two);
    - procedural textures (complete), shadow maps and shadow textures, gas / fog volumes, min/max blending factors,
      logic ops, texture wrap modes 4-7, 16-bit colour blending, every texture and framebuffer format, every
      combiner and lighting LUT mode, the rest of the GX transfer flags (scaling, format conversion, linear/tiled);
-   - checked feature by feature against the software renderer and Azahar (test cases for unused ones).
+   - checked feature by feature against the software renderer and Azahar (test cases for unused ones):
+     `tests/pica_synth.py` builds command lists, shaders and vertices from scratch and runs them through
+     `build/gpu_replay` (software or Vulkan renderer).
 2. Audio (the whole DSP): biquad filters, the remaining mixer details (aux buses, effects), every sample format and
    ADPCM detail, AAC decoding (DSP and the `mvd`/codec path games use).
 3. Services: every service a retail game opens answers as a console would, or as a console without that hardware or

@@ -14,6 +14,7 @@ static uint32_t pt_lut[6][256];             /* procedural texture: noise, -, col
                                              * (filled through 0x0B0-0x0B7, table and index in 0x0AF) */
 static uintptr_t cur_word;
 static uint32_t top_list, cur_list;         /* top-level list of this submission, and the list now executing */                 /* host address of the command word being executed */
+static int gs_b15;                          /* b15 of the geometry shader reads 1 after any invocation, until 0x280 is written */
 static uintptr_t uni_src[96];              /* where each uniform's last upload came from */
 static PicaShader vs, gs;                  /* vertex and geometry shader units */
 static uint64_t vs_ver = 1, gs_ver = 1;     /* bumped on every program or swizzle write */
@@ -78,6 +79,7 @@ static uint32_t write_reg(uint32_t id, uint32_t value, uint32_t mask) {
     case 0x22e: draw(0); break;
     case 0x22f: draw(1); break;
     case 0x232: dflt_n = 0; break;
+    case 0x280: gs_b15 = 0; break;                                   /* the program sets b0-b15: b15 is its own again */
     case 0x233: case 0x234: case 0x235:                              /* fixed vertex attribute data */
         dflt_queue[dflt_n++] = v;
         if (dflt_n == 3) {
@@ -1302,7 +1304,7 @@ static uint32_t gs_index(uint32_t i) {
     return gs_indexed ? (gs_i16 ? (uint32_t)(gs_ib[2 * i] | gs_ib[2 * i + 1] << 8) : gs_ib[i]) : gs_first + i;
 }
 static void run_gs_invocations(void) {
-    GsEm em; memset(&em, 0, sizeof em); em.em.emit = gs_emit;
+    GsEm em; memset(&em, 0, sizeof em); em.em.emit = gs_emit; em.em.own_bools = 1;
     for (;;) {
         uint32_t c = __atomic_fetch_add(&gs_next, 1, __ATOMIC_RELAXED);
         if (c >= gs_nouts) break;
@@ -1316,6 +1318,7 @@ static void run_gs_invocations(void) {
                 for (uint32_t k = 0; k < gs_vs_n && a < gs_n_in; k++, a++) memcpy(gin[(gs_map >> (4 * a)) & 15], gs_raw[vi][k], sizeof gin[0]);
             }
             em.em.vertex_id = 0; em.em.prim_emit = 0; em.em.winding = 0;
+            em.em.bools = gs.bools | (inv ? 0x8000u : 0);          /* b15 is set after every invocation (Azahar) */
             if (pica_shader_run_gs(&gs, reg[0x28a] & 0xffff, gin, gout, &em.em) < 0) LOG(1, "pica: geometry shader did not finish");
         }
     }
@@ -1332,7 +1335,7 @@ static uint64_t n_gs_runs;
 static void pool_run(int kind);
 static void gs_draw(const Fb *fb, uint32_t base, const uint8_t *ib, int i16, int indexed, uint32_t first, uint32_t count,
                     const uint32_t *vlist, uint32_t nuniq) {
-    gs.bools = reg[0x280] & 0xffff;
+    gs.bools = (reg[0x280] & 0xffff) | (gs_b15 ? 0x8000u : 0);
     for (int k = 0; k < 4; k++) gs.ints[k] = reg[0x281 + k];
     pica_shader_prepare_ver(&gs, gs_ver);
     gs_vs_n = (reg[0x24a] & 15) + 1; gs_n_in = (reg[0x289] & 15) + 1; gs_omask = reg[0x2bd] & 0xffff;
@@ -1355,6 +1358,52 @@ static void gs_draw(const Fb *fb, uint32_t base, const uint8_t *ib, int i16, int
     /* 3: rasterise in order */
     for (uint32_t c = 0; c < nchunks; c++)
         for (uint32_t t = 0; t + 2 < gs_outs[c].n; t += 3) triangle(fb, &gs_outs[c].v[t], &gs_outs[c].v[t + 1], &gs_outs[c].v[t + 2]);
+    if (gs_ninv) gs_b15 = 1;
+}
+/* Geometry shader modes whose inputs go into the unit's float uniforms (0x289 bit 8, register 0x252 mode 1 or 2), as
+ * Azahar does: one invocation after another, each sees what the previous ones left in the uniforms.
+ *   fixed primitive (2): vertices fill c[start..] (0x252 bits 16-23) with all their outputs, 0x252 bits 8-11 + 1 vertices
+ *     per invocation;
+ *   variable primitive (1): in an indexed draw, an index is a vertex count n instead of a vertex: c0 = (n, n, n, n), then
+ *     the next n vertices fill c1.., the first 0x254 + 1 with all their outputs, the rest with their first one only. */
+static void gs_draw_uniform(const Fb *fb, uint32_t base, const uint8_t *ib, int i16, int indexed, uint32_t first, uint32_t count,
+                            const uint32_t *vlist, uint32_t nuniq, int mode) {
+    gs.bools = (reg[0x280] & 0xffff) | (gs_b15 ? 0x8000u : 0);
+    for (int k = 0; k < 4; k++) gs.ints[k] = reg[0x281 + k];
+    pica_shader_prepare_ver(&gs, gs_ver);
+    gs_vs_n = (reg[0x24a] & 15) + 1; gs_omask = reg[0x2bd] & 0xffff;
+    if (mode == 1 && !indexed) { if (!n_skipped_gs++) LOG(1, "pica: variable-primitive geometry shader in a draw without indices (skipped)"); return; }
+    if (!gs_raw) { gs_raw = malloc(65536 * sizeof *gs_raw); if (!gs_raw) fatal("out of memory"); }
+    pool_init();
+    job_base = base; job_vlist = vlist; job_nv = nuniq; job_next = 0;
+    if (nworkers == 1 || nuniq < 48) { job_kind = 2; run_gs_vertices(); } else pool_run(2);
+    gs_ib = ib; gs_i16 = (uint32_t)i16; gs_indexed = (uint32_t)indexed; gs_first = first;
+    static GsOut out;
+    GsEm em; memset(&em, 0, sizeof em); em.em.emit = gs_emit; em.out = &out; out.n = 0;
+    uint32_t start = (reg[0x252] >> 16) & 0xff, nfix = ((reg[0x252] >> 8) & 15) + 1, pos = 0, need_index = mode == 1, main_left = 0, total_left = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t vi = gs_index(i);
+        int full = 0;
+        if (mode == 1) {
+            if (need_index) {
+                for (int k = 0; k < 4; k++) gs.uniform[0][k] = (float)vi;
+                pos = 1; main_left = reg[0x254] + 1; total_left = vi; need_index = 0;
+                continue;
+            }
+            if (main_left) { for (uint32_t k = 0; k < gs_vs_n && pos < 96; k++) memcpy(gs.uniform[pos++], gs_raw[vi][k], sizeof gs.uniform[0]); main_left--; }
+            else if (pos < 96) memcpy(gs.uniform[pos++], gs_raw[vi][0], sizeof gs.uniform[0]);
+            if (--total_left == 0) { need_index = 1; full = 1; }
+        } else {
+            for (uint32_t k = 0; k < gs_vs_n && start + pos < 96; k++) memcpy(gs.uniform[start + pos++], gs_raw[vi][k], sizeof gs.uniform[0]);
+            if (pos >= gs_vs_n * nfix) { pos = 0; full = 1; }
+        }
+        if (!full) continue;
+        float gin[16][4] = { { 0 } }, gout[16][4] = { { 0 } };
+        em.em.vertex_id = 0; em.em.prim_emit = 0; em.em.winding = 0;
+        if (pica_shader_run_gs(&gs, reg[0x28a] & 0xffff, gin, gout, &em.em) < 0) LOG(1, "pica: geometry shader did not finish");
+        gs.bools |= 0x8000u; gs_b15 = 1; n_gs_runs++;
+    }
+    for (uint32_t t = 0; t + 2 < out.n; t += 3) triangle(fb, &out.v[t], &out.v[t + 1], &out.v[t + 2]);
 }
 
 static void draw(int indexed) {
@@ -1368,10 +1417,8 @@ static void draw(int indexed) {
     if (gpu_frame() != frame_seen) { frame_seen = gpu_frame(); frame_draw_base = n_draws; }
     uint32_t draw_in_frame = (uint32_t)(n_draws - frame_draw_base);
     int use_gs = (reg[0x229] & 3) == 2;
-    if (use_gs && ((reg[0x229] >> 8) & 1 || (reg[0x289] >> 8) & 1)) {   /* variable-primitive and subdivision modes */
-        if (!n_skipped_gs++) LOG(1, "pica: geometry shader mode %s is not implemented (draw skipped)", (reg[0x229] >> 8) & 1 ? "variable primitive" : "fixed/subdivision");
-        return;
-    }
+    int gs_mode = use_gs ? (int)(reg[0x252] & 0xff) : 0;              /* 0 point, 1 variable primitive, 2 fixed primitive */
+    if (gs_mode > 2) { if (!n_skipped_gs++) LOG(1, "pica: geometry shader mode %d is unknown (draw skipped)", gs_mode); return; }
     Fb fb;
     fb.width = reg[0x11e] & 0x7ff; fb.hreg = (reg[0x11e] >> 12) & 0x3ff;
     fb.cfmt = (reg[0x117] >> 16) & 7; fb.dfmt = reg[0x116] & 3;
@@ -1418,8 +1465,9 @@ static void draw(int indexed) {
     }
     uint64_t tA = pns(); t_setup += tA - t_draw0;
     pica_shader_prepare_ver(&vs, vs_ver);
-    if (use_gs) {                                                     /* geometry shader, point mode */
-        gs_draw(&fb, base, ib, i16, indexed, first, count, vlist, nuniq);
+    if (use_gs) {                                                     /* geometry shader */
+        if (gs_mode == 0) gs_draw(&fb, base, ib, i16, indexed, first, count, vlist, nuniq);
+        else gs_draw_uniform(&fb, base, ib, i16, indexed, first, count, vlist, nuniq, gs_mode);
         uint64_t tC = pns(); t_shade += tC - tA;
         if (vkr_on) { vk_submit(&fb, caddr, daddr); ntris = 0; }
         else flush_tris(&fb);
@@ -1533,6 +1581,6 @@ void pica_state(SS *s) {
     SS_V(s, reg); SS_V(s, lut); SS_V(s, fog_lut); SS_V(s, pt_lut); SS_V(s, uni_src); SS_V(s, vs); SS_V(s, gs);
     SS_V(s, uni_queue); SS_V(s, uni_n); SS_V(s, gs_uni_queue); SS_V(s, gs_uni_n); SS_V(s, dflt); SS_V(s, dflt_queue); SS_V(s, dflt_n);
     SS_V(s, tevs); SS_V(s, tev_buf_init); SS_V(s, lights); SS_V(s, nlights); SS_V(s, global_amb); SS_V(s, tu);
-    SS_V(s, flat_mode); SS_V(s, flat);
+    SS_V(s, flat_mode); SS_V(s, flat); SS_V(s, gs_b15);
     if (ss_loading(s)) { vs_ver += 1000000; gs_ver += 1000000; lut_version += 1000000; }
 }
