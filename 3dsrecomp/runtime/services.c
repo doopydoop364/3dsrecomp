@@ -9,6 +9,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <strings.h>
 #include <ftw.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -85,6 +86,56 @@ static KObject *apt_lock, *apt_notify_ev, *apt_param_ev;
 static int apt_param_pending;                 /* a Wakeup parameter is waiting to be received */
 static uint32_t apt_cpu_percent = 30;
 
+/* Wrap / Unwrap: AES-CCM with the console's APT key (key slot 0x31), as Azahar: the nonce is cut out of the data at
+ * nonce_offset and goes first in the wrapped form. The key is read from aes_keys.txt (slot0x31KeyN=...) in the system
+ * folder when the user has one; without it an all-zero key, like Azahar without keys. Data wrapped here then unwraps
+ * here, but not on a console (and the reverse) unless the real key is given. */
+void aes_ccm_encrypt(const uint8_t key[16], const uint8_t nonce[12], const uint8_t *plain, uint32_t len, uint8_t *out);
+int aes_ccm_decrypt(const uint8_t key[16], const uint8_t nonce[12], const uint8_t *in, uint32_t len, uint8_t *plain);
+static const uint8_t *apt_wrap_key(void) {
+    static uint8_t key[16]; static int loaded;
+    if (loaded) return key;
+    loaded = 1;
+    const char *sd = getenv("RB_SYSTEM_DIR"); char p[600]; snprintf(p, sizeof p, "%s/aes_keys.txt", sd ? sd : "system");
+    FILE *f = fopen(p, "r"); char line[256];
+    while (f && fgets(line, sizeof line, f)) {
+        if (strncasecmp(line, "slot0x31KeyN=", 13)) continue;
+        int ok = 1;
+        for (int i = 0; i < 16 && ok; i++) { unsigned v; ok = sscanf(line + 13 + 2 * i, "%2x", &v) == 1; key[i] = (uint8_t)v; }
+        if (ok) { LOG(1, "apt: data wrapping key from %s", p); break; }
+        memset(key, 0, sizeof key);
+    }
+    if (f) fclose(f);
+    return key;
+}
+static uint32_t apt_wrap(int wrap, uint32_t in, uint32_t in_size, uint32_t out, uint32_t out_size, uint32_t noff, uint32_t nsize) {
+    nsize = (nsize & ~3u) < 12 ? nsize & ~3u : 12;                     /* as a console (verified by Azahar) */
+    uint32_t body = in_size - nsize;
+    if (in_size < nsize || noff > body || (wrap ? out_size < in_size + 16 : in_size < nsize + 16 || out_size < in_size - 16)) {
+        LOG(1, "apt: %s with sizes in %u out %u nonce %u at %u: refused", wrap ? "Wrap" : "Unwrap", in_size, out_size, nsize, noff);
+        return 0xc8e10401u;                                            /* PS, wrong argument (Azahar's code for a failed unwrap) */
+    }
+    const uint8_t *src = (const uint8_t *)(uintptr_t)in; uint8_t *dst = (uint8_t *)(uintptr_t)out;
+    uint8_t nonce[12] = { 0 };
+    uint8_t *tmp = malloc(in_size + 16);
+    uint32_t res = RES_OK;
+    if (wrap) {                                                        /* plain = data without the nonce */
+        memcpy(nonce, src + noff, nsize);
+        memcpy(tmp, src, noff); memcpy(tmp + noff, src + noff + nsize, body - noff);
+        memcpy(dst, nonce, nsize);
+        aes_ccm_encrypt(apt_wrap_key(), nonce, tmp, body, dst + nsize);
+    } else {                                                           /* nonce, ciphertext, MAC -> plain with the nonce put back */
+        memcpy(nonce, src, nsize);
+        uint32_t plen = body - 16;
+        if (noff > plen) res = 0xc8e10401u;
+        else if (!aes_ccm_decrypt(apt_wrap_key(), nonce, src + nsize, body, tmp)) { LOG(1, "apt: Unwrap: the data does not verify"); res = 0xc8e10401u; }
+        else { memcpy(dst, tmp, noff); memcpy(dst + noff, nonce, nsize); memcpy(dst + noff + nsize, tmp + noff, plen - noff); }
+    }
+    free(tmp);
+    LOG(2, "apt: %s %u bytes -> %08x", wrap ? "Wrap" : "Unwrap", in_size, res);
+    return res;
+}
+
 static void apt(KObject *s, uint32_t *cmd) {
     uint32_t id = cmd[0] >> 16;
     switch (id) {
@@ -131,6 +182,12 @@ static void apt(KObject *s, uint32_t *cmd) {
     case 0x0050: reply(cmd, 2, 0); cmd[2] = apt_cpu_percent; break;    /* GetAppCpuTimeLimit */
     case 0x0051: reply(cmd, 2, 2); cmd[2] = 0; cmd[3] = 2; cmd[4] = staticbufs()[1]; break;   /* GetStartupArgument: none */
     case 0x0101: case 0x0102: reply(cmd, 2, 0); cmd[2] = (uint32_t)is_new_3ds; break;   /* CheckNew3DSApp / CheckNew3DS */
+    case 0x0046: case 0x0047: {                                        /* Wrap / Unwrap */
+        uint32_t out_size = cmd[1], in_size = cmd[2], noff = cmd[3], nsize = cmd[4];
+        uint32_t din = cmd[5], in = cmd[6], dout = cmd[7], out = cmd[8], res = apt_wrap(id == 0x0046, in, in_size, out, out_size, noff, nsize);
+        reply(cmd, 1, 4); cmd[1] = res; cmd[2] = din; cmd[3] = in; cmd[4] = dout; cmd[5] = out;
+        break;
+    }
     default: stub(s, cmd);
     }
 }
@@ -192,8 +249,28 @@ static void quiet_ok(KObject *s, uint32_t *cmd) {
 #define FS_EXISTS    0xc82044beu
 typedef struct { int fd; uint64_t base, size; int fixed, virt; } HFile;   /* virt: the game RomFS (romfs.c) */
 uint64_t romfs_open(const char *dir); int64_t romfs_read(uint64_t off, uint32_t size, uint8_t *dst);
-typedef struct { uint32_t id; char root[300]; int used; } HArchive;
+typedef struct { uint32_t id; char root[300]; int used; uint32_t tid_lo, tid_hi; } HArchive;   /* tid: archive 0x2345678A */
 static HArchive archives[64];         /* open archive handles: slot + 1 */
+
+/* A RomFS image on the host, served from its IVFC level-3 data (what a game reads through the content archive, as
+ * Azahar does). Files without an IVFC header are served whole. Opened once and kept: the handles are read-only. */
+static HFile *romfs_image(const char *path) {
+    static struct { char path[600]; HFile *f; } cache[320]; static int ncache;
+    for (int i = 0; i < ncache; i++) if (!strcmp(cache[i].path, path)) return cache[i].f;
+    int fd = open(path, O_RDONLY); struct stat st;
+    if (fd < 0) return 0;
+    if (fstat(fd, &st)) { close(fd); return 0; }
+    HFile *f = calloc(1, sizeof *f); f->fd = fd; f->size = (uint64_t)st.st_size; f->fixed = 1;
+    uint8_t h[0x60];
+    if (pread(fd, h, sizeof h, 0) == (ssize_t)sizeof h && !memcmp(h, "IVFC", 4)) {
+        uint32_t mhs, bs; uint64_t l3; memcpy(&mhs, h + 8, 4); memcpy(&l3, h + 0x44, 8); memcpy(&bs, h + 0x4c, 4);
+        uint64_t blk = bs < 32 ? 1ull << bs : 0x1000;
+        f->base = (0x60 + mhs + blk - 1) & ~(blk - 1);
+        f->size = f->base + l3 <= (uint64_t)st.st_size ? l3 : (uint64_t)st.st_size - f->base;
+    }
+    if (ncache < (int)(sizeof cache / sizeof *cache)) { snprintf(cache[ncache].path, sizeof cache[ncache].path, "%s", path); cache[ncache++].f = f; }
+    return f;
+}
 
 /* Guest path (ASCII or UTF-16) -> host path under root. Returns 0 for paths that try to escape. */
 static int fs_path(const char *root, uint32_t type, uint32_t size, uint32_t ptr, char *out, size_t outsz) {
@@ -279,12 +356,19 @@ static void dir_session(KObject *s, uint32_t *cmd) {
 }
 static int rm_entry(const char *p, const struct stat *st, int flag, struct FTW *ftw) { (void)st; (void)flag; (void)ftw; return remove(p); }
 static int rm_tree(const char *p) { return nftw(p, rm_entry, 16, FTW_DEPTH | FTW_PHYS); }
-static HFile romfs;
+static HFile romfs, *update_romfs;     /* the game's RomFS; an update's RomFS (SelfNCCH type 5) if one was added */
 #define FS_NOT_FORMATTED 0xc8a04554u
 #define FS_ARCHIVE_NOT_FOUND 0xc8a04478u
 static void extdata_root(char *out, size_t n, int shared, uint32_t lo, uint32_t hi) {
     snprintf(out, n, "%s/%s", game_dir, shared ? "extdata_shared" : "extdata"); mkdir(out, 0755);
     snprintf(out, n, "%s/%s/%08x%08x", game_dir, shared ? "extdata_shared" : "extdata", hi, lo);
+}
+#define FS_CARD_NOT_INSERTED 0xc880448du   /* game card not inserted (FS, not found), as Azahar answers */
+/* The game came from a cartridge dump (extract writes <game>/cartridge): it runs from a game card, not the SD card. */
+static int game_on_card(void) {
+    static int v = -1;
+    if (v < 0) { char p[600]; snprintf(p, sizeof p, "%s/cartridge", game_dir); v = !access(p, F_OK); }
+    return v;
 }
 /* Opens an archive. Save data always exists; extra data must have been created first, as on a console. */
 static uint32_t archive_open(uint32_t id, uint32_t psize, uint32_t pptr, HArchive **out) {
@@ -303,6 +387,10 @@ static uint32_t archive_open(uint32_t id, uint32_t psize, uint32_t pptr, HArchiv
                 LOG(1, "fs: created empty shared extra data %08x%08x (the system provides it on a real console)", hi, lo);
             } else { LOG(1, "fs: extra data %08x%08x does not exist", hi, lo); return FS_ARCHIVE_NOT_FOUND; }
         }
+    } else if ((id == 0x567890b2 || id == 0x567890b4) && psize >= 4 && ld32(pptr) == 2 && !game_on_card()) {
+        /* save data on a game card (path: media type 2, ...): the game was installed from a CIA, no card is in */
+        LOG(1, "fs: save data on a game card requested; there is no game card (the game is installed)");
+        return FS_CARD_NOT_INSERTED;
     } else if ((id == 0x567890b2 || id == 0x567890b4) && psize >= 8 &&
                (ld32(pptr + 4) & 0xffffff) != (uint32_t)((RECOMP_TITLE_ID >> 8) & 0xffffff)) {
         /* another title's save data (path: media type, unique id): that game's save if it is also in work/ */
@@ -315,6 +403,8 @@ static uint32_t archive_open(uint32_t id, uint32_t psize, uint32_t pptr, HArchiv
     } else if (id == 4 || id == 0x567890b2 || id == 0x567890b4) {      /* the game's save data: exists once formatted */
         snprintf(a->root, sizeof a->root, "%s/save", game_dir);
         if (stat(a->root, &st)) { LOG(1, "fs: save data is not formatted yet"); return FS_NOT_FORMATTED; }
+    } else if (id == 0x2345678a) {                                   /* another title's content: path = title id, media */
+        a->tid_lo = psize >= 4 ? ld32(pptr) : 0; a->tid_hi = psize >= 8 ? ld32(pptr + 4) : 0;
     } else if (id == 8) {
         snprintf(a->root, sizeof a->root, "%s/save", game_dir); mkdir(a->root, 0755);
     } else if (id == 9) {
@@ -334,6 +424,30 @@ static uint32_t host_open(HArchive *a, uint32_t ptype, uint32_t psize, uint32_t 
     *out_handle = file_open(f);
     return RES_OK;
 }
+/* A file of another title's content (archive 0x2345678A; file path: open type, content index, section, ExeFS name).
+ *  - The game's own DLC (0004008C, same unique id): game/dlc/<content index>.romfs, unpacked by 3dsrecomp from the
+ *    DLC dump. A content that is not there is not owned: "not found", as on a console without it.
+ *  - System archives (shared font, Mii data, ...): a RomFS the user dumped, or the open replacement 3dsrecomp makes. */
+static uint32_t content_open(uint32_t lo, uint32_t hi, uint32_t fsize, uint32_t fptr, uint32_t *h) {
+    char sp[600]; HFile *f;
+    if (hi == 0x0004008cu && (lo & 0xffffff00u) == (RECOMP_TITLE_ID_LO & 0xffffff00u)) {
+        uint32_t idx = fsize >= 8 ? ld32(fptr + 4) : 0, section = fsize >= 12 ? ld32(fptr + 8) : 0;
+        snprintf(sp, sizeof sp, "%s/dlc/%u.romfs", game_dir, idx);
+        f = section == 0 ? romfs_image(sp) : 0;
+        LOG(1, "fs: DLC content %u%s -> %s", idx, section ? " (ExeFS/code, which DLC has not)" : "", f ? "ok" : "not there");
+        if (!f) return FS_NOT_FOUND;
+        *h = file_open(f); return RES_OK;
+    }
+    char nm[64]; snprintf(nm, sizeof nm, "%08x%08x.romfs", hi, lo); sys_path(sp, sizeof sp, nm);
+    if ((f = romfs_image(sp))) { LOG(1, "fs: system archive %s", sp); *h = file_open(f); return RES_OK; }
+    LOG(1, "fs: the game asks for title %08x%08x's content, expected at %s", hi, lo, sp);
+    if (getenv("RB_FAKE_SYSARCHIVES")) {                               /* debugging aid only: an all-zero file */
+        f = calloc(1, sizeof *f); f->fd = open("/dev/zero", O_RDONLY); f->size = 0x100000; f->fixed = 1;
+        LOG(1, "fs: RB_FAKE_SYSARCHIVES is set, serving zeros instead");
+        *h = file_open(f); return RES_OK;
+    }
+    return FS_NOT_FOUND;
+}
 static void fs_user(KObject *s, uint32_t *cmd) {
     uint32_t id = cmd[0] >> 16, res, h = 0;
     char path[600];
@@ -341,36 +455,27 @@ static void fs_user(KObject *s, uint32_t *cmd) {
     case 0x0801: case 0x0861: case 0x0862: case 0x080d: reply(cmd, 1, 0); break;
     case 0x080e: { HArchive *a = archive_get(cmd[1]); if (a) a->used = 0; reply(cmd, 1, 0); break; }   /* CloseArchive */
     case 0x0812: reply(cmd, 3, 0); cmd[2] = 0x40000000; cmd[3] = 0; break;   /* GetFreeBytes: 1 GB */
-    case 0x0802:                                                       /* OpenFile */
-        res = host_open(archive_get(cmd[2]), cmd[4], cmd[5], cmd[9], cmd[6], &h);
+    case 0x0802: {                                                     /* OpenFile */
+        HArchive *a = archive_get(cmd[2]);
+        res = a && a->id == 0x2345678a ? content_open(a->tid_lo, a->tid_hi, cmd[5], cmd[9], &h) : host_open(a, cmd[4], cmd[5], cmd[9], cmd[6], &h);
         reply(cmd, 1, 2); cmd[1] = res; cmd[2] = 0x10; cmd[3] = h; break;
+    }
     case 0x0803: {                                                     /* OpenFileDirectly */
         uint32_t arch = cmd[2], ftype = cmd[5], fsize = cmd[6], flags = cmd[7], fptr = cmd[12];
-        if (arch == 3) {                                               /* this title's own data: RomFS */
-            uint32_t kind = fsize >= 4 ? ld32(fptr) : 0;
-            if (kind != 0) LOG(1, "fs: SelfNCCH section %u requested, serving RomFS", kind);
-            LOG(1, "fs: open RomFS (%llu MB)", (unsigned long long)(romfs.size >> 20));
-            res = RES_OK; h = file_open(&romfs);
+        if (arch == 3) {                                               /* this title's own data (SelfNCCH) */
+            uint32_t kind = fsize >= 4 ? ld32(fptr) : 0;               /* 0 RomFS, 5 update RomFS (the base RomFS without one) */
+            if (kind == 5 && update_romfs) {
+                LOG(1, "fs: open the update's RomFS (%llu MB)", (unsigned long long)(update_romfs->size >> 20));
+                res = RES_OK; h = file_open(update_romfs);
+            } else {
+                if (kind != 0 && kind != 5) LOG(1, "fs: SelfNCCH section %u requested, serving RomFS", kind);
+                LOG(1, "fs: open RomFS (%llu MB)%s", (unsigned long long)(romfs.size >> 20), kind == 5 ? " as the update's (no update)" : "");
+                res = RES_OK; h = file_open(&romfs);
+            }
+        } else if (arch == 0x2345678a) {                               /* another title's content */
+            res = cmd[4] >= 8 ? content_open(ld32(cmd[10]), ld32(cmd[10] + 4), fsize, fptr, &h) : FS_NOT_FOUND;
         } else {
             HArchive *a = 0;
-            if (arch == 0x2345678a) {                                  /* content of another (system) title */
-                uint32_t ap = cmd[10];
-                char nm[64], sp[600]; snprintf(nm, sizeof nm, "%08x%08x.romfs", ld32(ap + 4), ld32(ap)); sys_path(sp, sizeof sp, nm);
-                int fd = open(sp, O_RDONLY); struct stat st;
-                if (fd >= 0 && !fstat(fd, &st)) {                      /* user-supplied dump of the system archive's RomFS */
-                    HFile *f = calloc(1, sizeof *f); f->fd = fd; f->size = (uint64_t)st.st_size; f->fixed = 1;
-                    char magic[4] = { 0 };
-                    if (pread(fd, magic, 4, 0) == 4 && !memcmp(magic, "IVFC", 4)) { f->base = 0x1000; f->size -= 0x1000; }   /* skip the hash header */
-                    LOG(1, "fs: system archive %s", sp);
-                    reply(cmd, 1, 2); cmd[2] = 0x10; cmd[3] = file_open(f); break;
-                }
-                LOG(1, "fs: the game asks for system title %08x%08x, expected at %s", ld32(ap + 4), ld32(ap), sp);
-                if (getenv("RB_FAKE_SYSARCHIVES")) {                   /* debugging aid only: an all-zero file */
-                    HFile *f = calloc(1, sizeof *f); f->fd = open("/dev/zero", O_RDONLY); f->size = 0x100000; f->fixed = 1;
-                    LOG(1, "fs: RB_FAKE_SYSARCHIVES is set, serving zeros instead");
-                    reply(cmd, 1, 2); cmd[2] = 0x10; cmd[3] = file_open(f); break;
-                }
-            }
             res = archive_open(arch, cmd[4], cmd[10], &a);
             if (res == RES_OK) { res = host_open(a, ftype, fsize, fptr, flags, &h); a->used = 0; }   /* the archive was only for this open */
         }
@@ -758,4 +863,6 @@ void services_init(const char *dir) {
     romfs.size = romfs_open(dir);
     if (!romfs.size) fatal("cannot open %s/romfs.bin", dir);
     romfs.fixed = 1; romfs.virt = 1;
+    char up[600]; snprintf(up, sizeof up, "%s/update_romfs.bin", dir);
+    if ((update_romfs = romfs_image(up))) LOG(1, "fs: the game has an update (RomFS %llu MB)", (unsigned long long)(update_romfs->size >> 20));
 }

@@ -12,7 +12,7 @@ Seeds come from seeddb.bin (--seeddb, else seeddb.bin in the 3dsrecomp folder, e
 --fetch-seeds, from Nintendo's seed server. Every seed is checked against the hash in the game's header before use,
 so a wrong or tampered seed is rejected.
 """
-import argparse, contextlib, hashlib, io, json, os, ssl, struct, sys, urllib.request
+import argparse, contextlib, hashlib, io, json, os, shutil, ssl, struct, sys, urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import decrypt_cia as D
 from extract_ncch import blz_decode
@@ -102,6 +102,28 @@ def find_seed(tid, check, seeddb, fetch):
     return None
 
 
+def cia_contents(f):
+    """A CIA's contents in TMD order as [(TMD content index, NCCH reader, encrypted)], and the title version."""
+    f.seek(0)
+    head = f.read(0x20)
+    hs, cs, ts, ms = u32(head, 0), u32(head, 8), u32(head, 0xC), u32(head, 0x10)
+    a = D.align64
+    tik = a(a(hs) + cs); tmd = a(tik + ts); con = a(tmd + ms)
+    f.seek(tik); t = f.read(0x300)
+    with contextlib.redirect_stdout(io.StringIO()):                # parse_tmd prints a line per content
+        contents, _ = D.parse_tmd(f, tmd)
+    sig = struct.unpack(">I", D.read_at(f, tmd, 4))[0]
+    version = struct.unpack(">H", D.read_at(f, tmd + 4 + D.SIG_SIZES.get(sig, 0x13C) + 0x9C, 2))[0]
+    ck = D.COMMON_KEYS.get(t[0x1F1], D.COMMON_KEYS[0])
+    tkey = AES.new(ck, AES.MODE_CBC, iv=t[0x1DC:0x1E4] + bytes(8)).decrypt(t[0x1BF:0x1CF])
+    out, off = [], con
+    for cid, cidx, ctype, csz in contents:                         # contents follow each other (sizes are 16-byte multiples)
+        enc = bool(ctype & 1)
+        out.append((cidx, CbcLayer(f, off, csz, tkey, struct.pack(">H", cidx) + bytes(14)) if enc else Plain(f, off, csz), enc))
+        off += csz
+    return out, version
+
+
 def open_ncch(path, f):
     """Returns (NCCH reader, how it was found)."""
     f.seek(0)
@@ -113,19 +135,45 @@ def open_ncch(path, f):
         off, sz = u32(head, 0x120) * MEDIA, u32(head, 0x124) * MEDIA
         return Plain(f, off, sz), "cartridge image (NCSD)"
     if u32(head, 0) == 0x2020:                                     # CIA: header, certs, ticket, TMD, contents
-        hs, cs, ts, ms = u32(head, 0), u32(head, 8), u32(head, 0xC), u32(head, 0x10)
-        a = D.align64
-        tik = a(a(hs) + cs); tmd = a(tik + ts); con = a(tmd + ms)
-        f.seek(tik); t = f.read(0x300)
-        with contextlib.redirect_stdout(io.StringIO()):            # parse_tmd prints a line per content
-            contents, _ = D.parse_tmd(f, tmd)
-        cid, cidx, ctype, csz = contents[0]
-        if not ctype & 1:
-            return Plain(f, con, csz), "CIA (content not encrypted)"
-        ck = D.COMMON_KEYS.get(t[0x1F1], D.COMMON_KEYS[0])
-        tkey = AES.new(ck, AES.MODE_CBC, iv=t[0x1DC:0x1E4] + bytes(8)).decrypt(t[0x1BF:0x1CF])
-        return CbcLayer(f, con, csz, tkey, struct.pack(">H", cidx) + bytes(14)), "CIA (title-key encrypted)"
+        (cidx, src, enc), *_ = cia_contents(f)[0]
+        return src, "CIA (title-key encrypted)" if enc else "CIA (content not encrypted)"
     sys.exit(f"{path}: not a CIA, cartridge image or NCCH")
+
+
+def dump_title(path):
+    """(title id, title version or None) of a dump, read from its headers without extracting anything."""
+    with open(path, "rb") as f:
+        src, _ = open_ncch(path, f)
+        tid = struct.unpack_from("<Q", src.read(0, 0x200), 0x108)[0]
+        version = cia_contents(f)[1] if u32(D.read_at(f, 0, 4)) == 0x2020 else None
+    return tid, version
+
+
+def ncch_keys(n, seeddb=None, fetch=False, quiet=False):
+    """(key for the ExHeader / ExeFS header / icon, key for .code and RomFS) of an NCCH header; None = plaintext."""
+    flags = n[0x188:0x190]
+    tid = struct.unpack_from("<Q", n, 0x108)[0]
+    say = (lambda *a: None) if quiet else print
+    if flags[7] & 0x04:
+        say("encryption: none")
+        return None, None
+    if flags[7] & 0x01:                                            # fixed key (development/system titles)
+        say("encryption: fixed key")
+        return bytes(16), bytes(16)
+    keyy = D.int128(struct.unpack(">QQ", n[:16]))
+    key_main = D.to_bytes(D.derive_key(0x2C, keyy))
+    sec_keyy = keyy
+    if flags[7] & 0x20:
+        seed = find_seed(tid, n[0x114:0x118], seeddb, fetch)
+        if seed is None:
+            sys.exit("this title uses seed encryption and its seed was not found: put seeddb.bin in the 3dsrecomp folder "
+                     "(or pass --seeddb), or use --fetch-seeds")
+        sec_keyy = D.int128(struct.unpack(">QQ", hashlib.sha256(n[:16] + seed).digest()[:16]))
+    slot = D.CRYPTO_MAP.get(flags[3])
+    if slot is None:
+        sys.exit(f"unknown NCCH crypto method {flags[3]:#x}")
+    say(f"encryption: key slot 0x2C, secondary {slot:#x}{' with seed' if flags[7] & 0x20 else ''}")
+    return key_main, D.to_bytes(D.derive_key(slot, sec_keyy))
 
 
 def smdh_names(icon):
@@ -151,29 +199,7 @@ def extract(path, out, seeddb=None, fetch=False, force=False):
         sys.exit(f"{out} is not empty (use --force to overwrite)")
     os.makedirs(out, exist_ok=True)
 
-    # keys
-    if flags[7] & 0x04:
-        key_main = key_sec = None
-        print("encryption: none")
-    else:
-        keyy = D.int128(struct.unpack(">QQ", n[:16]))
-        if flags[7] & 0x01:                                        # fixed key (development/system titles)
-            key_main = key_sec = bytes(16)
-            print("encryption: fixed key")
-        else:
-            key_main = D.to_bytes(D.derive_key(0x2C, keyy))
-            sec_keyy = keyy
-            if flags[7] & 0x20:
-                seed = find_seed(tid, n[0x114:0x118], seeddb, fetch)
-                if seed is None:
-                    sys.exit("this game uses seed encryption and its seed was not found: put seeddb.bin in the 3dsrecomp folder "
-                             "(or pass --seeddb), or use --fetch-seeds")
-                sec_keyy = D.int128(struct.unpack(">QQ", hashlib.sha256(n[:16] + seed).digest()[:16]))
-            slot = D.CRYPTO_MAP.get(flags[3])
-            if slot is None:
-                sys.exit(f"unknown NCCH crypto method {flags[3]:#x}")
-            key_sec = D.to_bytes(D.derive_key(slot, sec_keyy))
-            print(f"encryption: key slot 0x2C, secondary {slot:#x}{' with seed' if flags[7] & 0x20 else ''}")
+    key_main, key_sec = ncch_keys(n, seeddb, fetch)
 
     iv = lambda t: (tid << 64) | (t << 56)
     exh_len = u32(n, 0x180)
@@ -228,9 +254,99 @@ def extract(path, out, seeddb=None, fetch=False, force=False):
     icon = open(os.path.join(out, "icon.bin"), "rb").read() if os.path.exists(os.path.join(out, "icon.bin")) else b""
     info = {"title_id": f"{tid:016x}", "product_code": product, **smdh_names(icon)}
     json.dump(info, open(os.path.join(out, "title.json"), "w"), indent=2, ensure_ascii=False)
+    if kind.startswith("cartridge"):                               # the runtime then runs it as a game card
+        open(os.path.join(out, "cartridge"), "w").write("this game was extracted from a cartridge dump\n")
     print(f"extracted {info.get('title') or product} to {out}: ExeFS {', '.join(sorted(names))}"
           f"{', RomFS %d MB' % (romfs_len >> 20) if romfs_off else ''}")
     return info
+
+
+PROGRAM = ("exheader.bin", "code.bin", "code_decompressed.bin")   # what an update replaces in the game folder
+
+
+def _note(game, **kv):
+    p = os.path.join(game, "title.json")
+    info = json.load(open(p)) if os.path.exists(p) else {}
+    info.update(kv)
+    json.dump(info, open(p, "w"), indent=2, ensure_ascii=False)
+
+
+def add_update(path, game, seeddb=None, fetch=False):
+    """Applies an update dump (title 0004000E xxxxxxxx) to an extracted game folder, as a console runs it: the
+    update's ExHeader and .code replace the program (the base game's are kept in game/base/), the base RomFS stays,
+    and the update's RomFS becomes update_romfs.bin (the game opens it itself as SelfNCCH type 5)."""
+    tmp = game.rstrip("/") + ".update"
+    if os.path.exists(tmp):
+        shutil.rmtree(tmp)
+    info = extract(path, tmp, seeddb, fetch)
+    try:
+        base = os.path.join(game, "base")
+        if not os.path.isdir(base):                                # the first update: keep the base program once
+            os.makedirs(base)
+            for n in PROGRAM:
+                shutil.copy2(os.path.join(game, n), os.path.join(base, n))
+        prog = lambda d: struct.unpack_from("<Q", open(os.path.join(d, "exheader.bin"), "rb").read(), 0x200)[0]
+        if prog(tmp) & 0xFFFFFFFF != prog(base) & 0xFFFFFFFF:      # the same game (unique id), whatever the title type
+            sys.exit(f"{path}: the update's program id {prog(tmp):016x} does not belong to this game ({prog(base):016x})")
+        for n in PROGRAM:
+            os.replace(os.path.join(tmp, n), os.path.join(game, n))
+        # what earlier runs learned about the old program (functions found at run time, modules captured from memory
+        # and their extra functions) names addresses in that program: keep it with it, the new program starts afresh
+        wd = os.path.dirname(os.path.abspath(game))
+        old = os.path.join(base, "learned", f"before_{len(os.listdir(base))}")
+        for n in ("extra_functions.txt", "cro"):
+            if os.path.exists(os.path.join(wd, n)):
+                os.makedirs(old, exist_ok=True)
+                shutil.move(os.path.join(wd, n), os.path.join(old, n))
+                print(f"  {n}: belongs to the previous program, moved to {old}")
+        toml = os.path.join(ROOT, "games", f"{os.path.basename(wd)}.toml")
+        if os.path.exists(toml) and "[functions]" in open(toml).read():
+            print(f"  note: {toml} has [functions] hints, written for the previous program; check them")
+        romfs = os.path.join(tmp, "romfs.bin")
+        if os.path.exists(romfs):
+            os.replace(romfs, os.path.join(game, "update_romfs.bin"))
+        elif os.path.exists(os.path.join(game, "update_romfs.bin")):
+            os.remove(os.path.join(game, "update_romfs.bin"))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    tid, version = dump_title(path)
+    _note(game, update={"title_id": f"{tid:016x}", "version": version, "file": os.path.basename(path)})
+    print(f"update {info['title_id']}{' version %d' % version if version is not None else ''} applied to {game}")
+
+
+def add_dlc(path, game, seeddb=None, fetch=False):
+    """Unpacks a DLC dump (title 0004008C xxxxxxxx, a CIA) into game/dlc/<TMD content index>.romfs: each content's
+    RomFS, decrypted, which the runtime serves through the content archive (0x2345678A) like an installed title."""
+    with open(path, "rb") as f:
+        if u32(D.read_at(f, 0, 4)) != 0x2020:
+            sys.exit(f"{path}: DLC comes as a CIA")
+        contents, version = cia_contents(f)
+        out = os.path.join(game, "dlc"); tmp = out + ".tmp"
+        if os.path.exists(tmp):
+            shutil.rmtree(tmp)
+        os.makedirs(tmp)
+        tid, keys, n_ok = None, None, 0
+        for idx, src, _ in contents:
+            n = src.read(0, 0x200)
+            if n[0x100:0x104] != b"NCCH":
+                sys.exit(f"{path}: content {idx} is not a valid NCCH (wrong key or damaged dump)")
+            tid = struct.unpack_from("<Q", n, 0x108)[0]
+            _, key = ncch_keys(n, seeddb, fetch, quiet=True)
+            off, ln = u32(n, 0x1B0) * MEDIA, u32(n, 0x1B4) * MEDIA
+            if not off:
+                continue
+            class R:
+                def read(self, o, k, off=off): return src.read(off + o, k)
+            if ctr_read(R(), 0, 4, key, (tid << 64) | (3 << 56)) != b"IVFC":
+                sys.exit(f"{path}: content {idx}'s RomFS does not decrypt to IVFC (wrong key or seed)")
+            with open(os.path.join(tmp, f"{idx}.romfs"), "wb") as o:
+                ctr_copy(R(), 0, ln, key, (tid << 64) | (3 << 56), o)
+            n_ok += 1
+    if os.path.exists(out):
+        shutil.rmtree(out)
+    os.replace(tmp, out)
+    _note(game, dlc={"title_id": f"{tid:016x}", "version": version, "contents": n_ok, "file": os.path.basename(path)})
+    print(f"DLC {tid:016x} version {version}: {n_ok} contents unpacked to {out}")
 
 
 def main(argv=None):

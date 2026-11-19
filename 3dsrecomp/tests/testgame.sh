@@ -13,7 +13,7 @@ else
     [ -f "$G/exheader.bin" ] || { echo "no extracted game in $G"; exit 1; }
 fi
 mkdir -p "$T"
-for f in banner.bin code.bin code_decompressed.bin exheader.bin icon.bin romfs.bin sysarchives; do
+for f in banner.bin code.bin code_decompressed.bin exheader.bin icon.bin romfs.bin update_romfs.bin dlc cartridge sysarchives; do
     [ -e "$G/$f" ] && [ ! -e "$T/$f" ] && ln -s "$PWD/$G/$f" "$T/$f"
 done
 rm -rf "${T:?}/save" "${T:?}/extdata" "${T:?}/extdata_shared" "${T:?}/cecd" "${T:?}/sdmc" "${T:?}/romfs_override" "${T:?}/amiibo"

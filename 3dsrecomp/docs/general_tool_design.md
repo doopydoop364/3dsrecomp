@@ -229,3 +229,30 @@ Smash's one module is not a plain `.cro` file in its RomFS, so modules are captu
 - Function lookup: an address outside the main program is looked up in the loaded modules (by range) and their
   offset tables. A module that loads without compiled code is saved to `work/<id>/cro/<name>.cro` and reported;
   `3dsrecomp run` rebuilds with it and restarts, like the missing-function loop.
+
+## 12. Updates and DLC (2026-11-19)
+
+**How a console runs them** (Azahar's `loader/ncch.cpp`, `archive_selfncch.cpp`, `archive_ncch.cpp`, read for this):
+an installed update (title `0004000E` + the game's low word) supplies the ExHeader and `.code` that run; the game's
+RomFS stays the base one (SelfNCCH type 0) and the game opens the update's RomFS itself as SelfNCCH type 5 (the base
+RomFS when there is no update) and layers the two. DLC (`0004008C` + low word) is read through the content archive
+`0x2345678A`: archive path {title id, media type}, file path {open type, TMD content index, section, ExeFS name};
+a content that is not installed is "not found". Games may also ask `am:app` about DLC; none of the library does.
+
+**What 3dsrecomp does.**
+- `3dsrecomp build|run` take several dumps (`run game.cia update.cia dlc.cia`) and also pick up an update or DLC dump
+  lying in the game dump's folder, recognised by title id. Each is added to `work/<id>/game/` once (again only for a
+  newer title version; `title.json` records what was added).
+- Update: its ExHeader, `code.bin` and `code_decompressed.bin` replace the game's (the base ones are kept in
+  `game/base/`), its RomFS becomes `game/update_romfs.bin`. Discovery, recompilation and the stage cache follow the
+  program files, so the update's code is what gets recompiled; CRO modules come from the update's RomFS first.
+- DLC: every content's RomFS, decrypted, as `game/dlc/<TMD content index>.romfs` (indices, not content ids: they
+  differ when ids are skipped).
+- Runtime: SelfNCCH type 5 serves `update_romfs.bin` when present; archive `0x2345678A` serves the game's DLC
+  contents and the system archives, all from their IVFC level-3 data (the exact level-3 size from the IVFC header).
+
+**Findings.** Smash's DLC dump (139 contents) holds no fighter data: every content but the index (content 0: icons,
+content info) is a 14-byte "content data" marker of ownership. The fighters come with the game's update, and the
+library's Smash (title version 2080) has no update dump, so its code never asks for DLC. Checked without it: the
+update path end to end with a stand-in (the base dump extracted as an update; Smash running with the base RomFS
+served as the update RomFS); the DLC unpacking (all 139 contents decrypt to IVFC).

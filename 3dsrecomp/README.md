@@ -27,6 +27,9 @@ one-command tool for any CIA is in `docs/general_tool_design.md` (section 10).
 ## Play a game (one command)
     ./3dsrecomp run "My Game.cia"              # first time: extract, discover, recompile, compile (about a minute)
     ./3dsrecomp run 0004000000183600 --scale 2 # later: by title id; game options are passed through
+    ./3dsrecomp run "My Game.cia" "My Game Update.cia" "My Game DLC.cia"   # with its update and DLC
+An update or DLC dump in the same folder as the game's dump is found by its title id and added too (once; a newer
+version replaces it). The update's program is what gets recompiled; DLC contents go to `work/<title id>/game/dlc/`.
 Everything for a game lives in `work/<title id>/`: `game/` (its data, saves, amiibo), `gen/` and `obj/` (generated
 code), `native` (the executable). `./3dsrecomp build` does everything but start the game. Each stage is skipped when its
 inputs did not change. If the game reaches code the analysis missed, `run` adds it to `work/<title id>/extra_functions.txt`,

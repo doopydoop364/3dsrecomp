@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """3dsrecomp: native Linux builds of your own 3DS game dumps.
 
-    3dsrecomp run <dump | title id> [game options]   build if needed, then play (e.g. --scale 2, --fullscreen)
-    3dsrecomp build <dump | title id>                 extract, discover, recompile and compile into work/<title id>/
+    3dsrecomp run <dump... | title id> [game options]  build if needed, then play (e.g. --scale 2, --fullscreen)
+    3dsrecomp build <dump... | title id>               extract, discover, recompile and compile into work/<title id>/
     3dsrecomp extract <dump> [--out DIR]              only decrypt and unpack a .cia / .3ds / .cxi into a game folder
     3dsrecomp info <dump>                             show what a dump is (title, encryption) without extracting
 
 Everything for a game lives in work/<title id>/: game/ (its data and saves), gen/ and obj/ (generated code), native
 (the executable). Each stage is skipped when its inputs did not change. If the game reaches code the analysis missed,
 run records it, rebuilds and starts the game again.
+
+Updates and DLC: give their dumps after the game's (3dsrecomp run game.cia update.cia dlc.cia), or keep them in the
+same folder as the game's dump, where they are found by title id. They are added to work/<title id>/game/ once (an
+update's program replaces the game's, the base program stays in game/base/; DLC goes to game/dlc/).
 """
 import glob, hashlib, os, re, subprocess, sys
 
@@ -28,28 +32,74 @@ def info(argv):
     tid = struct.unpack_from("<Q", n, 0x108)[0]
     enc = "none" if flags[7] & 0x04 else "fixed key" if flags[7] & 0x01 else \
           f"key slot 0x2C / {X.D.CRYPTO_MAP.get(flags[3], 0):#x}" + (" with seed" if flags[7] & 0x20 else "")
-    print(json.dumps({"file": argv[0], "container": kind, "title_id": f"{tid:016x}",
+    version = X.dump_title(argv[0])[1]
+    print(json.dumps({"file": argv[0], "container": kind, "title_id": f"{tid:016x}", "version": version,
+                      "kind": {0x0004000E: "update", 0x0004008C: "DLC"}.get(tid >> 32, "game"),
                       "product_code": n[0x150:0x160].rstrip(b"\0").decode("ascii", "replace"), "encryption": enc}, indent=2))
 
 
-def resolve(target):
-    """A dump file (extracted on first use), a title id, or a game folder -> title id (16 hex digits)."""
-    import struct
+UPDATE_HI, DLC_HI = 0x0004000E, 0x0004008C
+DUMP_EXT = (".cia", ".3ds", ".cci", ".cxi")
+
+
+def _is_target(a):
+    return bool(re.fullmatch(r"[0-9a-fA-F]{16}", a)) or (os.path.isfile(a) and a.lower().endswith(DUMP_EXT))
+
+
+def resolve(targets):
+    """Dump files (the game, its update, its DLC) or a title id -> the game's title id (16 hex digits).
+
+    The game is extracted on first use. An update (title 0004000E...) or DLC (0004008C...) dump given here, or lying
+    in the same folder as the game's dump, is added to the game folder (again only when it is a newer version)."""
     import extract as X
-    if re.fullmatch(r"[0-9a-fA-F]{16}", target):
-        tid = target.lower()
-        if not os.path.exists(os.path.join(ROOT, "work", tid, "game", "exheader.bin")):
-            sys.exit(f"no extracted game for {tid} in work/: give the dump file instead")
-        return tid
-    if os.path.isfile(target):
-        with open(target, "rb") as f:
-            src, _ = X.open_ncch(target, f)
-            tid = f"{struct.unpack_from('<Q', src.read(0, 0x200), 0x108)[0]:016x}"
-        game = os.path.join(ROOT, "work", tid, "game")
-        if not os.path.exists(os.path.join(game, "exheader.bin")):
-            X.extract(target, game)
-        return tid
-    sys.exit(f"{target}: not a dump file or title id")
+    tid, game_dump, addons, seen = None, None, [], set()
+    for t in targets:
+        if re.fullmatch(r"[0-9a-fA-F]{16}", t):
+            tid = t.lower()
+            continue
+        if not os.path.isfile(t):
+            sys.exit(f"{t}: not a dump file or title id")
+        t_id, ver = X.dump_title(t)
+        seen.add(os.path.realpath(t))
+        if t_id >> 32 in (UPDATE_HI, DLC_HI):
+            addons.append((t, t_id, ver))
+            t_id = 0x00040000 << 32 | (t_id & 0xFFFFFFFF)
+        else:
+            game_dump = t
+        if tid and tid != f"{t_id:016x}":
+            sys.exit(f"{t} belongs to title {t_id:016x}, not {tid}")
+        tid = f"{t_id:016x}"
+    if tid is None:
+        sys.exit("no game given")
+    if game_dump:                                    # an update or DLC lying next to the game's dump
+        folder = os.path.dirname(os.path.abspath(game_dump))
+        for p in sorted(os.listdir(folder)):
+            full = os.path.join(folder, p)
+            if not p.lower().endswith(DUMP_EXT) or os.path.realpath(full) in seen or not os.path.isfile(full):
+                continue
+            try:
+                t_id, ver = X.dump_title(full)
+            except (SystemExit, Exception):
+                continue
+            if t_id >> 32 in (UPDATE_HI, DLC_HI) and f"{0x00040000 << 32 | (t_id & 0xFFFFFFFF):016x}" == tid:
+                addons.append((full, t_id, ver))
+    game = os.path.join(ROOT, "work", tid, "game")
+    if not os.path.exists(os.path.join(game, "exheader.bin")):
+        if not game_dump:
+            sys.exit(f"no extracted game for {tid} in work/: give the game's dump file too")
+        X.extract(game_dump, game)
+    import json
+    have = json.load(open(os.path.join(game, "title.json"))) if os.path.exists(os.path.join(game, "title.json")) else {}
+    for path, t_id, ver in sorted(addons, key=lambda a: a[1] >> 32):
+        key, add = ("update", X.add_update) if t_id >> 32 == UPDATE_HI else ("dlc", X.add_dlc)
+        old = have.get(key, {})
+        if (old.get("version") is not None and ver is not None and ver <= old["version"]) or \
+           (ver is None and old.get("file") == os.path.basename(path)):
+            continue                                 # already added (or a newer one is)
+        print(f"3dsrecomp: adding {'the update' if key == 'update' else 'DLC'} {os.path.basename(path)}"
+              f"{' (version %d)' % ver if ver is not None else ''}", flush=True)
+        add(path, game)
+    return tid
 
 
 def _hash_files(paths):
@@ -66,17 +116,20 @@ def modules(tid):
     sys.path.insert(0, os.path.join(ROOT, "analyze"))
     import cro as C
     wd = os.path.join(ROOT, "work", tid)
-    files = C.romfs_files(os.path.join(wd, "game", "romfs.bin"), lambda p: p.lower().endswith((".cro", ".crs")))
     crs, mods = None, {}
-    for p, b in files:
-        try:
-            m = C.Cro(b, is_crs=p.lower().endswith(".crs"))
-        except ValueError:
+    for romfs in ("update_romfs.bin", "romfs.bin"):    # an update's modules replace the game's
+        path = os.path.join(wd, "game", romfs)
+        if not os.path.exists(path):
             continue
-        if m.is_crs:
-            crs = m
-        else:
-            mods.setdefault(m.name, b)
+        for p, b in C.romfs_files(path, lambda p: p.lower().endswith((".cro", ".crs"))):
+            try:
+                m = C.Cro(b, is_crs=p.lower().endswith(".crs"))
+            except ValueError:
+                continue
+            if m.is_crs:
+                crs = crs or m
+            else:
+                mods.setdefault(m.name, b)
     for p in sorted(glob.glob(os.path.join(wd, "cro", "*.cro"))):
         try:
             m = C.Cro(open(p, "rb").read())
@@ -215,14 +268,17 @@ def main():
         X.main(rest)
     elif cmd == "info":
         info(rest)
-    elif cmd == "build":
-        if len(rest) != 1:
-            sys.exit("usage: 3dsrecomp build <dump | title id>")
-        build(resolve(rest[0]))
-    elif cmd == "run":
-        if not rest:
-            sys.exit("usage: 3dsrecomp run <dump | title id> [game options]")
-        sys.exit(run(resolve(rest[0]), rest[1:]))
+    elif cmd in ("build", "run"):
+        n = 0
+        while n < len(rest) and _is_target(rest[n]):
+            n += 1
+        if not n or (cmd == "build" and n != len(rest)):
+            sys.exit(f"usage: 3dsrecomp {cmd} <dump... | title id>{' [game options]' if cmd == 'run' else ''}")
+        tid = resolve(rest[:n])
+        if cmd == "build":
+            build(tid)
+        else:
+            sys.exit(run(tid, rest[n:]))
     else:
         sys.exit(f"unknown command '{cmd}' (try 3dsrecomp --help)")
 

@@ -12,8 +12,8 @@ tool are in `general_tool_design.md` section 10.
 16-bit Thumb (ARMv6K has no Thumb-2) beside ARM in the recompiler and in discovery; interworking through function
 keys (bit 0 = Thumb). Every completed Thumb run of Tomodachi Life matches Unicorn (difftest --thumb).
 Tomodachi Life boots to its first-run screens (touch works); Monster Hunter 4 Ultimate runs (needed geometry
-shaders); Smash runs until it loads its CRO module (phase 7). Open: Tomodachi Life reports demo-version data on a
-fresh console (not understood yet); APT Wrap is a stub (called 520 times by Tomodachi Life).
+shaders); Smash runs until it loads its CRO module (phase 7). Closed 2026-11-19: APT Wrap/Unwrap are implemented
+(AES-CCM); Tomodachi Life's "demo-version data has been found" on a fresh console is what Azahar shows too.
 
 ## 2. Phase 7: CRO modules — *done (2026-11-18)*
 `ldr:ro` in the runtime (Azahar's rules, our code); module code recompiled once, position-independent (every address
@@ -21,10 +21,14 @@ is the module's current base plus an offset), so modules run wherever and howeve
 Smash reaches its character select; Pokémon X plays its intro with modules loading, unloading and reloading.
 Design and findings: `general_tool_design.md` section 11.
 
-## 3. Updates and DLC
-`3dsrecomp` takes the base game plus update (0004000E) and DLC (0004008C) dumps together. The update's program
-replaces the base program before discovery; its RomFS patches the base RomFS; DLC content is served through
-`am`/`fs` like on a console. Smash's DLC is in the library.
+## 3. Updates and DLC — *done (2026-11-19), waiting for a real update dump to test end to end*
+`3dsrecomp build|run` take the game plus update (0004000E) and DLC (0004008C) dumps, given together or lying in the
+same folder. The update's ExHeader and code replace the program before discovery (base kept in `game/base/`); its
+RomFS is served as SelfNCCH type 5 (the game layers it over the base RomFS itself, as on a console); DLC contents are
+served through the content archive 0x2345678A by content index. Design and findings: `general_tool_design.md`
+section 12. Smash's DLC (139 contents) is unpacked, but its contents are only ownership markers: the fighters come
+with the update, which is not in the library, so the base program never asks for DLC. `am:app` is not implemented
+(no library game opens it).
 
 ## 4. GPU features
 1. Geometry shaders — *point mode done (2026-11-17)*; variable-primitive and subdivision modes still log and skip.
