@@ -119,6 +119,7 @@ static void texture_copy(uint32_t in, uint32_t out, uint32_t size, uint32_t in_w
 }
 
 static void run_queue(void) {
+    static int log_sync = -1; if (log_sync < 0) log_sync = getenv("RB_LOG_SYNC") != 0;   /* trace GX operations with the surface cache */
     uint8_t *q = gsp_mem->mem + 0x800;
     vkr_new_gen();                                                     /* the guest CPU ran since the last batch */
     while (q[1]) {
@@ -140,11 +141,13 @@ static void run_queue(void) {
             if (c[4] && !vkr_fill(c[4], c[6], c[5], c[7] >> 16)) { vkr_why = 2; vkr_sync_range(c[4], c[6] - c[4], 1); memory_fill(c[4], c[5], c[6], c[7] >> 16); }
             if (c[1]) irq(IRQ_PSC0); else if (c[4]) irq(IRQ_PSC1);
             break;
-        case 3: { uint32_t ib = bpp_of[(c[5] >> 8) & 7], ob = bpp_of[(c[5] >> 12) & 7];
+        case 3: { if (log_sync) fprintf(stderr, "xfer: frame %llu %08x -> %08x %ux%u -> %ux%u flags %08x\n", (unsigned long long)frames, c[1], c[2], c[3] & 0xffff, c[3] >> 16, c[4] & 0xffff, c[4] >> 16, c[5]);
+                  uint32_t ib = bpp_of[(c[5] >> 8) & 7], ob = bpp_of[(c[5] >> 12) & 7];
                   if (vkr_display_link(c[1], c[2], c[3] & 0xffff, c[3] >> 16, c[4] & 0xffff, c[4] >> 16, c[5])) { irq(IRQ_PPF); break; }   /* shown from the GPU */
                   vkr_why = 3; vkr_sync_range(c[1], (c[3] & 0xffff) * (c[3] >> 16) * ib, 0); vkr_why = 3; vkr_sync_range(c[2], (c[4] & 0xffff) * (c[4] >> 16) * ob, 1); }
                 { uint64_t t0 = host_ns(); display_transfer(c[1], c[2], c[3], c[4], c[5]); ns_transfer += host_ns() - t0; irq(IRQ_PPF); break; }
-        case 4: { uint32_t span = c[3] * 2 + 0x100000; vkr_why = 4; vkr_sync_range(c[1], span, 0); vkr_why = 4; vkr_sync_range(c[2], span, 1); }   /* gaps: generous span */
+        case 4: { if (log_sync) fprintf(stderr, "copy: frame %llu %08x -> %08x size %x in %08x out %08x\n", (unsigned long long)frames, c[1], c[2], c[3], c[4], c[5]);
+                  uint32_t span = c[3] * 2 + 0x100000; vkr_why = 4; vkr_sync_range(c[1], span, 0); vkr_why = 4; vkr_sync_range(c[2], span, 1); }   /* gaps: generous span */
                 texture_copy(c[1], c[2], c[3], c[4], c[5]); irq(IRQ_PPF); break;
         case 5: break;
         default: LOG(1, "gx: unknown command %u", id);

@@ -6,7 +6,12 @@
  *    else needs those bytes: a GX transfer, copy or partial fill, a texture read, or the display;
  *  - a clean surface is re-checked against guest memory (hash) on its first use after each guest
  *    submission, and re-uploaded if the memory changed;
- *  - only one surface may cover a byte range: an overlapping new surface replaces the old one.
+ *  - surfaces may overlap (games reuse VRAM for targets of other sizes, mipmap chains, depth buffers at several
+ *    sizes). A surface is dirty only in the rows it has drawn (ry0..ry1, whole 8-line tile rows), and dirty rows of
+ *    different surfaces never overlap: the newest drawer owns those bytes. A draw into bytes another surface owns takes
+ *    them over: copied tile for tile on the GPU when both have the same guest format (8x8 tiles are contiguous in
+ *    memory whatever the width), else written back through memory. Reads of a surface (render to texture, display)
+ *    first copy in what other surfaces own inside it. RB_NO_OVERLAP=1: the old rule, one surface per byte range.
  * Textures are decoded on the CPU (pica.c's decoder) and cached by address, size, format and content.
  * RB_VK_VALIDATE=1 enables the Khronos validation layer; RB_VK_DEVICE=n picks a GPU. */
 #include "host.h"
@@ -115,7 +120,7 @@ static void end_render(void) {
 }
 
 typedef struct Surf Surf;
-typedef struct { Surf *s; VkDeviceSize off, soff, hoff; int native, hi; } Pending;
+typedef struct { Surf *s; VkDeviceSize off, soff, hoff; int native, hi; uint32_t y0, y1; } Pending;
 static Pending pend[64]; static int npend;
 static void finish_downloads(void);
 static uint64_t nstale;
@@ -250,41 +255,78 @@ static uint64_t hash_mem(const uint8_t *p, size_t n) {
  * image: write-backs average each scale x scale block (colour) or take its centre sample (depth, stencil). */
 static uint32_t scale = 1;
 struct Surf { int used, depth; uint32_t addr, size, w, h, fmt; Img im; int dirty; uint64_t hash, checked, last;
-              int display; uint8_t *hires; uint64_t hires_gen; Img small; uint64_t ver; };   /* ver: draws into it so far */   /* small: native-size copy target (scale > 1) */   /* display: last download kept at full resolution */
+              int display; uint8_t *hires; uint64_t hires_gen; Img small; uint64_t ver;
+              uint32_t ry0, ry1; int recheck, mark, stale, hashed; };
+/* ry0..ry1: dirty image rows; recheck: memory under a dirty surface's clean rows may have changed; stale: its clean rows
+ * differ from memory (reload them at the next check); hashed: hash covers the current clean rows; mark: claim's scratch */   /* ver: draws into it so far */   /* small: native-size copy target (scale > 1) */   /* display: last download kept at full resolution */
 #define NSURF 64
 static Surf surf[NSURF];
+static int log_sync(void) { static int ls = -1; if (ls < 0) ls = getenv("RB_LOG_SYNC") != 0; return ls; }   /* RB_LOG_SYNC=1: trace the surface cache */
 static int overlaps(uint32_t a, uint32_t an, uint32_t b, uint32_t bn) { return a < b + bn && b < a + an; }
+static uint32_t sbpp(const Surf *s) { return s->depth ? dbpp[s->fmt & 3] : cbpp[s->fmt & 7]; }
+/* Image rows y0..y1 (multiples of 8; image row = PICA y, counted from the bottom) -> guest bytes lo..hi. */
+static void rows_bytes(const Surf *s, uint32_t y0, uint32_t y1, uint32_t *lo, uint32_t *hi) {
+    if (s->h & 7) { *lo = s->addr; *hi = s->addr + s->size; return; }
+    uint32_t R = s->w * 8 * sbpp(s);
+    *lo = s->addr + (s->h - y1) / 8 * R; *hi = s->addr + (s->h - y0) / 8 * R;
+}
+static void bytes_rows(const Surf *s, uint32_t lo, uint32_t hi, uint32_t *y0, uint32_t *y1) {   /* whole tile rows */
+    uint32_t R = s->w * 8 * sbpp(s);
+    *y0 = s->h - (hi - s->addr) / R * 8; *y1 = s->h - (lo - s->addr) / R * 8;
+}
+static void dirty_bytes(const Surf *s, uint32_t *lo, uint32_t *hi) { rows_bytes(s, s->ry0, s->ry1, lo, hi); }
+static int dirty_overlaps(const Surf *s, uint32_t a, uint32_t n) {
+    if (!s->dirty) return 0;
+    uint32_t lo, hi; dirty_bytes(s, &lo, &hi);
+    return overlaps(a, n, lo, hi - lo);
+}
+/* Hash of the guest memory under the surface's clean rows. */
+static uint64_t hash_clean(const Surf *s) {
+    const uint8_t *m = (const uint8_t *)(uintptr_t)s->addr;
+    if (!s->dirty) return hash_mem(m, s->size);
+    uint32_t lo, hi; dirty_bytes(s, &lo, &hi);
+    return hash_mem(m, lo - s->addr) * 31 + hash_mem(m + (hi - s->addr), s->addr + s->size - hi);
+}
+/* Same guest format and tile grid: an 8x8 tile is 64 * bpp contiguous bytes in both, so bytes map tile to tile. */
+static int tile_compat(const Surf *a, const Surf *b) {
+    if (a->depth != b->depth || a->fmt != b->fmt || (a->w | a->h | b->w | b->h) & 7) return 0;
+    uint32_t d = a->addr > b->addr ? a->addr - b->addr : b->addr - a->addr;
+    return d % (64 * sbpp(a)) == 0;
+}
+static int no_overlap(void) { static int v = -1; if (v < 0) v = getenv("RB_NO_OVERLAP") != 0; return v; }
 
 static void queue_download(Surf *s) {
     begin_cmd(); end_render();
-    uint32_t W = s->w * scale, H = s->h * scale;
+    uint32_t y0 = s->ry0, y1 = s->ry1;                             /* only the dirty rows go back to memory */
+    if (s->h & 7) { y0 = 0; y1 = s->h; }
+    uint32_t W = s->w * scale, H = (y1 - y0) * scale; int32_t Y = (int32_t)(y0 * scale);
     VkDeviceSize n = (VkDeviceSize)W * H;
     Pending *p = &pend[npend];
     memset(p, 0, sizeof *p);
+    p->y0 = y0; p->y1 = y1;
     if (s->depth && s->fmt != 0) {
         p->off = ring_alloc(&rbk, n * 4); p->soff = ring_alloc(&rbk, n);
-        VkBufferImageCopy c[2] = { { .bufferOffset = p->off, .imageSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 }, .imageExtent = { W, H, 1 } },
-                                   { .bufferOffset = p->soff, .imageSubresource = { VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1 }, .imageExtent = { W, H, 1 } } };
+        VkBufferImageCopy c[2] = { { .bufferOffset = p->off, .imageSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 }, .imageOffset = { 0, Y, 0 }, .imageExtent = { W, H, 1 } },
+                                   { .bufferOffset = p->soff, .imageSubresource = { VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1 }, .imageOffset = { 0, Y, 0 }, .imageExtent = { W, H, 1 } } };
         vkCmdCopyImageToBuffer(cmd, s->im.img, VK_IMAGE_LAYOUT_GENERAL, rbk.buf, 2, c);
     } else if (!s->depth && scale > 1) {                          /* colour: average on the GPU, read back native size */
         if (!s->small.img) mkimg(&s->small, s->w, s->h, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
-        VkImageBlit b = { .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .srcOffsets = { { 0, 0, 0 }, { (int32_t)W, (int32_t)H, 1 } },
-                          .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .dstOffsets = { { 0, 0, 0 }, { (int32_t)s->w, (int32_t)s->h, 1 } } };
+        VkImageBlit b = { .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .srcOffsets = { { 0, Y, 0 }, { (int32_t)W, Y + (int32_t)H, 1 } },
+                          .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .dstOffsets = { { 0, (int32_t)y0, 0 }, { (int32_t)s->w, (int32_t)y1, 1 } } };
         vkCmdBlitImage(cmd, s->im.img, VK_IMAGE_LAYOUT_GENERAL, s->small.img, VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_LINEAR);
         barrier();
-        p->off = ring_alloc(&rbk, (VkDeviceSize)s->w * s->h * 4); p->native = 1;
-        VkBufferImageCopy c = { .bufferOffset = p->off, .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { s->w, s->h, 1 } };
+        p->off = ring_alloc(&rbk, (VkDeviceSize)s->w * (y1 - y0) * 4); p->native = 1;
+        VkBufferImageCopy c = { .bufferOffset = p->off, .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageOffset = { 0, (int32_t)y0, 0 }, .imageExtent = { s->w, y1 - y0, 1 } };
         vkCmdCopyImageToBuffer(cmd, s->small.img, VK_IMAGE_LAYOUT_GENERAL, rbk.buf, 1, &c);
         if (s->display) {                                          /* the window shows this one at full resolution */
-            p->hoff = ring_alloc(&rbk, n * 4); p->hi = 1;
-            VkBufferImageCopy h = { .bufferOffset = p->hoff, .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { W, H, 1 } };
+            p->hoff = ring_alloc(&rbk, (VkDeviceSize)W * s->h * scale * 4); p->hi = 1;
+            VkBufferImageCopy h = { .bufferOffset = p->hoff, .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { W, s->h * scale, 1 } };
             vkCmdCopyImageToBuffer(cmd, s->im.img, VK_IMAGE_LAYOUT_GENERAL, rbk.buf, 1, &h);
         }
     } else {
         p->off = ring_alloc(&rbk, n * 4);
-        VkBufferImageCopy c = { .bufferOffset = p->off, .imageSubresource = { s->depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { W, H, 1 } };
+        VkBufferImageCopy c = { .bufferOffset = p->off, .imageSubresource = { s->depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageOffset = { 0, Y, 0 }, .imageExtent = { W, H, 1 } };
         vkCmdCopyImageToBuffer(cmd, s->im.img, VK_IMAGE_LAYOUT_GENERAL, rbk.buf, 1, &c);
-        p->hoff = p->off; p->hi = 1;
     }
     p->s = s; npend++;
     ndownloads++;
@@ -295,22 +337,23 @@ static void finish_downloads(void) {
         Surf *s = pend[i].s;
         uint8_t *mem = (uint8_t *)(uintptr_t)s->addr;
         const uint8_t *src = rbk.map + pend[i].off, *st = rbk.map + pend[i].soff;
-        uint32_t S = pend[i].native ? 1 : scale, W = s->w * S, c = S / 2;
-        for (uint32_t y = 0; y < s->h; y++)
+        uint32_t S = pend[i].native ? 1 : scale, W = s->w * S, c = S / 2, y0 = pend[i].y0, y1 = pend[i].y1;
+        for (uint32_t y = y0; y < y1; y++)
             for (uint32_t x = 0; x < s->w; x++) {
+                uint32_t ry = y - y0;                              /* row in the read-back rows */
                 if (!s->depth) {
                     uint8_t px[4];
-                    if (S == 1) memcpy(px, src + 4 * (y * W + x), 4);
+                    if (S == 1) memcpy(px, src + 4 * (ry * W + x), 4);
                     else {
                         uint32_t acc[4] = { 0, 0, 0, 0 };
                         for (uint32_t j = 0; j < S; j++)
-                            for (uint32_t i2 = 0; i2 < S; i2++) { const uint8_t *q = src + 4 * ((y * S + j) * W + x * S + i2); for (int k = 0; k < 4; k++) acc[k] += q[k]; }
+                            for (uint32_t i2 = 0; i2 < S; i2++) { const uint8_t *q = src + 4 * ((ry * S + j) * W + x * S + i2); for (int k = 0; k < 4; k++) acc[k] += q[k]; }
                         for (int k = 0; k < 4; k++) px[k] = (uint8_t)((acc[k] + S * S / 2) / (S * S));
                     }
                     color_write(mem + tile_off(s->w, s->h, x, y, cbpp[s->fmt]), s->fmt, px);
                     continue;
                 }
-                uint32_t k = (y * S + c) * W + x * S + c;
+                uint32_t k = (ry * S + c) * W + x * S + c;
                 uint8_t *p = mem + tile_off(s->w, s->h, x, y, dbpp[s->fmt]);
                 if (s->fmt == 0) { memcpy(p, src + 2 * k, 2); continue; }
                 uint32_t d;
@@ -324,20 +367,29 @@ static void finish_downloads(void) {
             if (!s->hires) s->hires = malloc(n);
             if (s->hires) { memcpy(s->hires, rbk.map + pend[i].hoff, n); s->hires_gen++; }
         }
-        s->dirty = 0; s->hash = hash_mem(mem, s->size); s->checked = gen;
-        invalidate_textures(s->addr, s->size);
+        uint32_t lo, hi; rows_bytes(s, y0, y1, &lo, &hi);
+        s->dirty = 0; s->recheck = 0; s->checked = gen;
+        if (!s->stale) { s->hash = hash_mem(mem, s->size); s->hashed = 1; }   /* image == memory everywhere */
+        invalidate_textures(lo, hi - lo);
+        for (int k = 0; k < NSURF; k++) {                          /* surfaces that also cover those bytes: re-check */
+            Surf *o = &surf[k];
+            if (o != s && o->used && overlaps(lo, hi - lo, o->addr, o->size)) { o->checked = 0; o->recheck = 1; }
+        }
     }
     npend = 0;
 }
-static void upload_surface(Surf *s) {
+/* Upload image rows y0..y1 from guest memory. */
+static void upload_rows(Surf *s, uint32_t y0, uint32_t y1) {
+    if (y1 <= y0) return;
+    if (log_sync()) fprintf(stderr, "up: frame %llu %s %08x %ux%u fmt %u rows %u..%u\n", (unsigned long long)gpu_frame(), s->depth ? "depth" : "colour", s->addr, s->w, s->h, s->fmt, y0, y1);
     begin_cmd(); end_render();
     const uint8_t *mem = (const uint8_t *)(uintptr_t)s->addr;
-    uint32_t S = scale, W = s->w * S, H = s->h * S;
+    uint32_t S = scale, W = s->w * S, H = (y1 - y0) * S; int32_t Y = (int32_t)(y0 * S);
     VkDeviceSize n = (VkDeviceSize)W * H;
     VkDeviceSize off = ring_alloc(&ring, n * 4), soff = 0;
     uint8_t *dst = ring.map + off, *sdst = 0;
     if (s->depth && s->fmt != 0) { soff = ring_alloc(&ring, n); sdst = ring.map + soff; }
-    for (uint32_t y = 0; y < s->h; y++)
+    for (uint32_t y = y0; y < y1; y++)
         for (uint32_t x = 0; x < s->w; x++) {
             uint8_t v[4] = { 0, 0, 0, 0 }, sv = 0; int vb = 4;
             if (!s->depth) color_read(mem + tile_off(s->w, s->h, x, y, cbpp[s->fmt]), s->fmt, v);
@@ -353,17 +405,17 @@ static void upload_surface(Surf *s) {
             }
             for (uint32_t j = 0; j < S; j++)
                 for (uint32_t i2 = 0; i2 < S; i2++) {
-                    uint32_t k = (y * S + j) * W + x * S + i2;
+                    uint32_t k = ((y - y0) * S + j) * W + x * S + i2;
                     memcpy(dst + (size_t)vb * k, v, (size_t)vb);
                     if (sdst) sdst[k] = sv;
                 }
         }
     if (s->depth && s->fmt != 0) {
-        VkBufferImageCopy c[2] = { { .bufferOffset = off, .imageSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 }, .imageExtent = { W, H, 1 } },
-                                   { .bufferOffset = soff, .imageSubresource = { VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1 }, .imageExtent = { W, H, 1 } } };
+        VkBufferImageCopy c[2] = { { .bufferOffset = off, .imageSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 }, .imageOffset = { 0, Y, 0 }, .imageExtent = { W, H, 1 } },
+                                   { .bufferOffset = soff, .imageSubresource = { VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1 }, .imageOffset = { 0, Y, 0 }, .imageExtent = { W, H, 1 } } };
         vkCmdCopyBufferToImage(cmd, ring.buf, s->im.img, VK_IMAGE_LAYOUT_GENERAL, 2, c);
     } else {
-        VkBufferImageCopy c = { .bufferOffset = off, .imageSubresource = { s->depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { W, H, 1 } };
+        VkBufferImageCopy c = { .bufferOffset = off, .imageSubresource = { s->depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageOffset = { 0, Y, 0 }, .imageExtent = { W, H, 1 } };
         vkCmdCopyBufferToImage(cmd, ring.buf, s->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
     }
     barrier();
@@ -385,11 +437,11 @@ void vkr_sync_range(uint32_t addr, uint32_t size, int will_write) {
     for (int i = 0; i < NSURF; i++) {
         Surf *s = &surf[i];
         if (!s->used || !overlaps(addr, size, s->addr, s->size)) continue;
-        if (s->dirty) { queue_download(s); any = 1; dl_by[why]++;
+        if (dirty_overlaps(s, addr, size)) { queue_download(s); any = 1; dl_by[why]++;
             static int ls = -1; if (ls < 0) ls = getenv("RB_LOG_SYNC") != 0;
             if (ls) fprintf(stderr, "sync: frame %llu cause %d range %08x+%x surface %08x %ux%u fmt %u%s\n", (unsigned long long)gpu_frame(), why,
                             addr, size, s->addr, s->w, s->h, s->fmt, s->depth ? " depth" : ""); }
-        if (will_write) s->checked = 0;
+        if (will_write) { s->checked = 0; s->recheck = 1; }
     }
     if (any) { submit_wait(); nsyncs++; sync_by[why]++; }
     if (will_write) invalidate_textures(addr, size);
@@ -403,12 +455,14 @@ static Surf *get_surface(uint32_t addr, uint32_t w, uint32_t h, uint32_t fmt, in
         Surf *s = &surf[i];
         if (s->used && s->addr == addr && s->w == w && s->h == h && s->fmt == fmt && s->depth == depth) { s->last = gen; return s; }
     }
-    vkr_why = 6; vkr_sync_range(addr, size, 0);                    /* write back what the new surface replaces */
-    for (int i = 0; i < NSURF; i++) {
-        Surf *s = &surf[i];
-        if (s->used && overlaps(addr, size, s->addr, s->size)) drop_surface(s);
-        if (!s->used && !free_slot) free_slot = s;
+    if (no_overlap()) {                                            /* the old rule: write back and drop what it overlaps */
+        int any = 0;
+        for (int i = 0; i < NSURF; i++)
+            if (surf[i].used && surf[i].dirty && overlaps(addr, size, surf[i].addr, surf[i].size)) { queue_download(&surf[i]); any = 1; }
+        if (any) { submit_wait(); nsyncs++; sync_by[6]++; }
+        for (int i = 0; i < NSURF; i++) if (surf[i].used && overlaps(addr, size, surf[i].addr, surf[i].size)) drop_surface(&surf[i]);
     }
+    for (int i = 0; i < NSURF; i++) if (!surf[i].used && !free_slot) free_slot = &surf[i];
     if (!free_slot) {                                              /* evict the least recently used */
         Surf *lru = &surf[0];
         for (int i = 1; i < NSURF; i++) if (surf[i].last < lru->last) lru = &surf[i];
@@ -424,15 +478,118 @@ static Surf *get_surface(uint32_t addr, uint32_t w, uint32_t h, uint32_t fmt, in
         mkimg(&s->im, w * scale, h * scale, f, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, a);
     } else mkimg(&s->im, w * scale, h * scale, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                  VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
-    s->hash = ~0ull;                                               /* forces the first upload */
+    s->stale = 1;                                                  /* forces the first upload */
     LOG(2, "vulkan: new %s surface %08x %ux%u format %u", depth ? "depth" : "colour", addr, w, h, fmt);
+    if (log_sync()) fprintf(stderr, "surf: frame %llu new %s %08x %ux%u fmt %u\n", (unsigned long long)gpu_frame(), depth ? "depth" : "colour", addr, w, h, fmt);
     return s;
 }
+/* Bring a surface's clean rows up to date with guest memory: a clean surface on its first use after each guest
+ * submission; a dirty one only when something wrote memory under it (recheck). */
 static void validate(Surf *s) {
-    if (!s || s->dirty || s->checked == gen) return;
-    uint64_t h = hash_mem((const uint8_t *)(uintptr_t)s->addr, s->size);
-    if (h != s->hash) upload_surface(s);
-    s->hash = h; s->checked = gen;
+    if (!s || (s->dirty ? !s->recheck : s->checked == gen)) return;
+    uint64_t h = hash_clean(s);
+    if (s->stale || !s->hashed || h != s->hash) {
+        if (!s->dirty) upload_rows(s, 0, s->h);
+        else { upload_rows(s, 0, s->ry0); upload_rows(s, s->ry1, s->h); }
+    }
+    s->hash = h; s->hashed = 1; s->stale = 0; s->checked = gen; s->recheck = 0;
+}
+static void set_dirty(Surf *s, uint32_t y0, uint32_t y1) {
+    if (s->dirty && s->ry0 == y0 && s->ry1 == y1) return;
+    s->dirty = 1; s->ry0 = y0; s->ry1 = y1;
+    s->hashed = 0;                                                 /* clean rows changed: not hashed again until needed */
+}
+
+/* Copy guest bytes lo..hi (whole tiles) from one surface's image to another's, tile for tile (tile_compat). */
+static VkImageCopy *cregs; static uint32_t ncregs_cap; static uint64_t ntilecopies;
+static void copy_tiles(Surf *d, Surf *s, uint32_t lo, uint32_t hi) {
+    uint32_t TB = 64 * sbpp(s);
+    if (lo < s->addr) lo = s->addr;
+    if (lo < d->addr) lo = d->addr;
+    if (hi > s->addr + s->size) hi = s->addr + s->size;
+    if (hi > d->addr + d->size) hi = d->addr + d->size;
+    if (hi <= lo) return;
+    lo = s->addr + (lo - s->addr) / TB * TB; hi = s->addr + (hi - s->addr + TB - 1) / TB * TB;
+    int32_t S = (int32_t)scale; uint32_t sw8 = s->w / 8, dw8 = d->w / 8, n = 0;
+    for (uint32_t b = lo; b < hi; b += TB) {
+        uint32_t si = (b - s->addr) / TB, di = (b - d->addr) / TB;
+        int32_t sx = (int32_t)(si % sw8) * 8 * S, sy = (int32_t)(s->h - 8 - si / sw8 * 8) * S;
+        int32_t dx = (int32_t)(di % dw8) * 8 * S, dy = (int32_t)(d->h - 8 - di / dw8 * 8) * S;
+        VkImageCopy *l = n ? &cregs[n - 1] : 0;
+        if (l && l->srcOffset.y == sy && l->dstOffset.y == dy && l->srcOffset.x + (int32_t)l->extent.width == sx && l->dstOffset.x + (int32_t)l->extent.width == dx) {
+            l->extent.width += (uint32_t)(8 * S); continue;
+        }
+        if (n == ncregs_cap) { ncregs_cap = ncregs_cap ? ncregs_cap * 2 : 256; cregs = realloc(cregs, ncregs_cap * sizeof *cregs); if (!cregs) fatal("vulkan: out of memory"); }
+        cregs[n++] = (VkImageCopy){ .srcSubresource = { s->im.aspect, 0, 0, 1 }, .srcOffset = { sx, sy, 0 }, .dstSubresource = { d->im.aspect, 0, 0, 1 },
+                                    .dstOffset = { dx, dy, 0 }, .extent = { (uint32_t)(8 * S), (uint32_t)(8 * S), 1 } };
+    }
+    begin_cmd(); end_render();
+    vkCmdCopyImage(cmd, s->im.img, VK_IMAGE_LAYOUT_GENERAL, d->im.img, VK_IMAGE_LAYOUT_GENERAL, n, cregs);
+    barrier();
+    d->ver++; ntilecopies++;
+    if (log_sync()) fprintf(stderr, "own: frame %llu copy %08x..%08x from %08x %ux%u to %08x %ux%u (%u regions)\n", (unsigned long long)gpu_frame(),
+                            lo, hi, s->addr, s->w, s->h, d->addr, d->w, d->h, n);
+}
+static void sync_wait(int why) { submit_wait(); nsyncs++; sync_by[why & 7]++; }
+
+/* Can o's dirty rows give up bytes lo..hi and stay one run of whole tile rows? The rest is returned in nlo..nhi. */
+static int shrink_ok(const Surf *o, uint32_t lo, uint32_t hi, uint32_t *nlo, uint32_t *nhi) {
+    uint32_t olo, ohi; dirty_bytes(o, &olo, &ohi);
+    if (lo <= olo && hi >= ohi) { *nlo = *nhi = 0; return 1; }
+    if (o->h & 7) return 0;
+    uint32_t R = o->w * 8 * sbpp(o);
+    if (lo <= olo && (hi - o->addr) % R == 0) { *nlo = hi; *nhi = ohi; return 1; }
+    if (hi >= ohi && (lo - o->addr) % R == 0) { *nlo = olo; *nhi = lo; return 1; }
+    return 0;
+}
+/* s is about to own its image rows y0..y1 (a draw or a fill). Other surfaces' dirty rows there are taken over: copied
+ * into s on the GPU (need: s's contents there matter) and dropped from their owner's dirty rows; when that is not
+ * possible (another format, a split run) the owner is written back to memory and s reloads those bytes. */
+static void claim(Surf *s, uint32_t y0, uint32_t y1, int need) {
+    uint32_t lo, hi; rows_bytes(s, y0, y1, &lo, &hi);
+    int any = 0, nmark = 0;
+    for (int i = 0; i < NSURF; i++) {
+        Surf *o = &surf[i]; uint32_t a, b;
+        o->mark = 0;
+        if (o == s || !o->used || !dirty_overlaps(o, lo, hi - lo)) continue;
+        if ((!need || tile_compat(s, o)) && shrink_ok(o, lo, hi, &a, &b)) { o->mark = 1; nmark++; }
+        else { queue_download(o); any = 1; dl_by[6]++;
+               if (log_sync()) fprintf(stderr, "sync: frame %llu cause 6 overlap: surface %08x %ux%u fmt %u%s written back for %08x %ux%u\n",
+                                       (unsigned long long)gpu_frame(), o->addr, o->w, o->h, o->fmt, o->depth ? " depth" : "", s->addr, s->w, s->h); }
+    }
+    if (any) sync_wait(6);
+    if (need) validate(s);
+    if (!nmark) return;
+    for (int i = 0; i < NSURF; i++) {
+        Surf *o = &surf[i]; uint32_t a, b, olo, ohi;
+        if (!o->mark) continue;
+        o->mark = 0;
+        dirty_bytes(o, &olo, &ohi);
+        if (need) copy_tiles(s, o, lo > olo ? lo : olo, hi < ohi ? hi : ohi);
+        shrink_ok(o, lo, hi, &a, &b);
+        if (a == b) o->dirty = 0; else bytes_rows(o, a, b, &o->ry0, &o->ry1);
+        o->stale = 1; o->recheck = 1; o->checked = 0;           /* its image there is stale now: reload when memory catches up */
+    }
+}
+/* s is about to be read (render to texture, display, depth test) in guest bytes lo..hi: copy in what other surfaces own
+ * there (or write those back to memory and reload, for other formats). */
+static void refresh(Surf *s, uint32_t lo, uint32_t hi) {
+    int any = 0, ncopy = 0;
+    for (int i = 0; i < NSURF; i++) {
+        Surf *o = &surf[i];
+        if (o == s || !o->used || !dirty_overlaps(o, lo, hi - lo)) continue;
+        if (tile_compat(s, o)) ncopy++; else { queue_download(o); any = 1; dl_by[7]++; }
+    }
+    if (any) sync_wait(7);
+    validate(s);
+    if (!ncopy) return;
+    for (int i = 0; i < NSURF; i++) {
+        Surf *o = &surf[i]; uint32_t olo, ohi;
+        if (o == s || !o->used || !dirty_overlaps(o, lo, hi - lo) || !tile_compat(s, o)) continue;
+        dirty_bytes(o, &olo, &ohi);
+        copy_tiles(s, o, lo > olo ? lo : olo, hi < ohi ? hi : ohi);
+    }
+    s->stale = 1;                                                  /* its clean rows hold newer data than memory now */
 }
 
 int vkr_fill(uint32_t start, uint32_t end, uint32_t value, uint32_t ctl) {
@@ -445,6 +602,7 @@ int vkr_fill(uint32_t start, uint32_t end, uint32_t value, uint32_t ctl) {
         uint8_t pat[24];
         for (int k = 0; k < 24; k++) pat[k] = (uint8_t)(value >> (8 * (k % fw)));
         for (uint32_t k = bpp; k + bpp <= 24; k += bpp) if (memcmp(pat, pat + k, bpp)) return 0;   /* not one colour per pixel */
+        claim(s, 0, s->h, 0);                                      /* the fill replaces whatever others drew there */
         begin_cmd(); end_render();
         VkImageSubresourceRange r = { s->im.aspect, 0, 1, 0, 1 };
         if (!s->depth) {
@@ -457,7 +615,7 @@ int vkr_fill(uint32_t start, uint32_t end, uint32_t value, uint32_t ctl) {
             vkCmdClearDepthStencilImage(cmd, s->im.img, VK_IMAGE_LAYOUT_GENERAL, &dv, 1, &r);
         }
         barrier();
-        s->dirty = 1;
+        set_dirty(s, 0, s->h); s->ver++;
         return 1;
     }
     return 0;
@@ -486,6 +644,7 @@ static Tex *texture_from_surface(const VkrTex *t) {
         if (x->used && !x->depth && x->dirty && x->addr == t->addr && x->w == t->w && x->h == t->h && x->fmt == t->fmt) { s = x; break; }
     }
     if (!s) return 0;
+    refresh(s, s->addr, s->addr + s->size);                        /* what overlapping targets drew inside it */
     Tex *e = 0, *lru = &texs[0];
     for (int i = 0; i < NTEX; i++) {
         Tex *x = &texs[i];
@@ -513,6 +672,7 @@ static Tex *texture_from_surface(const VkrTex *t) {
     return e;
 }
 static Tex *get_texture(const VkrTex *t, int unit, void (*decode)(int, int, int, uint8_t *)) {
+    if (log_sync()) fprintf(stderr, "tex: frame %llu %08x %ux%u fmt %u levels %u faces %u\n", (unsigned long long)gpu_frame(), t->addr, t->w, t->h, t->fmt, t->levels, t->faces);
     { Tex *r = texture_from_surface(t); if (r) return r; }
     for (uint32_t f = 0; f < t->faces; f++) { vkr_why = 7; vkr_sync_range(t->face_addr[f], t->size, 0); }   /* render-to-texture: the bytes must be current */
     Tex *e = 0, *lru = &texs[0];
@@ -667,9 +827,46 @@ void vkr_draw(const VkrDraw *d, const void *tris, int ntris, void (*decode)(int,
     uint32_t daddr = d->daddr;
     if (d->caddr && daddr && overlaps(d->caddr, d->width * d->height * cbpp[d->cfmt & 7], daddr, d->width * d->height * dbpp[d->dfmt & 3]))
         daddr = 0;                                                 /* depth aimed at the colour buffer: draw without depth */
+    uint32_t om0 = R[0x107], allow_c0 = R[0x113] & 15, allow_d0 = R[0x115] & 3;
+    int st_on = (d->dfmt & 3) == 3 && (R[0x105] & 1);
+    if (!(om0 & 1) && !st_on && !(allow_d0 && ((om0 >> 12) & 1))) daddr = 0;   /* no depth test, stencil or depth write */
+    int cwrite = allow_c0 && (((om0 >> 8) & 15) & ((d->cfmt & 7) == 1 || (d->cfmt & 7) == 3 ? 7 : 15));
+    int dwr = allow_d0 && (((om0 >> 12) & 1) || (st_on && ((R[0x105] >> 8) & 0xff)));
+    uint32_t y0 = 0, y1 = d->height;                               /* image rows the draw can touch, in whole tile rows */
+    if (!(d->height & 7)) {
+        int32_t mn = INT32_MAX, mx = INT32_MIN;
+        const uint8_t *vv = (const uint8_t *)tris;
+        for (int i = 0; i < ntris * 3; i++) { int32_t y; memcpy(&y, vv + 112 * (size_t)i + 104, 4); if (y < mn) mn = y; if (y > mx) mx = y; }
+        int32_t a = (mn >> 4) - 1, b = ((mx + 15) >> 4) + 1;
+        if ((R[0x065] & 3) == 3) {
+            int32_t s1 = (int32_t)((R[0x066] >> 16) & 0x3ff), s2 = (int32_t)((R[0x067] >> 16) & 0x3ff) + 1;
+            if (a < s1) a = s1;
+            if (b > s2) b = s2;
+        }
+        if (a < 0) a = 0;
+        if (b > (int32_t)d->height) b = (int32_t)d->height;
+        if (b <= a) a = b = 0;
+        y0 = (uint32_t)a & ~7u; y1 = ((uint32_t)b + 7) & ~7u;
+        if (y1 > d->height) y1 = d->height;
+    }
     Surf *sc = d->caddr ? get_surface(d->caddr, d->width, d->height, d->cfmt, 0) : 0;
     Surf *sd = daddr ? get_surface(daddr, d->width, d->height, d->dfmt, 1) : 0;
-    validate(sc); validate(sd);
+    if (sc) {
+        if (cwrite && y1 > y0) {
+            uint32_t a = y0, b = y1;
+            if (sc->dirty) { if (sc->ry0 < a) a = sc->ry0; if (sc->ry1 > b) b = sc->ry1; }
+            claim(sc, a, b, 1); set_dirty(sc, a, b);
+        } else validate(sc);
+    }
+    if (sd) {
+        if (dwr && y1 > y0) {
+            uint32_t a = y0, b = y1;
+            if (sd->dirty) { if (sd->ry0 < a) a = sd->ry0; if (sd->ry1 > b) b = sd->ry1; }
+            claim(sd, a, b, 1); set_dirty(sd, a, b);
+        } else if (y1 > y0) { uint32_t lo, hi; rows_bytes(sd, y0, y1, &lo, &hi); refresh(sd, lo, hi); }
+        else validate(sd);
+    }
+    validate(sc);                                                  /* in case the depth side wrote something back under it */
     if (sc) { sc->last = gen; sc->ver++; }
     if (sd) sd->last = gen;
 
@@ -754,8 +951,6 @@ void vkr_draw(const VkrDraw *d, const void *tris, int ntris, void (*decode)(int,
 
     vkCmdBindVertexBuffers(cmd, 0, 1, &ring.buf, &voff);
     vkCmdDraw(cmd, (uint32_t)ntris * 3, 1, 0, 0);
-    if (sc && k.wmask) sc->dirty = 1;
-    if (sd && allow_d) sd->dirty = 1;
 }
 
 void vkr_new_gen(void) { gen++; }
@@ -767,9 +962,9 @@ void vkr_frame(void) {
     static uint64_t frames;
     if (++frames % 300 == 0) {
         LOG(1, "vulkan: GPU wait %.2f s, write-back %.2f s, textures %.2f s, pipeline builds %.2f s, stale texture catches %llu", t_wait / 1e9, t_fin / 1e9, t_tex / 1e9, t_pipe / 1e9, (unsigned long long)nstale);
-        LOG(1, "vulkan: %llu submissions, %llu sync points, %llu surface downloads, %llu surface uploads, %llu texture uploads, %llu render-to-texture copies, %d pipelines, %llu frames not presented",
+        LOG(1, "vulkan: %llu submissions, %llu sync points, %llu surface downloads, %llu surface uploads, %llu texture uploads, %llu render-to-texture copies, %llu overlap copies, %d pipelines, %llu frames not presented",
             (unsigned long long)nsubmits, (unsigned long long)nsyncs, (unsigned long long)ndownloads, (unsigned long long)nuploads,
-            (unsigned long long)ntexuploads, (unsigned long long)ntexfromsurf, npipes, (unsigned long long)nskipped);
+            (unsigned long long)ntexuploads, (unsigned long long)ntexfromsurf, (unsigned long long)ntilecopies, npipes, (unsigned long long)nskipped);
     }
 }
 
@@ -806,7 +1001,8 @@ int vkr_display_link(uint32_t in, uint32_t out, uint32_t iw, uint32_t ih, uint32
     }
     if (!src) return 0;
     uint32_t y0 = src->h - row0 - rows;                            /* PICA y of the lowest row taken */
-    if (presenting) { disp_snapshot(src, out, (int)(flags & 1), y0, rows); return !getenv("RB_DISPLAY_COPY"); }   /* the window samples
+    if (presenting) { refresh(src, in, in + rows * src->w * cbpp[src->fmt]);
+                      disp_snapshot(src, out, (int)(flags & 1), y0, rows); return !getenv("RB_DISPLAY_COPY"); }   /* the window samples
                                                                           the GPU copy: the CPU copy is skipped */
     if (row0 == 0 && rows == src->h) {                             /* full-resolution readback path (SDL window) */
         src->display = 1;

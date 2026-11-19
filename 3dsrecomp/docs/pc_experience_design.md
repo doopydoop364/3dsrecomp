@@ -118,5 +118,16 @@ Constraints it must meet, so scaling can be switched on without restructuring:
   the CPU or an uncached copy needs those bytes; CPU writes into a cached range invalidate it.
   Detecting CPU access needs page protection on VRAM/FCRAM ranges or explicit flush points
   (GSP cache flush/invalidate commands, display transfer sources).
+- Overlapping surfaces (2026-11-19). Games reuse VRAM for targets of other sizes: MH4U's two 256x512 targets
+  overlap by 112 rows, and its bloom chain (64x128 down to 16x32) and Xenoblade's depth buffer at several sizes
+  live in the same bytes. These surfaces coexist. Each one is dirty only in the tile rows it has drawn (from the
+  draw's screen-space y range and the scissor), and no two surfaces are dirty in the same bytes: a draw takes over
+  what another surface owns there. Same guest format: copied tile for tile on the GPU, because an 8x8 tile is
+  64 x bpp contiguous bytes whatever the width. Other formats: written back through memory. Reads of a surface
+  (render to texture, display) copy in what others own inside it first. Draws with no depth test, stencil or depth
+  write bind no depth buffer. `RB_NO_OVERLAP=1` restores the old rule (one surface per byte range);
+  `RB_LOG_SYNC=1` traces the cache. MH4U: 6 GPU waits per frame down to 2 (both from display transfers, which go
+  GPU to GPU when the window is shown through Vulkan); tests/bench.sh 10.4 -> 6.2 ms/frame. Write-backs cover only
+  the dirty rows; that and the unbound depth buffers took Xenoblade from 8.6 to 4.2 ms/frame.
 - The software renderer stays as the reference: in original mode, Vulkan output read back at 1x
   must match it (and the reference emulator) screenshot for screenshot.
