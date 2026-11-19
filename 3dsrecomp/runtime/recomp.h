@@ -12,6 +12,7 @@ typedef struct CPU {
     uint32_t fpscr;
     uint32_t tls;              /* cp15 thread register (TPIDRURO) */
     uint32_t ge;               /* CPSR.GE, one bit per byte lane */
+    uint32_t resume;           /* nonzero: the next recompiled function entered continues at this address (kernel.c) */
 } CPU;
 
 typedef void (*recomp_fn)(CPU *);
@@ -38,7 +39,18 @@ recomp_fn recomp_lookup_module(uint32_t a);      /* code of a loaded CRO module 
 /* Recompiled CRO modules (generated): functions by offset in the module (bit 0 set: Thumb); *mb is the base the
  * module is loaded at, which its code adds to every address it computes. */
 typedef struct { uint32_t off; recomp_fn fn; } ModFn;
-typedef struct { const char *name; uint32_t file_size; const ModFn *fns; uint32_t nfns; uint32_t *mb; } RecompModule;
+typedef struct { const char *name; uint32_t file_size; const ModFn *fns; uint32_t nfns; uint32_t *mb;
+                 const ModFn *res; const uint32_t *nres; } RecompModule;   /* res: resume points by offset (sorted) */
+/* Resume points of the main program (generated table.c): every place a paused thread can continue from. */
+extern const ModFn recomp_resume_points[];
+extern const uint32_t recomp_resume_count;
+#ifdef RECOMP_NO_RESUME                           /* measurement builds only: threads cannot be continued from registers */
+#define RESUME_PENDING(c) 0
+#else
+#define RESUME_PENDING(c) __builtin_expect((c)->resume != 0, 0)
+#endif
+recomp_fn recomp_resume_lookup(uint32_t key);
+recomp_fn recomp_resume_module(uint32_t key);    /* the same in loaded CRO modules (modules.c) */    /* the function to enter (with c->resume set) to continue at key */
 extern const RecompModule recomp_modules[];
 extern const uint32_t recomp_module_count;
 static inline recomp_fn recomp_lookup(uint32_t a) {
@@ -60,8 +72,8 @@ static inline void recomp_table_build(const void *list, uint32_t count, void *(*
 /* Loop back-edges count down recomp_budget; at zero the runtime may let another core's thread run (kernel.c). */
 #define PREEMPT_BUDGET 25000
 extern int recomp_budget;
-void recomp_preempt(CPU *c);
-#define BACKEDGE() do { if (__builtin_expect(--recomp_budget < 0, 0)) recomp_preempt(c); } while (0)
+void recomp_preempt(CPU *c, uint32_t key);   /* key: the back-edge target, where a paused thread continues */
+#define BACKEDGE(k) do { if (__builtin_expect(--recomp_budget < 0, 0)) recomp_preempt(c, (k)); } while (0)
 
 /* Returns record the guest return target in r15. Builds with RECOMP_CHECK_RETURNS verify at
  * every call site that the callee came back to the instruction after the call. */

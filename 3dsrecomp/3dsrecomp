@@ -171,9 +171,9 @@ def build_modules(tid, gen, mods, jobs):
     with open(os.path.join(gen, "modules.c"), "w") as fh:
         fh.write('#include "recomp.h"\n')
         for idx, *_ in entries:
-            fh.write(f"extern const ModFn mod_m{idx}_fns[]; extern uint32_t mb_m{idx};\n")
+            fh.write(f"extern const ModFn mod_m{idx}_fns[], mod_m{idx}_res[]; extern const uint32_t mod_m{idx}_nres; extern uint32_t mb_m{idx};\n")
         fh.write("const RecompModule recomp_modules[] = {\n")
-        fh.write("".join(f'  {{"{name}", {size}u, mod_m{idx}_fns, {n}u, &mb_m{idx}}},\n' for idx, name, size, n in entries))
+        fh.write("".join(f'  {{"{name}", {size}u, mod_m{idx}_fns, {n}u, &mb_m{idx}, mod_m{idx}_res, &mod_m{idx}_nres}},\n' for idx, name, size, n in entries))
         fh.write(f"}};\nconst uint32_t recomp_module_count = {len(entries)};\n")
 
 

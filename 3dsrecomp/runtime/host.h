@@ -55,6 +55,8 @@ struct KThread {
     KObject *arb; uint32_t arb_addr;
     void *hstack;
     void *ctx;
+    uint32_t resume_key;                 /* where the thread continues when paused (key: bit 0 = Thumb) */
+    int post, started;                   /* post: what its blocking system call still has to do (kernel.c) */
 };
 
 extern KThread *cur;

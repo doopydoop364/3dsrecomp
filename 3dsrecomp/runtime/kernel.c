@@ -261,7 +261,7 @@ int recomp_budget = PREEMPT_BUDGET;
 static int prefer_other_core = -1;                  /* next pick: a thread not on this core, if one is ready */
 static uint64_t svc_count, svc_at_preempt; static KThread *quiet_thread; static int quiet_budgets;
 uint64_t n_preempts, n_core_switches;
-void recomp_preempt(CPU *c) {
+void recomp_preempt(CPU *c, uint32_t key) {
     (void)c;
     recomp_budget = PREEMPT_BUDGET;
     if (!cur) return;
@@ -288,16 +288,86 @@ void recomp_preempt(CPU *c) {
     }
     for (int i = 0; i < nthreads; i++)                     /* another core's thread gets a turn */
         if (threads[i] != cur && threads[i]->state == T_READY && threads[i]->core != cur->core) { prefer_other_core = cur->core; n_core_switches++; break; }
+    cur->resume_key = key; cur->post = 0;                  /* paused at a loop back-edge: continue at its target */
     cur->state = T_READY; cur->seq = ++seq_counter; to_scheduler();   /* deliver what is due (vblank, timers) */
 }
-static void thread_main(void) {
-    KThread *t = cur;
-    recomp_fn f = recomp_lookup(t->cpu.r[15]);
-    if (!f) fatal("thread entry %08x is not a known function", t->cpu.r[15]);
-    f(&t->cpu);
+/* What a system call that blocked still has to do when the thread wakes: kept in the thread (post), so a thread
+ * continued from its registers alone (save states) finishes the call the same way. */
+enum { P_NONE, P_OK, P_RESULT, P_WAITN, P_WAITN0 };
+static void finish_wait(KThread *t) {
+    uint32_t *r = t->cpu.r;
+    switch (t->post) {
+    case P_OK: r[0] = RES_OK; break;
+    case P_RESULT: r[0] = t->wait_result; break;
+    case P_WAITN: r[0] = t->wait_result; if (r[0] != RES_OK) t->wait_index = -1; r[1] = (uint32_t)t->wait_index; break;
+    case P_WAITN0: r[0] = RES_TIMEOUT; r[1] = 0; break;
+    }
+    t->post = P_NONE;
+}
+static void thread_exit_here(KThread *t) {
     LOG(1, "thread returned from its entry function");
     t->state = T_DEAD; wake_waiters(); to_scheduler();
     abort();
+}
+static void thread_main(void) {
+    KThread *t = cur;
+    t->started = 1;
+    recomp_fn f = recomp_lookup(t->cpu.r[15]);
+    if (!f) fatal("thread entry %08x is not a known function", t->cpu.r[15]);
+    f(&t->cpu);
+    thread_exit_here(t);
+}
+/* Continue a paused thread from its registers alone: enter the function holding its resume point with c->resume set,
+ * and when that returns, the function holding the return address it left in r15, and so on up the guest's own call
+ * chain (return addresses are in guest registers and memory), until the entry function returns. */
+static void thread_resume_main(void) {
+    KThread *t = cur;
+    CPU *c = &t->cpu;
+    finish_wait(t);
+    uint32_t key = t->resume_key;
+    for (;;) {
+        recomp_fn f = recomp_lookup(key);
+        if (f) c->resume = 0;
+        else {
+            f = recomp_resume_lookup(key);
+            if (!f) fatal("thread %d cannot continue at %08x: not a resume point", t->id, key);
+            c->resume = key & ~1u;
+        }
+        f(c);
+        key = c->r[15];
+        if ((key & ~1u) == 0xffff0ff0u) break;            /* the entry function returned (its initial lr) */
+    }
+    thread_exit_here(t);
+}
+recomp_fn recomp_resume_lookup(uint32_t key) {
+    uint32_t lo = 0, hi = recomp_resume_count;
+    while (lo < hi) {
+        uint32_t m = (lo + hi) / 2;
+        if (recomp_resume_points[m].off < key) lo = m + 1; else hi = m;
+    }
+    if (lo < recomp_resume_count && recomp_resume_points[lo].off == key) return recomp_resume_points[lo].fn;
+    return recomp_resume_module(key);
+}
+/* Give a thread a fresh host stack that continues it from its registers (save states; RB_TEST_RESUME). */
+static void thread_restart_from_registers(KThread *t) {
+    size_t hs = 4u << 20;
+    if (t->hstack) munmap(t->hstack, hs);
+    t->hstack = mmap(0, hs, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
+    ucontext_t *uc = t->ctx;
+    getcontext(uc);
+    uc->uc_stack.ss_sp = t->hstack; uc->uc_stack.ss_size = hs; uc->uc_link = 0;
+    makecontext(uc, thread_resume_main, 0);
+}
+/* Called by the scheduler between threads (no guest thread on the host stack): RB_TEST_RESUME=<frame> throws away
+ * every started thread's host stack at that frame and continues it from its registers, which must change nothing. */
+void k_restart_threads(void) {
+    int n = 0;
+    for (int i = 0; i < nthreads; i++) {
+        KThread *t = threads[i];
+        if (t->state == T_DEAD || !t->started || t == cur) continue;
+        thread_restart_from_registers(t); n++;
+    }
+    fprintf(stderr, "kernel: %d threads continue from their registers\n", n);
 }
 KThread *k_thread_create(uint32_t entry, uint32_t arg, uint32_t sp, int prio) {
     /* a finished thread's slot (and its TLS area) is reused; its object stays, still finished, for open handles */
@@ -393,9 +463,11 @@ static const char *svc_name(uint32_t n) {
     return n < 0x40 && names[n] ? names[n] : "?";
 }
 
-void svc_call(CPU *c, uint32_t num, uint32_t addr) {
+void svc_call(CPU *c, uint32_t num, uint32_t next) {
     svc_count++;
     uint32_t *r = c->r;
+    uint32_t addr = (next & ~1u) - ((next & 1) ? 2 : 4);   /* the svc instruction; next: where the thread continues */
+    cur->resume_key = next; cur->post = P_NONE;
     LOG(3, "svc %02x %s (%08x %08x %08x %08x) from %08x lr %08x", num, svc_name(num), r[0], r[1], r[2], r[3], addr, r[14]);
     switch (num) {
     case 0x01: {                                           /* ControlMemory */
@@ -443,9 +515,10 @@ void svc_call(CPU *c, uint32_t num, uint32_t addr) {
         cur->state = T_DEAD; wake_waiters(); to_scheduler(); abort();
     case 0x0a: {                                           /* SleepThread */
         int64_t ns = (int64_t)(((uint64_t)r[1] << 32) | r[0]);
+        cur->post = P_OK;
         if (ns <= 0) { vclock += 1000; cur->state = T_READY; cur->seq = ++seq_counter; to_scheduler(); }
         else { cur->nwait = 0; block(ns); }
-        r[0] = RES_OK; break;
+        finish_wait(cur); break;
     }
     case 0x0b: { KObject *o = h_get(r[1]); r[1] = o && o->type == K_THREAD ? (uint32_t)o->thread->prio : 0x30; r[0] = RES_OK; break; }
     case 0x0c: { KObject *o = h_get(r[0]); if (o && o->type == K_THREAD) o->thread->prio = (int)r[1]; r[0] = RES_OK; resched(); break; }
@@ -505,7 +578,7 @@ void svc_call(CPU *c, uint32_t num, uint32_t addr) {
         if (m < value) {
             if (type == 2 || type == 4) st32(a, (uint32_t)(m - 1));
             cur->nwait = 0; cur->arb = o; cur->arb_addr = a;
-            r[0] = block((type == 3 || type == 4) ? timeout : -1);
+            cur->post = P_RESULT; block((type == 3 || type == 4) ? timeout : -1); finish_wait(cur);
         } else r[0] = RES_OK;
         break;
     }
@@ -520,7 +593,7 @@ void svc_call(CPU *c, uint32_t num, uint32_t addr) {
         cur->wait[0] = o; cur->nwait = 1; cur->wait_all = 0;
         if (wait_try(cur)) { cur->nwait = 0; r[0] = RES_OK; }
         else if (timeout == 0) { cur->nwait = 0; r[0] = RES_TIMEOUT; }
-        else r[0] = block(timeout);
+        else { cur->post = P_RESULT; block(timeout); finish_wait(cur); }
         break;
     }
     case 0x25: {                                           /* WaitSynchronizationN */
@@ -531,10 +604,10 @@ void svc_call(CPU *c, uint32_t num, uint32_t addr) {
             cur->wait[i] = h_get(ld32(hp + 4 * i));
             if (!cur->wait[i]) fatal("WaitSynchronizationN on bad handle %08x", ld32(hp + 4 * i));
         }
-        if (n == 0) { cur->nwait = 0; if (timeout) block(timeout); r[0] = timeout ? RES_TIMEOUT : RES_OK; r[1] = 0; break; }
+        if (n == 0) { cur->nwait = 0; if (timeout) { cur->post = P_WAITN0; block(timeout); finish_wait(cur); } else { r[0] = RES_OK; r[1] = 0; } break; }
         if (wait_try(cur)) { cur->nwait = 0; r[0] = RES_OK; }
         else if (timeout == 0) { cur->nwait = 0; r[0] = RES_TIMEOUT; cur->wait_index = -1; }
-        else { r[0] = block(timeout); if (r[0] != RES_OK) cur->wait_index = -1; }
+        else { cur->post = P_WAITN; block(timeout); finish_wait(cur); break; }
         r[1] = (uint32_t)cur->wait_index;
         break;
     }

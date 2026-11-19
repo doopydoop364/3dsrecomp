@@ -1043,7 +1043,7 @@ def thumb_body(ins):
     if (h >> 12) == 13:                                   # Bcc / SVC
         cond = (h >> 8) & 15
         if cond == 15:
-            return f'svc_call(c, 0x{h & 0xFF:x}u, 0x{addr:08x}u);'
+            return f'svc_call(c, 0x{h & 0xFF:x}u, {A(addr + 2)} | 1u);'
         if cond == 14:
             raise Unsup('thumb_undefined')
         off = h & 0xFF
@@ -1128,7 +1128,7 @@ def decode_body(ins):
             return vfp_ls(ins)
         raise Unsup('coproc')
     if w & (1 << 24):
-        return f'svc_call(c, 0x{w & 0xFFFFFF:x}u, 0x{addr:08x}u);'
+        return f'svc_call(c, 0x{w & 0xFFFFFF:x}u, {A(addr + 4)});'
     if cp in (10, 11):
         return vfp_xfer(ins) if w & 0x10 else vfp_cdp(ins)
     if (w & 0x0FFF0FDF) == 0x0E070F9A:                    # mcr p15, 0, rd, c7, c10, 4/5 (memory barriers)
@@ -1206,6 +1206,7 @@ def is_clean_code(t, funcs):
 
 
 PLACEHOLDER = re.compile(r'@([GCT]):([0-9a-f]{8})@')
+RETSITE = re.compile(r'c->r\[14\] = (?:A\()?0x([0-9a-f]{8})u')     # a call: the address it returns to
 
 
 def emit_function(entry, body, funcs):
@@ -1217,6 +1218,19 @@ def emit_function(entry, body, funcs):
 
     resume = sorted({t for ins in body.values() for t in ins.resume})
     leave = 'goto L_resume;' if resume else 'return;'
+    # Places a paused guest thread can continue from (save states): after each call and system call, and at loop
+    # back-edge targets (where the runtime may switch threads). A thread is resumed through the function's
+    # dispatch on c->resume; see recomp.h and kernel.c.
+    rps = set()
+    for a, ins in body.items():
+        if ins.body is None:
+            continue
+        for m in RETSITE.finditer(ins.body):
+            t = int(m.group(1), 16) & ~1
+            if t in body:
+                rps.add(t)
+        if 'svc_call(' in ins.body and a + ins.size in body:
+            rps.add(a + ins.size)
 
     def resolve(m):
         kind, t = m.group(1), int(m.group(2), 16)
@@ -1226,7 +1240,8 @@ def emit_function(entry, body, funcs):
             return f'{{ fn_{FNP}{t:08x}(c); {leave} }}' if t in funcs else f'TRAP(0x{t:08x}u, "branch to unknown code");'
         if local(t):
             if (t & ~1) <= here[0]:                        # loop back-edge: count it (other cores, busy waits)
-                return f'{{ BACKEDGE(); goto L_{t & ~1:08x}; }}'
+                rps.add(t & ~1)
+                return f'{{ BACKEDGE({A(t)}); goto L_{t & ~1:08x}; }}'
             return f'goto L_{t & ~1:08x};'
         if t in funcs:
             return f'{{ fn_{FNP}{t:08x}(c); {leave} }}'
@@ -1235,14 +1250,15 @@ def emit_function(entry, body, funcs):
     order = sorted(body)
     start = entry & ~1
     here = [0]                                             # address being emitted, for back-edge checks
-    out = [f'void fn_{FNP}{entry:08x}(CPU *c) {{', '  uint32_t ret_lr = c->r[14]; (void)ret_lr;']
+    out = [f'void fn_{FNP}{entry:08x}(CPU *c) {{', '  uint32_t ret_lr = c->r[14]; (void)ret_lr;', '@DISPATCH@']
     if order[0] != start:
         labels.add(start)
         out.append(f'  goto L_{start:08x};')
-    for a in order:
+    labels |= rps
+    for a in order:                                        # back-edge targets are local jump targets: labels already
         here[0] = a
         ins = body[a]
-        if a in labels:
+        if a in labels or a in rps:
             out.append(f'L_{a:08x}:;')
         code = PLACEHOLDER.sub(resolve, ins.body)
         if resume:
@@ -1258,8 +1274,16 @@ def emit_function(entry, body, funcs):
         # a callee came back with r15 set: continue at that local address, or keep returning
         cases = ' '.join(f'case 0x{t:08x}u: {PLACEHOLDER.sub(resolve, G(t))}' for t in resume)
         out.append(f'  return;\nL_resume:;\n  switch (c->r[15]{" - MB" if MODULE else ""}) {{ {cases} default: return; }}')
+    rps = sorted(rps)
+    if rps:
+        cases = ' '.join(f'case 0x{t:08x}u: goto L_{t:08x};' for t in rps)
+        out[2] = '  if (RESUME_PENDING(c)) goto L_dispatch;'
+        out.append(f'  return;\nL_dispatch:; {{ uint32_t at_ = c->resume{" - MB" if MODULE else ""}; c->resume = 0;\n'
+                   f'  switch (at_) {{ {cases} default: TRAP(c->r[15], "resume at an unknown place"); return; }} }}')
+    else:
+        out.pop(2)
     out.append('}')
-    return '\n'.join(out)
+    return '\n'.join(out), [t | tb for t in rps]
 
 
 # ---------------------------------------------------------------- driver
@@ -1300,6 +1324,7 @@ def _emit_file(args):
     unsup_words = collections.Counter()
     bad_funcs = []
     covered = set()
+    resumes = []
     parts = list(FILE_HEADER)
     for e in entries:
         body = discover(e, _FUNCS)
@@ -1312,12 +1337,25 @@ def _emit_file(args):
                 bad = True
         if bad:
             bad_funcs.append(e)
-        parts.append(emit_function(e, body, _FUNCS))
+        code, rps = emit_function(e, body, _FUNCS)
+        parts.append(code)
         parts.append('')
+        resumes.extend((k, e) for k in rps)
         covered.update(body)
     with open(os.path.join(outdir, f'rc_{idx:03d}.c'), 'w') as fh:
         fh.write('\n'.join(parts))
-    return stats, unsup_words, bad_funcs, covered
+    return stats, unsup_words, bad_funcs, covered, resumes
+
+
+def resume_table(results, name, pre, typ):
+    """C table of resume points: (address key, function), sorted by key; one entry per key."""
+    seen = {}
+    for r in results:
+        for k, e in r[4]:
+            seen.setdefault(k, e)
+    rows = sorted(seen.items())
+    return (f'const {typ} {name}[] = {{\n' + ''.join(f'  {{0x{k:08x}u, fn_{pre}{e:08x}}},\n' for k, e in rows) +
+            ('  {0, 0},\n' if not rows else '') + '};\n'), len(rows)
 
 
 def load_game_file(root, title_id):
@@ -1372,9 +1410,11 @@ def module_main(cro_path, outdir, idx, jobs):
     with open(os.path.join(outdir, f'mod_{idx}_table.c'), 'w') as fh:
         fh.write(f'#include "recomp.h"\n#include "mod_{idx}_funcs.h"\nuint32_t mb_m{idx};\n')
         fh.write(f'const ModFn mod_m{idx}_fns[] = {{\n' + ''.join(f'  {{0x{a:08x}u, fn_{pre}{a:08x}}},\n' for a in order) + '};\n')
+        tab, nres = resume_table(results, f'mod_m{idx}_res', pre, 'ModFn')
+        fh.write(tab + f'const uint32_t mod_m{idx}_nres = {nres};\n')
     os.remove(img_path)
     stats = collections.Counter()
-    for st, _, _, _ in results:
+    for st, *_ in results:
         stats.update(st)
     un = sum(v for k, v in stats.items() if k.startswith('unsup:'))
     print(f'module {m.name}: {len(order)} functions, {stats["insns"]} instructions, {un} unsupported')
@@ -1457,7 +1497,7 @@ def main():
         results = pool.map(_emit_file, jobs_args)
     stats, words, bad = collections.Counter(), collections.Counter(), []
     cov = bytearray((TEXT_END - BASE) // 4)
-    for s, w, b, cv in results:
+    for s, w, b, cv, _ in results:
         stats.update(s); words.update(w); bad.extend(b)
         for a in cv:
             cov[(a - BASE) // 4] = 1
@@ -1470,6 +1510,8 @@ def main():
         fh.write('const struct { uint32_t addr; recomp_fn fn; } recomp_functions[] = {\n')
         fh.write(''.join(f'  {{0x{a:08x}u, fn_{a:08x}}},\n' for a in order))
         fh.write(f'}};\nconst uint32_t recomp_function_count = {len(order)};\n')
+        tab, nres = resume_table(results, 'recomp_resume_points', '', 'ModFn')
+        fh.write(tab + f'const uint32_t recomp_resume_count = {nres};\n')
 
     with open(os.path.join(outdir, 'functions_all.txt'), 'w') as fh:
         fh.write(''.join(f'{a:08x}\n' for a in order))

@@ -80,6 +80,18 @@ int modules_note_missing(uint32_t a) {
     }
     return 0;
 }
+recomp_fn recomp_resume_module(uint32_t key) {
+    for (int i = 0; i < nloaded; i++) {
+        Loaded *l = &loaded[i];
+        uint32_t o = (key & ~1u) - l->base;
+        if (o >= l->size) continue;
+        const ModFn *r = l->rm->res; uint32_t lo = 0, hi = *l->rm->nres, k = o | (key & 1);
+        while (lo < hi) { uint32_t m = (lo + hi) / 2; if (r[m].off < k) lo = m + 1; else hi = m; }
+        *l->rm->mb = l->base;
+        return lo < *l->rm->nres && r[lo].off == k ? r[lo].fn : 0;
+    }
+    return 0;
+}
 recomp_fn recomp_lookup_module(uint32_t a) {
     for (int i = 0; i < nloaded; i++) {
         Loaded *l = &loaded[i];

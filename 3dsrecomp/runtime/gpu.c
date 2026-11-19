@@ -155,6 +155,7 @@ static void run_queue(void) {
     }
 }
 void control_vblank(uint64_t frame);
+void k_restart_threads(void);
 static void vblank(void) {
     frames++;
     { static int64_t dump_at = -2; if (dump_at == -2) { const char *s = getenv("RB_MEMDUMP_FRAME"); dump_at = s ? atoll(s) : -1; }
@@ -189,6 +190,8 @@ static void vblank(void) {
     irq(IRQ_PDC0); irq(IRQ_PDC1);
     { static int64_t exit_at = -2; if (exit_at == -2) { const char *e = getenv("RB_EXIT_FRAME"); exit_at = e ? atoll(e) : -1; }
       if ((int64_t)frames == exit_at) { gpu_report(); exit(0); } }   /* tests: stop after a fixed frame */
+    { static int64_t rs = -2; if (rs == -2) { const char *e = getenv("RB_TEST_RESUME"); rs = e ? atoll(e) : -1; }
+      if ((int64_t)frames == rs) k_restart_threads(); }              /* test: continue every thread from its registers */
     control_vblank(frames);                                            /* RB_CONTROL: wait for the next command */
 }
 
