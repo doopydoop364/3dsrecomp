@@ -1525,3 +1525,14 @@ void pica_report(void) {
     fprintf(stderr, "pica: %llu command lists, %llu draws, %llu triangles rasterised, %llu pixels written, %llu geometry-shader draws skipped\n",
             (unsigned long long)n_lists, (unsigned long long)n_draws, (unsigned long long)n_tris, (unsigned long long)n_pixels, (unsigned long long)n_skipped_gs);
 }
+
+
+/* ---- save states: the registers and everything uploaded through them; decoded caches start over ---- */
+void pica_state(SS *s) {
+    ss_tag(s, "pica");
+    SS_V(s, reg); SS_V(s, lut); SS_V(s, fog_lut); SS_V(s, pt_lut); SS_V(s, uni_src); SS_V(s, vs); SS_V(s, gs);
+    SS_V(s, uni_queue); SS_V(s, uni_n); SS_V(s, gs_uni_queue); SS_V(s, gs_uni_n); SS_V(s, dflt); SS_V(s, dflt_queue); SS_V(s, dflt_n);
+    SS_V(s, tevs); SS_V(s, tev_buf_init); SS_V(s, lights); SS_V(s, nlights); SS_V(s, global_amb); SS_V(s, tu);
+    SS_V(s, flat_mode); SS_V(s, flat);
+    if (ss_loading(s)) { vs_ver += 1000000; gs_ver += 1000000; lut_version += 1000000; }
+}

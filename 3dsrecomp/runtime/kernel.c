@@ -69,7 +69,7 @@ void call_indirect(CPU *c, uint32_t addr) {
 }
 
 /* ------------------------------------------------------------------ memory */
-typedef struct { uint32_t base, size; int state, perm; const char *what; } Region;
+typedef struct { uint32_t base, size; int state, perm; const char *what; uint32_t src; } Region;   /* src: of an alias */
 static Region regions[512];
 static int nregions;
 uint32_t linear_base = 0x30000000u, app_mem_size = 0x4000000u;
@@ -121,10 +121,22 @@ int mem_alias(uint32_t dst, uint32_t src, uint32_t size, int unmap) {
     if (!unmap) {
         if (mmap((void *)(uintptr_t)src, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED) return -1;
         if (nregions == 512) fatal("too many memory regions");
-        regions[nregions++] = (Region){ dst, size, 9, 3, "alias" };       /* state 9: alias */
-    } else {
-        for (int i = 0; i < nregions; i++)
-            if (regions[i].base == dst && !strcmp(regions[i].what, "alias")) { regions[i] = regions[--nregions]; break; }
+        regions[nregions++] = (Region){ dst, size, 9, 3, "alias", src };  /* state 9: alias */
+    } else {                                               /* all of an alias, or its start or end (ldr:ro gives back the tail) */
+        for (int i = 0; i < nregions; i++) {
+            Region *g = &regions[i];
+            if (g->state != 9 || dst < g->base || dst + size > g->base + g->size) continue;
+            if (dst == g->base && size == g->size) regions[i] = regions[--nregions];
+            else if (dst + size == g->base + g->size) g->size -= size;
+            else if (dst == g->base) { g->base += size; g->src += size; g->size -= size; }
+            else {                                         /* from the middle: two aliases remain */
+                if (nregions == 512) fatal("too many memory regions");
+                uint32_t cut = dst + size - g->base;
+                regions[nregions++] = (Region){ dst + size, g->size - cut, 9, 3, "alias", g->src + cut };
+                g->size = dst - g->base;
+            }
+            break;
+        }
     }
     LOG(2, "%s %08x <-> %08x (%x bytes)", unmap ? "unmap alias" : "map alias", dst, src, size);
     return 0;
@@ -164,7 +176,13 @@ static void advance_to(uint64_t t) {
     else if (w > target + 34000000ull) pace_wall0 = w - gone;                     /* behind by more than 2 frames: resync instead of
                                                                                         running fast to catch up (audio would be cut) */
 }
-KObject *k_new(KType t) { KObject *o = calloc(1, sizeof *o); o->type = t; return o; }
+static KObject **objs; static int nobjs, objs_cap;   /* every object ever made (they are never freed) */
+KObject *k_new(KType t) {
+    KObject *o = calloc(1, sizeof *o); o->type = t;
+    if (nobjs == objs_cap) { objs_cap = objs_cap ? objs_cap * 2 : 256; objs = realloc(objs, (size_t)objs_cap * sizeof *objs); if (!objs) fatal("out of memory"); }
+    o->sid = nobjs; objs[nobjs++] = o;
+    return o;
+}
 uint32_t h_new(KObject *o) {
     for (uint32_t i = 1; i < 2048; i++)
         if (!handles[i]) { handles[i] = o; o->refs++; return 0x00010000u | (i << 2); }
@@ -237,11 +255,18 @@ void k_signal(KObject *e) {
 }
 
 /* ------------------------------------------------------------------ scheduler */
-static struct { void (*fn)(void); uint64_t period, next; } periodic[8];
+static struct { void (*fn)(void); uint64_t period, next; char name[16]; } periodic[8];
 static int nperiodic;
-void k_add_periodic(void (*fn)(void), uint64_t period_ns) {
+void k_add_periodic(void (*fn)(void), uint64_t period_ns, const char *name) {
+    if (nperiodic == 8) fatal("too many periodic events");
     periodic[nperiodic].fn = fn; periodic[nperiodic].period = period_ns; periodic[nperiodic].next = now_ns() + period_ns;
+    snprintf(periodic[nperiodic].name, sizeof periodic[nperiodic].name, "%s", name);
     nperiodic++;
+}
+/* After a state loaded the periodic events by name, each owner hands its function back. */
+void k_periodic_restore(const char *name, void (*fn)(void)) {
+    for (int i = 0; i < nperiodic; i++) if (!strcmp(periodic[i].name, name)) { periodic[i].fn = fn; return; }
+    fatal("save state: no periodic event \"%s\" to restore", name);
 }
 static KObject *timers[64];
 static int ntimers;
@@ -674,3 +699,135 @@ void svc_call(CPU *c, uint32_t num, uint32_t next) {
     default: fatal("supervisor call %02x (%s) from %08x is not implemented", num, svc_name(num), addr);
     }
 }
+
+
+/* ------------------------------------------------------------------ save states */
+void ss_obj(SS *s, KObject **o) {
+    int32_t i = !*o ? -1 : *o == &process_obj ? -2 : (*o)->sid;
+    SS_V(s, i);
+    if (ss_loading(s)) {
+        if (i >= nobjs) fatal("save state: object %d of %d", i, nobjs);
+        *o = i == -1 ? 0 : i == -2 ? &process_obj : objs[i];
+    }
+}
+void ss_thread(SS *s, KThread **t) {
+    int32_t i = *t ? (*t)->id : -1;
+    SS_V(s, i);
+    if (ss_loading(s)) *t = i < 0 ? 0 : threads[i];
+}
+static void region_bytes(SS *s, uint32_t a, uint32_t n) {   /* guest memory, without the pages an alias took away */
+    uint32_t end = a + n;
+    while (a < end) {
+        uint32_t stop = end, skip = 0;
+        for (int i = 0; i < nregions; i++)
+            if (regions[i].state == 9) {
+                uint32_t h0 = regions[i].src, h1 = h0 + regions[i].size;
+                if (a >= h0 && a < h1) { skip = (h1 < end ? h1 : end) - a; break; }
+                if (h0 > a && h0 < stop) stop = h0;
+            }
+        if (skip) { a += skip; continue; }
+        ss_big(s, (void *)(uintptr_t)a, stop - a);
+        a = stop;
+    }
+}
+void kernel_state(SS *s) {
+    int load = ss_loading(s);
+    ss_tag(s, "kernel");
+    SS_V(s, vclock); SS_V(s, seq_counter); SS_V(s, mem_used); SS_V(s, linear_next); SS_V(s, shared_next);
+    SS_V(s, svc_count); SS_V(s, prefer_other_core);
+    /* memory: the regions, then the aliases, then the contents */
+    ss_tag(s, "memory");
+    int n = nregions; SS_V(s, n);
+    static Region saved[512];
+    for (int i = 0; i < n; i++) {
+        Region r = load ? (Region){ 0 } : regions[i];
+        char what[64]; snprintf(what, sizeof what, "%s", load ? "" : r.what);
+        SS_V(s, r.base); SS_V(s, r.size); SS_V(s, r.state); SS_V(s, r.perm); SS_V(s, r.src); ss_str(s, what, sizeof what);
+        if (load) { r.what = strdup(what); saved[i] = r; }
+    }
+    if (load) {
+        for (int i = 0; i < n; i++) {
+            Region *r = &saved[i];
+            if (r->state == 9) continue;
+            int have = 0;
+            for (int k = 0; k < nregions; k++) if (regions[k].base == r->base && regions[k].size == r->size) { regions[k] = *r; have = 1; }
+            if (!have) mem_map(r->base, r->size, r->what, r->state, r->perm);
+        }
+        for (int i = 0; i < n; i++)
+            if (saved[i].state == 9 && mem_alias(saved[i].base, saved[i].src, saved[i].size, 0)) fatal("save state: cannot remake alias %08x", saved[i].base);
+        if (nregions != n) fatal("save state: %d memory regions after loading, %d saved", nregions, n);
+    }
+    for (int i = 0; i < nregions; i++) {                   /* contents in the saved order (load re-made them in another) */
+        Region *r = load ? &saved[i] : &regions[i];
+        int ro = r->state != 9 && (r->perm == 5 || r->perm == 1);  /* code and read-only data (main.c protects them) */
+        if (load && ro) mprotect((void *)(uintptr_t)r->base, r->size, PROT_READ | PROT_WRITE);
+        region_bytes(s, r->base, r->size);
+        if (load && ro) mprotect((void *)(uintptr_t)r->base, r->size, PROT_READ);
+    }
+    /* objects: all of them exist before any field refers to one */
+    ss_tag(s, "objects");
+    int no = nobjs; SS_V(s, no);
+    if (load) { while (nobjs < no) k_new(K_EVENT); }
+    for (int i = 0; i < no; i++) {
+        KObject *o = objs[i];
+        SS_V(s, o->type); SS_V(s, o->refs); SS_V(s, o->signaled); SS_V(s, o->reset); SS_V(s, o->lock_count);
+        SS_V(s, o->count); SS_V(s, o->max); SS_V(s, o->fire_ns); SS_V(s, o->interval_ns); SS_V(s, o->addr); SS_V(s, o->size);
+        SS_V(s, o->prefer); ss_raw(s, o->name, sizeof o->name);
+        if (o->type == K_SHMEM) {
+            if (o->addr) o->mem = (uint8_t *)(uintptr_t)o->addr;             /* mapped: its bytes are guest memory */
+            else { if (load) { free(o->mem); o->mem = calloc(1, o->size ? o->size : 1); } ss_big(s, o->mem, o->size); }
+        }
+    }
+    ss_tag(s, "threads");
+    int nt = nthreads; SS_V(s, nt);
+    if (load) {
+        for (int i = 0; i < nthreads; i++) if (threads[i]->hstack) { munmap(threads[i]->hstack, 4u << 20); threads[i]->hstack = 0; }
+        for (int i = 0; i < nt; i++) { if (i >= nthreads) threads[i] = calloc(1, sizeof(KThread)); else memset(threads[i], 0, sizeof(KThread)); }
+        nthreads = nt;
+    }
+    for (int i = 0; i < nt; i++) {
+        KThread *t = threads[i];
+        SS_V(s, t->cpu); SS_V(s, t->id); SS_V(s, t->state); SS_V(s, t->prio); SS_V(s, t->core); SS_V(s, t->seq);
+        SS_V(s, t->nwait); SS_V(s, t->wait_all); SS_V(s, t->wake_ns); SS_V(s, t->wait_result); SS_V(s, t->wait_index);
+        SS_V(s, t->arb_addr); SS_V(s, t->resume_key); SS_V(s, t->post); SS_V(s, t->started);
+    }
+    for (int i = 0; i < nt; i++) {                         /* references, once every thread exists */
+        KThread *t = threads[i];
+        ss_obj(s, &t->obj); ss_obj(s, &t->arb);
+        for (int k = 0; k < 32; k++) ss_obj(s, &t->wait[k]);
+    }
+    for (int i = 0; i < no; i++) { KObject *o = objs[i]; ss_thread(s, &o->owner); ss_thread(s, &o->thread); }
+    ss_thread(s, &quiet_thread); SS_V(s, quiet_budgets); SS_V(s, svc_at_preempt);
+    ss_tag(s, "handles");
+    for (int i = 0; i < 2048; i++) ss_obj(s, &handles[i]);
+    int ntm = ntimers; SS_V(s, ntm); ntimers = ntm;
+    for (int i = 0; i < ntm; i++) ss_obj(s, &timers[i]);
+    int np = nperiodic; SS_V(s, np);
+    for (int i = 0; i < np; i++) {
+        SS_V(s, periodic[i].period); SS_V(s, periodic[i].next); ss_raw(s, periodic[i].name, sizeof periodic[i].name);
+        if (load) periodic[i].fn = 0;
+    }
+    nperiodic = np;
+    if (load) {                                            /* fresh host stacks: each thread continues from its registers */
+        for (int i = 0; i < nt; i++) {
+            KThread *t = threads[i];
+            if (t->state == T_DEAD) continue;
+            if (!t->ctx) t->ctx = calloc(1, sizeof(ucontext_t));
+            if (t->started) thread_restart_from_registers(t);
+            else {
+                size_t hs = 4u << 20;
+                t->hstack = mmap(0, hs, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
+                ucontext_t *uc = t->ctx; getcontext(uc);
+                uc->uc_stack.ss_sp = t->hstack; uc->uc_stack.ss_size = hs; uc->uc_link = 0;
+                makecontext(uc, thread_main, 0);
+            }
+        }
+    }
+}
+/* After every part loaded: each periodic event got its function back; the pacing clock starts from here. */
+void kernel_after_load(void) {
+    for (int i = 0; i < nperiodic; i++) if (!periodic[i].fn) fatal("save state: nobody restored the periodic event \"%s\"", periodic[i].name);
+    pace_wall0 = wall_ns(); pace_v0 = vclock;
+}
+int k_object_count(void) { return nobjs; }
+KObject *k_object(int i) { return objs[i]; }

@@ -206,3 +206,7 @@ void y2r_service(KObject *s, uint32_t *cmd) {
         reply(cmd, 1, 0);
     }
 }
+
+
+/* ---- save states ---- */
+void y2r_state(SS *s) { ss_tag(s, "y2r"); SS_V(s, c); ss_obj(s, &end_event); }

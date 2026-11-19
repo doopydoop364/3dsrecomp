@@ -50,3 +50,6 @@ void audio_push(const int16_t *s, int frames) {
         SDL_PutAudioStreamData(stream, out, frames * 4);
 }
 void audio_set_volume(int percent) { volume = (float)percent / 100.0f; }
+
+/* Drop queued output (after loading a state, the old sound must not play on). */
+void audio_flush(void) { if (stream) SDL_ClearAudioStream(stream); }

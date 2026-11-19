@@ -7,6 +7,9 @@
  *   press ITEMS [N]  hold ITEMS for N frames (default 6), then release; reply "ok frame F"
  *   shot PATH        advance one frame and write it to PATH (PNG, 400x480: top screen above, bottom screen at x 40..359,
  *                    y 240..479, so a touch at (x, y) in the picture is touch=(x-40)/(y-240))
+ *   save PATH        write a save state (state.c) of this moment; no frames pass
+ *   load PATH        load a save state: the program restarts with it (same process id) and listens again, paused;
+ *                    the reply "ok loading" comes first, then the connection closes
  *   frame            reply "ok frame F" without advancing
  *   quit             end the game
  * tools/play.py starts games in this mode and sends commands. */
@@ -114,6 +117,15 @@ void control_vblank(uint64_t frame) {
             snprintf(shot_path, sizeof shot_path, "%s", arg);
             video_shot_next(shot_path);
             target = frame + 1; replying = shot_pending = 1; return;
+        } else if (!strcmp(cmd, "save")) {
+            if (!*arg) { say("error save needs a path"); continue; }
+            if (state_save(arg)) say("error could not save %s", arg); else say("ok frame %llu saved %s", (unsigned long long)frame, arg);
+        } else if (!strcmp(cmd, "load")) {
+            if (!*arg || access(arg, R_OK)) { say("error cannot read %s", arg); continue; }
+            say("ok loading %s", arg);
+            if (cfd >= 0) { close(cfd); cfd = -1; }
+            state_load_restart(arg);
+            say("error loading failed");
         } else if (!strcmp(cmd, "frame")) {
             say("ok frame %llu", (unsigned long long)frame);
         } else if (!strcmp(cmd, "quit")) {

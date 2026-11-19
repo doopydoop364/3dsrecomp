@@ -20,7 +20,7 @@ RUNNER  ?= build/runner
 $(RUNNER): tests/runner.c runtime/vfp.c runtime/recomp.h $(OBJS)
 	$(CC) -O1 -g -Iruntime -I$(GEN) tests/runner.c runtime/vfp.c $(OBJS) -o $@ -lz -lm
 
-RT := runtime/aes.c runtime/kernel.c runtime/ldr_ro.c runtime/modules.c runtime/services.c runtime/gpu.c runtime/pica.c runtime/pica_shader.c runtime/video.c runtime/input.c runtime/settings.c runtime/dsp.c runtime/audio.c runtime/y2r.c runtime/nfc.c runtime/romfs.c runtime/vk.c runtime/main.c runtime/vfp.c runtime/control.c
+RT := runtime/aes.c runtime/kernel.c runtime/ldr_ro.c runtime/modules.c runtime/services.c runtime/gpu.c runtime/pica.c runtime/pica_shader.c runtime/video.c runtime/input.c runtime/settings.c runtime/dsp.c runtime/audio.c runtime/y2r.c runtime/nfc.c runtime/romfs.c runtime/vk.c runtime/main.c runtime/vfp.c runtime/control.c runtime/state.c
 SPV := $(GEN)/pica_vert.inc $(GEN)/pica_frag.inc $(GEN)/present_vert.inc $(GEN)/present_frag.inc
 $(GEN)/pica_%.inc: runtime/shaders/pica.%
 	glslc -O --target-env=vulkan1.3 -mfmt=c $< -o $@

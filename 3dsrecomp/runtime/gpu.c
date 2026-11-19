@@ -199,7 +199,7 @@ void gsp_service(KObject *s, uint32_t *cmd) {
     switch (cmd[0] >> 16) {
     case 0x0013:                                                       /* RegisterInterruptRelayQueue */
         gsp_ev = h_get(cmd[3]);
-        if (!gsp_mem) { gsp_mem = k_shmem(0x1000); k_add_periodic(vblank, 16715000); }
+        if (!gsp_mem) { gsp_mem = k_shmem(0x1000); k_add_periodic(vblank, 16715000, "vblank"); }
         memset(gsp_mem->mem, 0, 12);
         reply(cmd, 2, 2); cmd[1] = 0x2a07; cmd[2] = 0; cmd[3] = 0; cmd[4] = h_new(gsp_mem);
         break;
@@ -241,4 +241,13 @@ void gpu_report(void) {
             (unsigned long long)frames, (unsigned long long)swaps, (unsigned long long)lists,
             (unsigned long long)gx_count[0], (unsigned long long)gx_count[1], (unsigned long long)gx_count[2], (unsigned long long)gx_count[3], (unsigned long long)gx_count[4]);
     pica_report();
+}
+
+
+/* ---- save states ---- */
+void gpu_state(SS *s) {
+    ss_tag(s, "gsp");
+    ss_obj(s, &gsp_mem); ss_obj(s, &gsp_ev);
+    SS_V(s, shown); SS_V(s, frames); SS_V(s, swaps); SS_V(s, lists); SS_V(s, gx_count);
+    if (ss_loading(s) && gsp_mem) k_periodic_restore("vblank", vblank);
 }

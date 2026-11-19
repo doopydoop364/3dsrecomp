@@ -41,6 +41,7 @@ struct KObject {
     char name[12]; ServiceFn handler;    /* session */
     KThread *thread;                     /* thread */
     void *user;
+    int sid;                             /* index among all objects (save states) */
 };
 
 struct KThread {
@@ -66,6 +67,29 @@ extern int log_level;
 #define LOG(lvl, ...) do { if (log_level >= (lvl)) { fprintf(stderr, "[t%d] ", cur ? cur->id : -1); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
 void fatal(const char *fmt, ...) __attribute__((noreturn, format(printf, 1, 2)));
 
+/* save states (state.c): each part of the runtime saves and loads its fields through one visitor */
+typedef struct SS SS;
+int ss_loading(SS *s);
+void ss_raw(SS *s, void *p, size_t n);
+void ss_big(SS *s, void *p, size_t n);
+void ss_tag(SS *s, const char *tag);
+void ss_str(SS *s, char *buf, size_t n);
+#define SS_V(s, x) ss_raw((s), &(x), sizeof(x))
+void ss_obj(SS *s, KObject **o);          /* a kernel object, as its index (kernel.c) */
+void ss_thread(SS *s, KThread **t);
+int k_object_count(void);
+KObject *k_object(int i);
+int state_save(const char *path);
+void state_load(const char *path);
+void state_load_restart(const char *path);
+void state_set_argv(char **argv);
+const char *data_folder(void);         /* the player's data for this game (services.c) */
+void state_quick_path(char *out, size_t n);
+uint64_t gpu_frame(void);
+/* periodic events by name, so a state can restore them: the owner calls k_periodic_restore when loading */
+void k_add_periodic(void (*fn)(void), uint64_t period_ns, const char *name);
+void k_periodic_restore(const char *name, void (*fn)(void));
+
 /* memory */
 void *mem_map(uint32_t addr, uint32_t size, const char *what, int state, int perm);
 int mem_valid(uint32_t addr, uint32_t size);
@@ -84,7 +108,6 @@ KObject *k_semaphore(int initial, int max);
 KObject *k_shmem(uint32_t size);
 KObject *k_session(const char *name);
 void k_signal(KObject *event);
-void k_add_periodic(void (*fn)(void), uint64_t period_ns);
 void k_set_fast_forward(int on);
 KThread *k_thread_create(uint32_t entry, uint32_t arg, uint32_t sp, int prio);
 void k_set_speed(double s);

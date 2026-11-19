@@ -102,3 +102,16 @@ recomp_fn recomp_lookup_module(uint32_t a) {
     }
     return 0;
 }
+
+
+/* ---- save states: which recompiled modules run where; the module code itself is in guest memory ---- */
+void modules_state(SS *s) {
+    ss_tag(s, "modules");
+    int n = nloaded; SS_V(s, n);
+    uint32_t base[64], size[64];
+    for (int i = 0; i < n; i++) { if (!ss_loading(s)) { base[i] = loaded[i].base; size[i] = loaded[i].size; } SS_V(s, base[i]); SS_V(s, size[i]); }
+    if (ss_loading(s)) {
+        while (nloaded) modules_unloaded(loaded[0].base);
+        for (int i = 0; i < n; i++) modules_loaded(base[i], size[i]);
+    }
+}

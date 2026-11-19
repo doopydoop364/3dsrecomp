@@ -6,6 +6,7 @@
 #include <vulkan/vulkan.h>
 #include <zlib.h>
 #include <time.h>
+#include <unistd.h>
 #include "input.h"
 #include "settings.h"
 #include "vkr.h"
@@ -615,6 +616,8 @@ void video_frame(uint64_t frame, const uint8_t *top, uint32_t top_stride, uint32
             if (ff_toggle && e.key.scancode == ff_key) { ff_on = !ff_on; k_set_fast_forward(ff_on); }
             if (e.key.key == SDLK_F9) show_fps = !show_fps;
             if (e.key.key == SDLK_F10 && !prof_left) prof_start(frame);
+            if (e.key.key == SDLK_F7) { char p[700]; state_quick_path(p, sizeof p); state_save(p); }   /* save state (quick slot) */
+            if (e.key.key == SDLK_F8) { char p[700]; state_quick_path(p, sizeof p); if (!access(p, R_OK)) state_load_restart(p); }
             if (e.key.key == SDLK_F5) nfc_host_tap();             /* amiibo: tap the next dump from <game>/amiibo */
             if (e.key.key == SDLK_F6) nfc_host_remove();
             if (e.key.key == SDLK_F11) SDL_SetWindowFullscreen(win, !(SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN));

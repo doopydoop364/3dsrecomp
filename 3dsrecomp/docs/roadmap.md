@@ -45,7 +45,9 @@ with the update, which is not in the library, so the base program never asks for
 1. Saves outside the game folder — *done (2026-11-19)*: `~/.local/share/3dsrecomp/<title id>/` (save, extra data,
    SD card, StreetPass, amiibo); saves still in a game folder move there on the first start. Test copies carry a
    `data_in_folder` marker and keep their data inside, so scripted runs never reach the player's saves.
-2. Save states.
+2. Save states — *done (2026-11-19)*: F7/F8 (quick slot), `save`/`load` in `tools/play.py`. Guest-level, so they
+   survive rebuilds: threads continue from their registers (recompiler resume points), state is written by each part
+   of the runtime through one visitor (`runtime/state.c`), loading restarts the program with the state.
 3. Trial playthrough: one agent plays one game (Ocarina of Time) through `tools/play.py`, to settle how agents play,
    what they report and how much it costs. Agents read up on the game first, play in a throwaway copy, run 2-3 at a
    time and only while the user is not playing.

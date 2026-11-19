@@ -378,3 +378,7 @@ void ldr_ro_service(KObject *s, uint32_t *cmd) {
         LOG(1, "STUB ldr:ro    cmd %08x", cmd[0]); reply(cmd, 1, 0, RES_OK);
     }
 }
+
+
+/* ---- save states ---- */
+void ldr_ro_state(SS *s) { ss_tag(s, "ldr:ro"); SS_V(s, crs_addr); }

@@ -219,3 +219,19 @@ void dsp_audio_frame(void) {
     for (int r = 0; r < 2; r++) memcpy(region(r) + OFF_FINAL, final, sizeof final);
     audio_push(&final[0][0], FRAME);
 }
+
+
+/* ---- save states ---- */
+void dsp_state(SS *s) {
+    ss_tag(s, "dsp");
+    for (int i = 0; i < NSRC; i++) {
+        Voice *x = &v[i];
+        int16_t *pcm = x->pcm;
+        if (ss_loading(s)) free(x->pcm);
+        SS_V(s, *x);
+        if (ss_loading(s)) { x->pcm = x->pcm_len ? malloc((size_t)x->pcm_len * 4) : 0; pcm = x->pcm; }
+        if (x->pcm_len) ss_raw(s, pcm, (size_t)x->pcm_len * 4);
+        x->pcm = pcm;
+    }
+    SS_V(s, master_volume); SS_V(s, aux_return);
+}

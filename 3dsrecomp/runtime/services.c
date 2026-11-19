@@ -29,6 +29,7 @@ static void mkdirs(const char *path) {
     for (char *q = p + 1; *q; q++) if (*q == '/') { *q = 0; mkdir(p, 0755); *q = '/'; }
     mkdir(p, 0755);
 }
+const char *data_folder(void) { return data_dir; }
 static void data_dir_init(const char *dir) {
     const char *env = getenv("RB_DATA_DIR");
     char marker[600]; snprintf(marker, sizeof marker, "%s/data_in_folder", dir);
@@ -119,7 +120,7 @@ static void font_relocate(uint8_t *m, uint32_t size, uint32_t target) {
 }
 
 /* ---- APT: applet manager. The game is the only running application and is never suspended. ---- */
-static KObject *apt_lock, *apt_notify_ev, *apt_param_ev;
+static KObject *apt_lock, *apt_notify_ev, *apt_param_ev, *font;
 static int apt_param_pending;                 /* a Wakeup parameter is waiting to be received */
 static uint32_t apt_cpu_percent = 30;
 
@@ -198,7 +199,6 @@ static void apt(KObject *s, uint32_t *cmd) {
         break;
     }
     case 0x0044: {                                                     /* GetSharedFont */
-        static KObject *font;
         if (!font) {
             font = k_shmem(0x332000); font->prefer = LINEAR_BASE + app_mem_size;   /* after the application's memory */
             char fp[600]; sys_path(fp, sizeof fp, "shared_font.bin");
@@ -284,7 +284,9 @@ static void quiet_ok(KObject *s, uint32_t *cmd) {
 /* ---- fs:USER: RomFS comes from the user's dump, save data lives in plain host folders ---- */
 #define FS_NOT_FOUND 0xc8804478u
 #define FS_EXISTS    0xc82044beu
-typedef struct { int fd; uint64_t base, size; int fixed, virt; } HFile;   /* virt: the game RomFS (romfs.c) */
+typedef struct { int fd; uint64_t base, size; int fixed, virt; int kind, oflags; char path[600]; } HFile;
+/* virt: the game RomFS (romfs.c). kind (to reopen it from a save state): 0 a host file (path, oflags), 1 the game
+ * RomFS, 2 a RomFS image (path), 3 zeros */
 uint64_t romfs_open(const char *dir); int64_t romfs_read(uint64_t off, uint32_t size, uint8_t *dst);
 typedef struct { uint32_t id; char root[600]; int used; uint32_t tid_lo, tid_hi; } HArchive;   /* tid: archive 0x2345678A */
 static HArchive archives[64];         /* open archive handles: slot + 1 */
@@ -298,6 +300,7 @@ static HFile *romfs_image(const char *path) {
     if (fd < 0) return 0;
     if (fstat(fd, &st)) { close(fd); return 0; }
     HFile *f = calloc(1, sizeof *f); f->fd = fd; f->size = (uint64_t)st.st_size; f->fixed = 1;
+    f->kind = 2; snprintf(f->path, sizeof f->path, "%s", path);
     uint8_t h[0x60];
     if (pread(fd, h, sizeof h, 0) == (ssize_t)sizeof h && !memcmp(h, "IVFC", 4)) {
         uint32_t mhs, bs; uint64_t l3; memcpy(&mhs, h + 8, 4); memcpy(&l3, h + 0x44, 8); memcpy(&bs, h + 0x4c, 4);
@@ -359,7 +362,7 @@ static uint32_t file_open(HFile *f) {
     return h_new(o);
 }
 /* Directory handle: Read returns 0x228-byte entries (UTF-16 name, 8.3 name and extension, attributes, size). */
-typedef struct { DIR *d; char path[1024]; } HDir;
+typedef struct { DIR *d; char path[1024]; uint32_t pos; } HDir;   /* pos: entries handed out (save states) */
 static void dir_session(KObject *s, uint32_t *cmd) {
     HDir *hd = s->user;
     switch (cmd[0] >> 16) {
@@ -383,7 +386,7 @@ static void dir_session(KObject *s, uint32_t *cmd) {
             ent[0x21c] = (uint8_t)isdir; ent[0x21e] = (uint8_t)!isdir;
             uint64_t size = isdir ? 0 : (uint64_t)st.st_size; memcpy(ent + 0x220, &size, 8);
             memcpy((uint8_t *)(uintptr_t)ptr + n * 0x228, ent, sizeof ent);
-            n++;
+            n++; hd->pos++;
         }
         reply(cmd, 2, 2); cmd[2] = n; cmd[3] = desc; cmd[4] = ptr; break;
     }
@@ -453,10 +456,11 @@ static HArchive *archive_get(uint32_t lo) { return lo >= 1 && lo <= 64 && archiv
 static uint32_t host_open(HArchive *a, uint32_t ptype, uint32_t psize, uint32_t pptr, uint32_t flags, uint32_t *out_handle) {
     char path[1024];
     if (!a || !a->root[0] || !fs_path(a->root, ptype, psize, pptr, path, sizeof path)) return FS_NOT_FOUND;
-    int fd = open(path, ((flags & 2) ? O_RDWR : O_RDONLY) | ((flags & 4) ? O_CREAT : 0), 0644);
+    int of = ((flags & 2) ? O_RDWR : O_RDONLY) | ((flags & 4) ? O_CREAT : 0);
+    int fd = open(path, of, 0644);
     LOG(1, "fs: open %s flags %x -> %s", path, flags, fd < 0 ? "not found" : "ok");
     if (fd < 0) return FS_NOT_FOUND;
-    HFile *f = calloc(1, sizeof *f); f->fd = fd;
+    HFile *f = calloc(1, sizeof *f); f->fd = fd; f->kind = 0; f->oflags = of & ~O_CREAT; snprintf(f->path, sizeof f->path, "%s", path);
     *out_handle = file_open(f);
     return RES_OK;
 }
@@ -478,7 +482,7 @@ static uint32_t content_open(uint32_t lo, uint32_t hi, uint32_t fsize, uint32_t 
     if ((f = romfs_image(sp))) { LOG(1, "fs: system archive %s", sp); *h = file_open(f); return RES_OK; }
     LOG(1, "fs: the game asks for title %08x%08x's content, expected at %s", hi, lo, sp);
     if (getenv("RB_FAKE_SYSARCHIVES")) {                               /* debugging aid only: an all-zero file */
-        f = calloc(1, sizeof *f); f->fd = open("/dev/zero", O_RDONLY); f->size = 0x100000; f->fixed = 1;
+        f = calloc(1, sizeof *f); f->fd = open("/dev/zero", O_RDONLY); f->size = 0x100000; f->fixed = 1; f->kind = 3;
         LOG(1, "fs: RB_FAKE_SYSARCHIVES is set, serving zeros instead");
         *h = file_open(f); return RES_OK;
     }
@@ -595,6 +599,7 @@ static void fs_user(KObject *s, uint32_t *cmd) {
 static KObject *hid_mem, *hid_ev[5];
 static uint32_t pad_idx, acc_idx, gyro_idx, pad_state;
 static int16_t accel_rest[3] = { 0, -512, 0 };
+static int accel_on, gyro_on;
 static uint64_t hid_ticks(void) { return (uint64_t)((unsigned __int128)now_ns() * 268111856u / 1000000000u); }
 static void hid_section(uint8_t *b, uint32_t *idx, uint32_t count, uint32_t entry_off, uint32_t entry_size, const void *entry) {
     uint32_t i = *idx = (*idx + 1) % count;
@@ -649,13 +654,13 @@ static void hid(KObject *s, uint32_t *cmd) {
             for (int i = 0; i < 5; i++) hid_ev[i] = k_event(0);
             const char *a = getenv("RB_ACCEL");
             if (a) sscanf(a, "%hd,%hd,%hd", &accel_rest[0], &accel_rest[1], &accel_rest[2]);
-            k_add_periodic(hid_pad_tick, 1000000000ull / 234);
+            k_add_periodic(hid_pad_tick, 1000000000ull / 234, "hid pad");
         }
         reply(cmd, 1, 7); cmd[2] = 0x14000000; cmd[3] = h_new(hid_mem);
         for (int i = 0; i < 5; i++) cmd[4 + i] = h_new(hid_ev[i]);
         break;
-    case 0x0011: { static int on; if (!on++) k_add_periodic(hid_accel_tick, 1000000000ull / 104); LOG(1, "hid: accelerometer enabled"); reply(cmd, 1, 0); break; }
-    case 0x0013: { static int on; if (!on++) k_add_periodic(hid_gyro_tick, 1000000000ull / 101); LOG(1, "hid: gyroscope enabled"); reply(cmd, 1, 0); break; }
+    case 0x0011: { if (!accel_on++) k_add_periodic(hid_accel_tick, 1000000000ull / 104, "hid accel"); LOG(1, "hid: accelerometer enabled"); reply(cmd, 1, 0); break; }
+    case 0x0013: { if (!gyro_on++) k_add_periodic(hid_gyro_tick, 1000000000ull / 101, "hid gyro"); LOG(1, "hid: gyroscope enabled"); reply(cmd, 1, 0); break; }
     case 0x0012: case 0x0014: reply(cmd, 1, 0); break;               /* disable: keep publishing, harmless */
     case 0x0015: { float k = 14.375f; reply(cmd, 2, 0); memcpy(&cmd[2], &k, 4); break; }
     case 0x0016: { int16_t p[9] = { 0, 6700, -6700, 0, 6700, -6700, 0, 6700, -6700 };   /* gyroscope calibration */
@@ -721,7 +726,7 @@ static void dsp_cmd(KObject *s, uint32_t *cmd) {
             case 0: case 2:                                            /* Initialize / Wakeup */
                 if (buf[0] == 0) memset((void *)(uintptr_t)DSP_MEM, 0, 0x80000);
                 dsp_on = 1; dsp_send_struct_addresses();
-                if (!dsp_ticking) { dsp_ticking = 1; k_add_periodic(dsp_tick, 4888700); }   /* 1310720 ARM11 cycles */
+                if (!dsp_ticking) { dsp_ticking = 1; k_add_periodic(dsp_tick, 4888700, "dsp"); }   /* 1310720 ARM11 cycles */
                 LOG(1, "dsp: audio pipe %s, audio running", buf[0] ? "wakeup" : "initialize");
                 break;
             case 1: dsp_on = 0; LOG(1, "dsp: audio pipe shutdown"); break;
@@ -756,8 +761,8 @@ static void dsp_cmd(KObject *s, uint32_t *cmd) {
 
 /* ---- Network and social services of a console that is offline: no StreetPass, SpotPass, friends or Wi-Fi. ---- */
 static KObject *offline_event(KObject **slot) { if (!*slot) *slot = k_event(0); return *slot; }
+static KObject *info_ev, *state_ev;
 static void cecd(KObject *s, uint32_t *cmd) {                         /* cecd:u, StreetPass */
-    static KObject *info_ev, *state_ev;
     switch (cmd[0] >> 16) {
     case 0x000e: reply(cmd, 2, 0); cmd[2] = 0; break;                  /* GetCecdState: idle */
     case 0x000f: reply(cmd, 1, 2); cmd[2] = 0; cmd[3] = h_new(offline_event(&info_ev)); break;   /* GetCecInfoEventHandle */
@@ -818,7 +823,7 @@ static void ac(KObject *s, uint32_t *cmd) {                           /* ac:u / 
 
 /* ---- ir:rst: the New 3DS ZL / ZR buttons and C-stick (layout per Azahar) ---- */
 static KObject *rst_mem, *rst_ev;
-static uint32_t rst_idx = 7, rst_state; static int rst_on;
+static uint32_t rst_idx = 7, rst_state; static int rst_on, rst_ticking;
 static void rst_tick(void) {
     if (!rst_on) return;
     uint8_t *m = rst_mem->mem;
@@ -839,8 +844,8 @@ static void irrst(KObject *s, uint32_t *cmd) {
     switch (cmd[0] >> 16) {
     case 0x0001: reply(cmd, 1, 3); cmd[2] = 0x14000000; cmd[3] = h_new(rst_mem); cmd[4] = h_new(rst_ev); break;   /* GetHandles */
     case 0x0002: {                                                     /* Initialize(update period ms, raw C-stick) */
-        static int ticking; uint32_t ms = cmd[1] ? cmd[1] : 10;
-        rst_on = 1; if (!ticking++) k_add_periodic(rst_tick, (uint64_t)ms * 1000000ull);
+        uint32_t ms = cmd[1] ? cmd[1] : 10;
+        rst_on = 1; if (!rst_ticking++) k_add_periodic(rst_tick, (uint64_t)ms * 1000000ull, "ir:rst");
         LOG(1, "ir:rst: ZL/ZR and C-stick every %u ms", ms); reply(cmd, 1, 0); break;
     }
     case 0x0003: rst_on = 0; reply(cmd, 1, 0); break;                  /* Shutdown */
@@ -848,22 +853,22 @@ static void irrst(KObject *s, uint32_t *cmd) {
     }
 }
 /* ---- ir:USER: infrared accessories (Circle Pad Pro); none is attached ---- */
+static KObject *ir_conn_ev, *ir_send_ev, *ir_recv_ev, *ir_mem;
 static void iruser(KObject *s, uint32_t *cmd) {
-    static KObject *conn_ev, *send_ev, *recv_ev, *mem;
-    if (!conn_ev) { conn_ev = k_event(0); send_ev = k_event(0); recv_ev = k_event(0); }
+    if (!ir_conn_ev) { ir_conn_ev = k_event(0); ir_send_ev = k_event(0); ir_recv_ev = k_event(0); }
     switch (cmd[0] >> 16) {
     case 0x0018:                                                       /* InitializeIrNopShared(..., shared memory) */
-        mem = h_get(cmd[8]);
-        if (mem && mem->mem) { memset(mem->mem, 0, 16); mem->mem[0x0e] = 1; }
+        ir_mem = h_get(cmd[8]);
+        if (ir_mem && ir_mem->mem) { memset(ir_mem->mem, 0, 16); ir_mem->mem[0x0e] = 1; }
         reply(cmd, 1, 0); break;
     case 0x0006:                                                       /* RequireConnection: nothing answers */
-        if (mem && mem->mem) { mem->mem[0x08] = 1; mem->mem[0x09] = 2; }
+        if (ir_mem && ir_mem->mem) { ir_mem->mem[0x08] = 1; ir_mem->mem[0x09] = 2; }
         reply(cmd, 1, 0); break;
-    case 0x0009: if (mem && mem->mem) { mem->mem[0x08] = 0; mem->mem[0x0c] = 0; } reply(cmd, 1, 0); break;   /* Disconnect */
-    case 0x0002: mem = 0; reply(cmd, 1, 0); break;                     /* FinalizeIrNop */
-    case 0x000a: reply(cmd, 1, 2); cmd[2] = 0; cmd[3] = h_new(recv_ev); break;   /* GetReceiveEvent */
-    case 0x000b: reply(cmd, 1, 2); cmd[2] = 0; cmd[3] = h_new(send_ev); break;   /* GetSendEvent */
-    case 0x000c: reply(cmd, 1, 2); cmd[2] = 0; cmd[3] = h_new(conn_ev); break;   /* GetConnectionStatusEvent */
+    case 0x0009: if (ir_mem && ir_mem->mem) { ir_mem->mem[0x08] = 0; ir_mem->mem[0x0c] = 0; } reply(cmd, 1, 0); break;   /* Disconnect */
+    case 0x0002: ir_mem = 0; reply(cmd, 1, 0); break;                     /* FinalizeIrNop */
+    case 0x000a: reply(cmd, 1, 2); cmd[2] = 0; cmd[3] = h_new(ir_recv_ev); break;   /* GetReceiveEvent */
+    case 0x000b: reply(cmd, 1, 2); cmd[2] = 0; cmd[3] = h_new(ir_send_ev); break;   /* GetSendEvent */
+    case 0x000c: reply(cmd, 1, 2); cmd[2] = 0; cmd[3] = h_new(ir_conn_ev); break;   /* GetConnectionStatusEvent */
     case 0x000d: reply(cmd, 1, 0); cmd[1] = 0xc8a0000du; break;        /* SendIrNop: not connected (13, InvalidState; module not checked) */
     case 0x0019: reply(cmd, 1, 0); cmd[1] = 0xc88003efu; break;        /* ReleaseReceivedData: no data (NoData, NotFound; module not checked) */
     default: stub(s, cmd);
@@ -899,7 +904,76 @@ void services_init(const char *dir) {
     nfc_set_dir(data_dir);
     romfs.size = romfs_open(dir);
     if (!romfs.size) fatal("cannot open %s/romfs.bin", dir);
-    romfs.fixed = 1; romfs.virt = 1;
+    romfs.fixed = 1; romfs.virt = 1; romfs.kind = 1;
     char up[600]; snprintf(up, sizeof up, "%s/update_romfs.bin", dir);
     if ((update_romfs = romfs_image(up))) LOG(1, "fs: the game has an update (RomFS %llu MB)", (unsigned long long)(update_romfs->size >> 20));
+}
+
+
+/* ---- save states ---- */
+static ServiceFn session_handler(const char *name) {
+    if (!strcmp(name, "file")) return file_session;
+    if (!strcmp(name, "dir")) return dir_session;
+    return service_lookup(name);
+}
+static void hfile_state(SS *s, HFile **pf) {
+    int load = ss_loading(s), have = *pf != 0;
+    SS_V(s, have);
+    if (!have) { if (load) *pf = 0; return; }
+    HFile t = load ? (HFile){ 0 } : **pf;
+    SS_V(s, t.kind); SS_V(s, t.oflags); SS_V(s, t.base); SS_V(s, t.size); SS_V(s, t.fixed); ss_str(s, t.path, sizeof t.path);
+    if (!load) return;
+    if (t.kind == 1) { *pf = &romfs; return; }
+    if (t.kind == 2) { *pf = romfs_image(t.path); if (!*pf) fatal("save state: %s is gone", t.path); return; }
+    HFile *f = calloc(1, sizeof *f); *f = t;
+    f->fd = t.kind == 3 ? open("/dev/zero", O_RDONLY) : open(t.path, t.oflags);
+    if (f->fd < 0) fatal("save state: cannot reopen %s (%s)", t.path, strerror(errno));
+    *pf = f;
+}
+void services_state(SS *s) {
+    int load = ss_loading(s);
+    ss_tag(s, "services");
+    ss_obj(s, &apt_lock); ss_obj(s, &apt_notify_ev); ss_obj(s, &apt_param_ev); ss_obj(s, &font);
+    SS_V(s, apt_param_pending); SS_V(s, apt_cpu_percent);
+    char dd[512]; snprintf(dd, sizeof dd, "%s", data_dir); ss_str(s, dd, sizeof dd);
+    for (int i = 0; i < 64; i++) {                         /* archives; their folders follow this run's data folder */
+        HArchive *a = &archives[i];
+        SS_V(s, a->id); SS_V(s, a->used); SS_V(s, a->tid_lo); SS_V(s, a->tid_hi); ss_str(s, a->root, sizeof a->root);
+        size_t n = strlen(dd);
+        if (load && n && !strncmp(a->root, dd, n) && (a->root[n] == '/' || !a->root[n])) {
+            char t[600]; snprintf(t, sizeof t, "%s%s", data_dir, a->root + n); snprintf(a->root, sizeof a->root, "%s", t);
+        }
+    }
+    ss_obj(s, &hid_mem); for (int i = 0; i < 5; i++) ss_obj(s, &hid_ev[i]);
+    SS_V(s, pad_idx); SS_V(s, acc_idx); SS_V(s, gyro_idx); SS_V(s, pad_state); SS_V(s, accel_rest); SS_V(s, accel_on); SS_V(s, gyro_on);
+    ss_obj(s, &dsp_sem_ev); for (int i = 0; i < 4; i++) ss_obj(s, &dsp_pipe_ev[i]);
+    SS_V(s, dsp_pipe); SS_V(s, dsp_pipe_len); SS_V(s, dsp_on); SS_V(s, dsp_ticking); SS_V(s, dsp_frames);
+    ss_obj(s, &info_ev); ss_obj(s, &state_ev);
+    ss_obj(s, &rst_mem); ss_obj(s, &rst_ev); SS_V(s, rst_idx); SS_V(s, rst_state); SS_V(s, rst_on); SS_V(s, rst_ticking);
+    ss_obj(s, &ir_conn_ev); ss_obj(s, &ir_send_ev); ss_obj(s, &ir_recv_ev); ss_obj(s, &ir_mem);
+    ss_tag(s, "sessions");
+    int no = k_object_count(); SS_V(s, no);
+    for (int i = 0; i < no; i++) {
+        KObject *o = k_object(i);
+        if (o->type != K_SESSION) continue;
+        if (load) o->handler = session_handler(o->name);
+        if (!strcmp(o->name, "file")) { HFile *f = o->user; hfile_state(s, &f); o->user = f; }
+        else if (!strcmp(o->name, "dir")) {
+            HDir *hd = o->user; int have = hd != 0; SS_V(s, have);
+            if (!have) { if (load) o->user = 0; continue; }
+            if (load) { hd = calloc(1, sizeof *hd); o->user = hd; }
+            ss_str(s, hd->path, sizeof hd->path); SS_V(s, hd->pos);
+            if (load) {                                   /* reopen, past the entries already handed out */
+                hd->d = opendir(hd->path); uint32_t k = 0; struct dirent *e;
+                while (hd->d && k < hd->pos && (e = readdir(hd->d))) if (strcmp(e->d_name, ".") && strcmp(e->d_name, "..")) k++;
+            }
+        }
+    }
+    if (load) {
+        if (hid_mem) k_periodic_restore("hid pad", hid_pad_tick);
+        if (accel_on) k_periodic_restore("hid accel", hid_accel_tick);
+        if (gyro_on) k_periodic_restore("hid gyro", hid_gyro_tick);
+        if (dsp_ticking) k_periodic_restore("dsp", dsp_tick);
+        if (rst_ticking) k_periodic_restore("ir:rst", rst_tick);
+    }
 }

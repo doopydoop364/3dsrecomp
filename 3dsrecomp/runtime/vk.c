@@ -1379,3 +1379,14 @@ int vkr_init(void) {
     LOG(1, "vulkan: rendering on %s at %ux (depth-stencil format %s)", props.deviceName, scale, d24fmt == VK_FORMAT_D24_UNORM_S8_UINT ? "D24S8" : "D32FS8");
     return 1;
 }
+
+/* After a save state loaded: guest memory is the truth again, so every cached surface, texture and display snapshot
+ * is dropped (nothing is written back: what they held is older than the loaded memory). */
+void vkr_forget(void) {
+    if (!vkr_on) return;
+    submit_wait();
+    for (int i = 0; i < NSURF; i++) if (surf[i].used) drop_surface(&surf[i]);
+    for (int i = 0; i < NTEX; i++) if (texs[i].used) { bury(&texs[i].im); texs[i].used = 0; }
+    for (int i = 0; i < NDISP; i++) disp[i].valid = 0;
+    nlinks = 0;
+}

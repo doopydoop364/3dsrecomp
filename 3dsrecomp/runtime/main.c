@@ -32,6 +32,7 @@ static void usage(void) {
         "  --fullscreen         start in fullscreen              --set SECTION.KEY=VALUE   any settings.toml value\n", prog_name);
     exit(1);
 }
+void control_vblank(uint64_t frame);
 int main(int argc, char **argv) {
     /* RB_ALLOW_ATTACH=1: let a debugger or profiler attach to this process (gdb -p, perf -p) although the system
      * only allows that for child processes (Yama ptrace_scope 1). It opens only this process, only when asked. */
@@ -142,6 +143,10 @@ int main(int argc, char **argv) {
     input_init();
     audio_init();
     services_init(dir);
-    k_thread_create(text, 0, STACK_TOP, exh[0x20f] ? exh[0x20f] : 0x30);
+    state_set_argv(argv);
+    const char *st = getenv("RB_LOAD_STATE");
+    if (st && *st) { k_thread_create(text, 0, STACK_TOP, exh[0x20f] ? exh[0x20f] : 0x30); state_load(st); unsetenv("RB_LOAD_STATE");
+                    control_vblank(gpu_frame()); }   /* live control: pause at the loaded frame itself */
+    else k_thread_create(text, 0, STACK_TOP, exh[0x20f] ? exh[0x20f] : 0x30);
     k_run();
 }

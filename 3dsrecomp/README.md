@@ -59,7 +59,16 @@ Copy `settings.example.toml` to `settings.toml` in the folder you run from (or p
 Defaults: WASD circle pad, arrow keys d-pad, I/J/K/L = X/Y/B/A (a diamond like the 3DS), Q/E = L/R,
 = Start, - Select; gamepads by Nintendo button position; left mouse on the bottom screen is the stylus.
 Hotkeys: F1 next layout (stacked, large top, top only, side by side), F2 swap screens, F3 show the bottom
-screen in top-only mode, F11 fullscreen, F12 screenshot, Escape quit. `RB_INPUT` scripts input for tests.
+screen in top-only mode, F7 save state, F8 load state, F11 fullscreen, F12 screenshot, Escape quit. `RB_INPUT` scripts
+input for tests.
+
+## Save states
+F7 saves the whole console as it is (`~/.local/share/3dsrecomp/<title id>/states/quick.state`), F8 goes back to it.
+Loading restarts the program with the state (the window reopens). States keep working after the game is rebuilt or
+3dsrecomp is updated (unless the state format changes): they hold the 3DS's memory, threads, kernel objects and
+services, not the PC program's, and each thread continues from its registers (the recompiler marks every place a
+paused thread can continue from). `tools/play.py` has `save PATH` / `load PATH`; `RB_LOAD_STATE=<file>` starts a game
+from a state; `RB_TEST_RESUME=<frame>` checks the thread part alone. Design: `runtime/state.c`.
 
 ## Robobot controls (games/0004000000183600.toml)
 WASD move (double-tap to dash) · W or Space jump/hover · J inhale/attack/armor punch · K drop ability / reset specs ·

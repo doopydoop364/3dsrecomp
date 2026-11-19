@@ -15,6 +15,11 @@ KThread *cur;
 int log_level = 1;
 recomp_fn *recomp_table;
 uint64_t gpu_frame(void) { return 0; }
+uint32_t linear_base = 0x14000000u;   /* the runtime's (kernel.c); replays use the old layout */
+/* save states are not part of replays: pica.c's visitor links against these */
+int ss_loading(SS *s) { (void)s; return 0; }
+void ss_raw(SS *s, void *p, size_t n) { (void)s; (void)p; (void)n; }
+void ss_tag(SS *s, const char *t) { (void)s; (void)t; }
 void fatal(const char *fmt, ...) { fprintf(stderr, "fatal: %s\n", fmt); exit(1); }
 void recomp_trap(CPU *c, uint32_t addr, uint32_t info, const char *why) { (void)c; fprintf(stderr, "trap: %s %08x %08x\n", why, addr, info); exit(1); }
 

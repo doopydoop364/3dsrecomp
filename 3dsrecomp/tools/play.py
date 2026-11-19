@@ -12,6 +12,7 @@
           hold ITEMS       keep holding ITEMS;  release   let go of everything
           shot PATH        advance one frame and save it as a PNG (400x480: top screen above; bottom screen at
                            x 40..359, y 240..479, so a touch at picture (x, y) is touch=(x-40)/(y-240))
+          save PATH        write a save state;  load PATH   load one (the game restarts with it, paused)
           frame            the current frame number;  quit   end the game
         ITEMS: buttons A B X Y L R ZL ZR START SELECT UP DOWN LEFT RIGHT, circle=X/Y and cstick=X/Y (-154..154, up is
         positive), touch=X/Y (bottom screen, 0..319 / 0..239), joined with commas: press A  press UP,circle=0/154 30
@@ -112,16 +113,26 @@ def start(argv):
     sys.exit("the game did not reach its first frame within 2 minutes; see " + os.path.join(sd, "game.log"))
 
 
-def send(name, commands):
+def connect(name, wait=120):
+    """A connection to the session's game; waits while it (re)starts, e.g. after loading a state."""
     sock = os.path.join(session(name), "sock")
-    if not alive(name):
-        sys.exit(f"session {name} is not running.\n{log_tail(name)}")
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        s.connect(sock)
-    except OSError as e:
-        sys.exit(f"cannot reach session {name}: {e}")
-    f = s.makefile("rw")
+    t0 = time.time()
+    while True:
+        if not alive(name):
+            sys.exit(f"session {name} is not running.\n{log_tail(name)}")
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.connect(sock)
+            return s, s.makefile("rw")
+        except OSError as e:
+            s.close()
+            if time.time() - t0 > wait:
+                sys.exit(f"cannot reach session {name}: {e}")
+            time.sleep(0.1)
+
+
+def send(name, commands):
+    s, f = connect(name)
     for c in commands:
         f.write(c.strip() + "\n"); f.flush()
         reply = f.readline()
@@ -130,6 +141,10 @@ def send(name, commands):
         print(f"{c}: {reply.strip()}", flush=True)
         if reply.startswith("ok bye"):
             break
+        if reply.startswith("ok loading"):              # the game restarts with the state: reconnect when it listens
+            s.close()
+            time.sleep(0.3)
+            s, f = connect(name)
     s.close()
 
 

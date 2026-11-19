@@ -95,7 +95,7 @@ void nfc_set_dir(const char *game_dir) { snprintf(game_amiibo_dir, sizeof game_a
 void nfc_service(KObject *s, uint32_t *cmd) {
     uint32_t id = cmd[0] >> 16, a = cmd[1];
     if (!ev_in) { ev_in = k_event(0); ev_out = k_event(0); }
-    if (!ticking) { ticking = 1; k_add_periodic(tick, 50000000); }
+    if (!ticking) { ticking = 1; k_add_periodic(tick, 50000000, "nfc"); }
     switch (id) {
     case 0x01:                                                          /* Initialize(mode) */
         reply(cmd, 1, 0);
@@ -206,4 +206,13 @@ void nfc_service(KObject *s, uint32_t *cmd) {
         reply(cmd, 1, 0);
     }
     LOG(2, "nfc: cmd %04x -> %08x (device state %d)", id, cmd[1], dstate);
+}
+
+
+/* ---- save states ---- */
+void nfc_state(SS *s) {
+    ss_tag(s, "nfc");
+    SS_V(s, mode); SS_V(s, dstate); SS_V(s, cstate); ss_obj(s, &ev_in); ss_obj(s, &ev_out);
+    SS_V(s, tag); SS_V(s, last_touch_ns); SS_V(s, ticking);
+    if (ss_loading(s) && ticking) k_periodic_restore("nfc", tick);
 }
