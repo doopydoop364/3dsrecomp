@@ -563,11 +563,15 @@ static void menu_loop(SDL_Texture *tt, SDL_Texture *tb) {
     ff_on = 0; k_set_fast_forward(0);
 }
 
+static char next_shot[512];
+void video_shot_next(const char *path) { snprintf(next_shot, sizeof next_shot, "%s", path); }   /* control.c: shot PATH */
+
 /* Called once per vertical blank with the framebuffers the game currently displays (0 = none yet). */
 void video_frame(uint64_t frame, const uint8_t *top, uint32_t top_stride, uint32_t top_fmt,
                  const uint8_t *bot, uint32_t bot_stride, uint32_t bot_fmt) {
     int want_shot = 0;
     for (int i = 0; i < nshots; i++) if (shots[i] == frame) want_shot = 1;
+    if (next_shot[0]) want_shot = 2;
     static int prof = -1; if (prof < 0) prof = getenv("RB_PROFILE_PRESENT") != 0;   /* test: time the window path headless */
     if (headless && !want_shot && !prof) return;
     { struct timespec a; clock_gettime(CLOCK_MONOTONIC, &a); double now = (double)a.tv_sec * 1e3 + (double)a.tv_nsec / 1e6;
@@ -584,7 +588,8 @@ void video_frame(uint64_t frame, const uint8_t *top, uint32_t top_stride, uint32
     clock_gettime(CLOCK_MONOTONIC, &t1);
     if (prof) { static double acc; static int n; acc += (double)(t1.tv_sec - t0.tv_sec) * 1e3 + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
                 if (++n == 300) { fprintf(stderr, "present: compose %.2f ms/frame\n", acc / n); acc = 0; n = 0; } }
-    if (want_shot) {
+    if (want_shot == 2) { write_png(next_shot); next_shot[0] = 0; }
+    else if (want_shot) {
         char p[64]; snprintf(p, sizeof p, "build/shot_%06llu.png", (unsigned long long)frame); write_png(p);
         if (hi) { snprintf(p, sizeof p, "build/shot_%06llu_hi.png", (unsigned long long)frame); write_png_buf(p, frame_hi, OUT_W * hi_scale, OUT_H * hi_scale); }
     }

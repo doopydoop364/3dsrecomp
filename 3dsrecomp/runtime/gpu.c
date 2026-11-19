@@ -154,6 +154,7 @@ static void run_queue(void) {
         }
     }
 }
+void control_vblank(uint64_t frame);
 static void vblank(void) {
     frames++;
     { static int64_t dump_at = -2; if (dump_at == -2) { const char *s = getenv("RB_MEMDUMP_FRAME"); dump_at = s ? atoll(s) : -1; }
@@ -188,6 +189,7 @@ static void vblank(void) {
     irq(IRQ_PDC0); irq(IRQ_PDC1);
     { static int64_t exit_at = -2; if (exit_at == -2) { const char *e = getenv("RB_EXIT_FRAME"); exit_at = e ? atoll(e) : -1; }
       if ((int64_t)frames == exit_at) { gpu_report(); exit(0); } }   /* tests: stop after a fixed frame */
+    control_vblank(frames);                                            /* RB_CONTROL: wait for the next command */
 }
 
 void gsp_service(KObject *s, uint32_t *cmd) {

@@ -233,6 +233,14 @@ emulator; enhancements never change game timing (virtual clock); per-game data b
 - Calls to the fplib NaN/Inf dispatcher (0x232cf4), hand-made return addresses and the static-initialiser
   table (0x675158) are special-cased.
 
+## Playing step by step (scripts and agents)
+`tools/play.py start <title id> [--fresh]` starts a game headless and uncapped in its own copy
+(`work/<id>/live_<name>/`, never the folder you play in), paused at its first frame. `tools/play.py <name> "press A"
+"run 300" "shot out.png"` then sends commands one at a time: `run N`, `press ITEMS [N]`, `hold ITEMS`, `release`,
+`shot PATH`, `frame`, `quit` (ITEMS as in `RB_INPUT`, e.g. `UP,circle=0/154` or `touch=160/69`). The game waits,
+paused, for each next command, so whoever drives it can look at a screenshot and decide. `tools/play.py stop <name>`
+ends it; `tools/play.py --help` has the details. Under the hood: `RB_CONTROL=<socket>` (`runtime/control.c`).
+
 ## Scripted path to gameplay
 `tests/play.sh "<RB_INPUT>" "<RB_SHOT frames>" <exit frame>` restores `build/pristine/` (a save the game made on a clean
 boot: copy `game/save`, `game/extdata`, `game/extdata_shared` there) before every run, because the game writes its save
