@@ -58,6 +58,7 @@ def prepare_copy(tid, name, fresh):
         shutil.rmtree(dst)
     new = not os.path.isdir(dst)
     os.makedirs(dst, exist_ok=True)
+    open(os.path.join(dst, "data_in_folder"), "w").close()   # its save data stays in this copy, not the player's folder
     for f in READ_ONLY:
         if os.path.exists(os.path.join(src, f)) and not os.path.lexists(os.path.join(dst, f)):
             os.symlink(os.path.join(src, f), os.path.join(dst, f))

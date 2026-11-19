@@ -11,10 +11,47 @@
 #include <fcntl.h>
 #include <strings.h>
 #include <ftw.h>
+#include <limits.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 static const char *game_dir;
+/* The player's data for this game (save data, extra data, SD card files, StreetPass messages, amiibo dumps) lives
+ * outside the game folder, so rebuilding or reinstalling a game never touches it:
+ *   $RB_DATA_DIR if set; else the game folder itself if it contains a file named data_in_folder (test copies made by
+ *   tests/testgame.sh and tools/play.py, so scripted runs never reach the player's data); else
+ *   $XDG_DATA_HOME/3dsrecomp/<title id> (default ~/.local/share/3dsrecomp/<title id>).
+ * Data still in the game folder from before (2026-11-19) is moved there on the first start. */
+static char data_dir[512];
+static const char *const DATA_ITEMS[] = { "save", "extdata", "extdata_shared", "sdmc", "cecd", "amiibo" };
+static void mkdirs(const char *path) {
+    char p[512]; snprintf(p, sizeof p, "%s", path);
+    for (char *q = p + 1; *q; q++) if (*q == '/') { *q = 0; mkdir(p, 0755); *q = '/'; }
+    mkdir(p, 0755);
+}
+static void data_dir_init(const char *dir) {
+    const char *env = getenv("RB_DATA_DIR");
+    char marker[600]; snprintf(marker, sizeof marker, "%s/data_in_folder", dir);
+    if (env && *env) snprintf(data_dir, sizeof data_dir, "%s", env);
+    else if (!access(marker, F_OK)) snprintf(data_dir, sizeof data_dir, "%s", dir);
+    else {
+        const char *x = getenv("XDG_DATA_HOME"), *h = getenv("HOME");
+        if (x && *x) snprintf(data_dir, sizeof data_dir, "%s/3dsrecomp/%016llx", x, (unsigned long long)RECOMP_TITLE_ID);
+        else snprintf(data_dir, sizeof data_dir, "%s/.local/share/3dsrecomp/%016llx", h ? h : ".", (unsigned long long)RECOMP_TITLE_ID);
+    }
+    mkdirs(data_dir);
+    char a[600], b[600], ra[PATH_MAX], rb[PATH_MAX];
+    if (!realpath(dir, ra) || !realpath(data_dir, rb) || !strcmp(ra, rb)) { fprintf(stderr, "data: %s\n", data_dir); return; }
+    for (unsigned i = 0; i < sizeof DATA_ITEMS / sizeof *DATA_ITEMS; i++) {   /* move what an older version kept here */
+        snprintf(a, sizeof a, "%s/%s", dir, DATA_ITEMS[i]); snprintf(b, sizeof b, "%s/%s", data_dir, DATA_ITEMS[i]);
+        struct stat st;
+        if (lstat(a, &st)) continue;
+        if (!lstat(b, &st)) { fprintf(stderr, "data: %s is left alone: %s already exists\n", a, b); continue; }
+        if (rename(a, b)) fatal("cannot move %s to %s (%s); move it by hand", a, b, strerror(errno));
+        fprintf(stderr, "data: moved %s to %s\n", a, b);
+    }
+    fprintf(stderr, "data: %s\n", data_dir);
+}
 /* System data shared by all games (shared font, system archives): <game>/sysarchives/<name>, else the folder in
  * $RB_SYSTEM_DIR (3dsrecomp run sets it), else system/sysarchives/<name> under the current folder. */
 static void sys_path(char *out, size_t n, const char *name) {
@@ -249,7 +286,7 @@ static void quiet_ok(KObject *s, uint32_t *cmd) {
 #define FS_EXISTS    0xc82044beu
 typedef struct { int fd; uint64_t base, size; int fixed, virt; } HFile;   /* virt: the game RomFS (romfs.c) */
 uint64_t romfs_open(const char *dir); int64_t romfs_read(uint64_t off, uint32_t size, uint8_t *dst);
-typedef struct { uint32_t id; char root[300]; int used; uint32_t tid_lo, tid_hi; } HArchive;   /* tid: archive 0x2345678A */
+typedef struct { uint32_t id; char root[600]; int used; uint32_t tid_lo, tid_hi; } HArchive;   /* tid: archive 0x2345678A */
 static HArchive archives[64];         /* open archive handles: slot + 1 */
 
 /* A RomFS image on the host, served from its IVFC level-3 data (what a game reads through the content archive, as
@@ -322,7 +359,7 @@ static uint32_t file_open(HFile *f) {
     return h_new(o);
 }
 /* Directory handle: Read returns 0x228-byte entries (UTF-16 name, 8.3 name and extension, attributes, size). */
-typedef struct { DIR *d; char path[600]; } HDir;
+typedef struct { DIR *d; char path[1024]; } HDir;
 static void dir_session(KObject *s, uint32_t *cmd) {
     HDir *hd = s->user;
     switch (cmd[0] >> 16) {
@@ -360,8 +397,8 @@ static HFile romfs, *update_romfs;     /* the game's RomFS; an update's RomFS (S
 #define FS_NOT_FORMATTED 0xc8a04554u
 #define FS_ARCHIVE_NOT_FOUND 0xc8a04478u
 static void extdata_root(char *out, size_t n, int shared, uint32_t lo, uint32_t hi) {
-    snprintf(out, n, "%s/%s", game_dir, shared ? "extdata_shared" : "extdata"); mkdir(out, 0755);
-    snprintf(out, n, "%s/%s/%08x%08x", game_dir, shared ? "extdata_shared" : "extdata", hi, lo);
+    snprintf(out, n, "%s/%s", data_dir, shared ? "extdata_shared" : "extdata"); mkdir(out, 0755);
+    snprintf(out, n, "%s/%s/%08x%08x", data_dir, shared ? "extdata_shared" : "extdata", hi, lo);
 }
 #define FS_CARD_NOT_INSERTED 0xc880448du   /* game card not inserted (FS, not found), as Azahar answers */
 /* The game came from a cartridge dump (extract writes <game>/cartridge): it runs from a game card, not the SD card. */
@@ -393,29 +430,28 @@ static uint32_t archive_open(uint32_t id, uint32_t psize, uint32_t pptr, HArchiv
         return FS_CARD_NOT_INSERTED;
     } else if ((id == 0x567890b2 || id == 0x567890b4) && psize >= 8 &&
                (ld32(pptr + 4) & 0xffffff) != (uint32_t)((RECOMP_TITLE_ID >> 8) & 0xffffff)) {
-        /* another title's save data (path: media type, unique id): that game's save if it is also in work/ */
+        /* another title's save data (path: media type, unique id): that game's save, next to this game's data */
         uint32_t lo = (ld32(pptr + 4) & 0xffffff) << 8, hi = 0x00040000u;
-        char gd[300]; snprintf(gd, sizeof gd, "%s", game_dir);
-        char *s1 = strrchr(gd, '/'); if (s1) *s1 = 0;                 /* work/<id>/game -> work/<id> */
-        char *s2 = strrchr(gd, '/'); if (s2) *s2 = 0;                 /* -> work */
-        snprintf(a->root, sizeof a->root, "%s/%08x%08x/game/save", s1 && s2 ? gd : ".", hi, lo);
+        char gd[512]; snprintf(gd, sizeof gd, "%s", data_dir);
+        char *s1 = strrchr(gd, '/'); if (s1) *s1 = 0;                 /* .../3dsrecomp/<id> -> .../3dsrecomp */
+        snprintf(a->root, sizeof a->root, "%s/%08x%08x/save", s1 ? gd : ".", hi, lo);
         if (stat(a->root, &st)) { LOG(1, "fs: save data of title %08x%08x does not exist", hi, lo); return FS_ARCHIVE_NOT_FOUND; }
     } else if (id == 4 || id == 0x567890b2 || id == 0x567890b4) {      /* the game's save data: exists once formatted */
-        snprintf(a->root, sizeof a->root, "%s/save", game_dir);
+        snprintf(a->root, sizeof a->root, "%s/save", data_dir);
         if (stat(a->root, &st)) { LOG(1, "fs: save data is not formatted yet"); return FS_NOT_FORMATTED; }
     } else if (id == 0x2345678a) {                                   /* another title's content: path = title id, media */
         a->tid_lo = psize >= 4 ? ld32(pptr) : 0; a->tid_hi = psize >= 8 ? ld32(pptr + 4) : 0;
     } else if (id == 8) {
-        snprintf(a->root, sizeof a->root, "%s/save", game_dir); mkdir(a->root, 0755);
+        snprintf(a->root, sizeof a->root, "%s/save", data_dir); mkdir(a->root, 0755);
     } else if (id == 9) {
-        snprintf(a->root, sizeof a->root, "%s/sdmc", game_dir); mkdir(a->root, 0755);
+        snprintf(a->root, sizeof a->root, "%s/sdmc", data_dir); mkdir(a->root, 0755);
     }
     a->used = 1; *out = a;
     return RES_OK;
 }
 static HArchive *archive_get(uint32_t lo) { return lo >= 1 && lo <= 64 && archives[lo - 1].used ? &archives[lo - 1] : 0; }
 static uint32_t host_open(HArchive *a, uint32_t ptype, uint32_t psize, uint32_t pptr, uint32_t flags, uint32_t *out_handle) {
-    char path[600];
+    char path[1024];
     if (!a || !a->root[0] || !fs_path(a->root, ptype, psize, pptr, path, sizeof path)) return FS_NOT_FOUND;
     int fd = open(path, ((flags & 2) ? O_RDWR : O_RDONLY) | ((flags & 4) ? O_CREAT : 0), 0644);
     LOG(1, "fs: open %s flags %x -> %s", path, flags, fd < 0 ? "not found" : "ok");
@@ -450,7 +486,7 @@ static uint32_t content_open(uint32_t lo, uint32_t hi, uint32_t fsize, uint32_t 
 }
 static void fs_user(KObject *s, uint32_t *cmd) {
     uint32_t id = cmd[0] >> 16, res, h = 0;
-    char path[600];
+    char path[1024];
     switch (id) {
     case 0x0801: case 0x0861: case 0x0862: case 0x080d: reply(cmd, 1, 0); break;
     case 0x080e: { HArchive *a = archive_get(cmd[1]); if (a) a->used = 0; reply(cmd, 1, 0); break; }   /* CloseArchive */
@@ -500,7 +536,7 @@ static void fs_user(KObject *s, uint32_t *cmd) {
         reply(cmd, 1, 0); cmd[1] = res; break;
     }
     case 0x0805: case 0x080a: {                                        /* RenameFile, RenameDirectory */
-        HArchive *a = archive_get(cmd[2]), *b = archive_get(cmd[6]); char to[600]; res = FS_NOT_FOUND;
+        HArchive *a = archive_get(cmd[2]), *b = archive_get(cmd[6]); char to[1024]; res = FS_NOT_FOUND;
         if (a && b && a->root[0] && b->root[0] && fs_path(a->root, cmd[4], cmd[5], cmd[11], path, sizeof path) &&
             fs_path(b->root, cmd[8], cmd[9], cmd[13], to, sizeof to)) {
             struct stat st;
@@ -531,20 +567,20 @@ static void fs_user(KObject *s, uint32_t *cmd) {
         LOG(1, "fs: OpenArchive id %x -> %s", aid, res ? "does not exist" : a->root[0] ? a->root : "(no host folder)");
         reply(cmd, 3, 0); cmd[1] = res; cmd[2] = res ? 0 : (uint32_t)(a - archives) + 1; cmd[3] = 0; break;
     }
-    case 0x0851: { char root[300]; extdata_root(root, sizeof root, 0, cmd[2], cmd[3]); mkdir(root, 0755);   /* CreateExtSaveData */
+    case 0x0851: { char root[600]; extdata_root(root, sizeof root, 0, cmd[2], cmd[3]); mkdir(root, 0755);   /* CreateExtSaveData */
                    LOG(1, "fs: created extra data folder %s", root); reply(cmd, 1, 0); break; }
     case 0x0852: {                                                     /* DeleteExtSaveData(media, low, high) */
-        char root[300]; struct stat st; extdata_root(root, sizeof root, cmd[1] == 0, cmd[2], cmd[3]);
+        char root[600]; struct stat st; extdata_root(root, sizeof root, cmd[1] == 0, cmd[2], cmd[3]);
         res = stat(root, &st) ? FS_ARCHIVE_NOT_FOUND : rm_tree(root) ? FS_NOT_FOUND : RES_OK;
         LOG(1, "fs: delete extra data %s -> %08x", root, res); reply(cmd, 1, 0); cmd[1] = res; break;
     }
     case 0x084c: case 0x080f: {                                        /* FormatSaveData, FormatThisUserSaveData: empty save folder */
-        char root[300]; snprintf(root, sizeof root, "%s/save", game_dir);
+        char root[600]; snprintf(root, sizeof root, "%s/save", data_dir);
         if (id == 0x080f || cmd[1] == 4 || cmd[1] == 0x567890b2) { rm_tree(root); mkdir(root, 0755); LOG(1, "fs: formatted save data %s", root); }
         reply(cmd, 1, 0); break;
     }
     case 0x0817: case 0x0818: reply(cmd, 2, 0); cmd[2] = 1; break;     /* IsSdmcDetected / IsSdmcWritable */
-    case 0x0845: { char root[300]; struct stat st; snprintf(root, sizeof root, "%s/save", game_dir);   /* GetFormatInfo */
+    case 0x0845: { char root[600]; struct stat st; snprintf(root, sizeof root, "%s/save", data_dir);   /* GetFormatInfo */
                    if (cmd[1] == 4 && stat(root, &st)) { reply(cmd, 1, 0); cmd[1] = FS_NOT_FORMATTED; break; } }
                  reply(cmd, 5, 0); cmd[2] = 0x20000; cmd[3] = 8; cmd[4] = 8; cmd[5] = 0; break;   /* GetFormatInfo */
     case 0x0863: reply(cmd, 2, 0); cmd[2] = 0; break;                  /* GetPriority */
@@ -728,8 +764,8 @@ static void cecd(KObject *s, uint32_t *cmd) {                         /* cecd:u,
     case 0x0010: reply(cmd, 1, 2); cmd[2] = 0; cmd[3] = h_new(offline_event(&state_ev)); break;  /* GetChangeStateEventHandle */
     case 0x0011: case 0x0012: {          /* OpenAndWrite / OpenAndRead(size, program id, path type, flags, pid, buffer): one file per box item */
         uint32_t size = cmd[1], desc = cmd[7], ptr = cmd[8], n = 0;
-        char path[400]; snprintf(path, sizeof path, "%s/cecd", game_dir); mkdir(path, 0755);
-        snprintf(path, sizeof path, "%s/cecd/%08x_%u.bin", game_dir, cmd[2], cmd[3]);
+        char path[700]; snprintf(path, sizeof path, "%s/cecd", data_dir); mkdir(path, 0755);
+        snprintf(path, sizeof path, "%s/cecd/%08x_%u.bin", data_dir, cmd[2], cmd[3]);
         uint32_t res = RES_OK;
         if ((cmd[0] >> 16) == 0x0011) {
             FILE *f = fopen(path, "wb");
@@ -859,7 +895,8 @@ ServiceFn service_lookup(const char *name) {
 }
 void services_init(const char *dir) {
     game_dir = dir;
-    nfc_set_dir(dir);
+    data_dir_init(dir);
+    nfc_set_dir(data_dir);
     romfs.size = romfs_open(dir);
     if (!romfs.size) fatal("cannot open %s/romfs.bin", dir);
     romfs.fixed = 1; romfs.virt = 1;

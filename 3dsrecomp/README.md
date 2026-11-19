@@ -30,8 +30,10 @@ one-command tool for any CIA is in `docs/general_tool_design.md` (section 10).
     ./3dsrecomp run "My Game.cia" "My Game Update.cia" "My Game DLC.cia"   # with its update and DLC
 An update or DLC dump in the same folder as the game's dump is found by its title id and added too (once; a newer
 version replaces it). The update's program is what gets recompiled; DLC contents go to `work/<title id>/game/dlc/`.
-Everything for a game lives in `work/<title id>/`: `game/` (its data, saves, amiibo), `gen/` and `obj/` (generated
-code), `native` (the executable). `./3dsrecomp build` does everything but start the game. Each stage is skipped when its
+Everything for a game lives in `work/<title id>/`: `game/` (its data), `gen/` and `obj/` (generated code), `native`
+(the executable). Your saves are kept apart, in `~/.local/share/3dsrecomp/<title id>/` (`save/`, `extdata/`,
+`extdata_shared/`, `sdmc/`, `cecd/`, `amiibo/`; `$XDG_DATA_HOME` moves it, `RB_DATA_DIR` overrides it), so rebuilding
+or deleting `work/` never touches them; saves an older version kept in `game/` are moved there on the first start. `./3dsrecomp build` does everything but start the game. Each stage is skipped when its
 inputs did not change. If the game reaches code the analysis missed, `run` adds it to `work/<title id>/extra_functions.txt`,
 rebuilds and restarts. Console system data shared by all games (the shared font, the Mii archive) goes in
 `system/sysarchives/`. Robobot's folder moved to `work/0004000000183600/game`; `game` links to it, so
@@ -119,7 +121,7 @@ Put a file at `game/romfs_override/<path inside the RomFS>` and the game loads i
 `game/romfs_override/snd/stream/Title.dspadpcm.bcstm` replaces the title music.
 
 ## amiibo
-Put amiibo dumps (540-byte `.bin` files read from your figures) in `game/amiibo/`. When the game asks for an amiibo,
+Put amiibo dumps (540-byte `.bin` files read from your figures) in `~/.local/share/3dsrecomp/<title id>/amiibo/`. When the game asks for an amiibo,
 F5 taps the next one and F6 takes it away (it is also removed 3 seconds after the game stops reading it, as in Azahar).
 The game gets the figure's ID and serial number, which need no console keys; the figure's own save area is not
 available, and nothing is written back to the file. In Robobot the amiibo icon appears only after some story progress:

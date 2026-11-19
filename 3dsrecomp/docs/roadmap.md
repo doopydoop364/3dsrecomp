@@ -42,8 +42,9 @@ with the update, which is not in the library, so the base program never asks for
 (no library game opens it).
 
 ## Stage A: playtesting
-1. Saves outside the game folder (`~/.local/share/3dsrecomp/<title id>/`), moving existing saves once, so a rebuild,
-   reinstall or GameVault update never touches them. First, before more saves pile up.
+1. Saves outside the game folder — *done (2026-11-19)*: `~/.local/share/3dsrecomp/<title id>/` (save, extra data,
+   SD card, StreetPass, amiibo); saves still in a game folder move there on the first start. Test copies carry a
+   `data_in_folder` marker and keep their data inside, so scripted runs never reach the player's saves.
 2. Save states.
 3. Trial playthrough: one agent plays one game (Ocarina of Time) through `tools/play.py`, to settle how agents play,
    what they report and how much it costs. Agents read up on the game first, play in a throwaway copy, run 2-3 at a
