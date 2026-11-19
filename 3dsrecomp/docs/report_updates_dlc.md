@@ -28,3 +28,13 @@ Robobot regress 12/12. Smoke tests of all 8 other games pass; Ocarina, Xenoblade
 pixel-identical to before. Mario Kart 7 and Animal Crossing differ, but two runs of the same build differ as much
 (their smoke runs are not deterministic at those frames); Smash differs by its clock; Tomodachi Life by the changes
 above.
+
+## Benchmarks (tests/bench.sh, uncapped, host ms per game frame; 16.7 ms is 60 fps)
+| Game | frames | ms/frame | GPU lists | transfers | rest (game code, services) |
+|---|---|---|---|---|---|
+| Animal Crossing: New Leaf - Welcome amiibo | 5000 | 3.74 | 1.43 | 0.51 | 1.51 |
+| Pokémon X | 6000 | 4.81 | 2.33 | 0.31 | 1.99 |
+| Super Smash Bros. (first benchmark with its module) | 2400 | 9.66 | 3.12 | 0.64 | 4.82 |
+
+All three have room to spare. Smash spends the most outside the GPU (its game code), the first place to look in the
+phase 8 performance pass. Measured with a 4-core VM running on the same machine, so slightly pessimistic.
