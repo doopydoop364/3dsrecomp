@@ -39,6 +39,17 @@ rebuilds and restarts. Console system data shared by all games (the shared font,
 `system/sysarchives/`. Robobot's folder moved to `work/0004000000183600/game`; `game` links to it, so
 `./build/robobot-stable game` still works. Status: Robobot plays; other games build and start but need phase 5 work.
 
+## Homebrew (.3dsx)
+A homebrew program works like a dump: `./3dsrecomp run program.3dsx`. 3dsrecomp loads and relocates it itself (as
+Azahar's loader does: code, rodata and data at 0x00100000, page-aligned) and gives it a made-up title id in the
+homebrew range (from the file's bytes), since a .3dsx has none; nothing else needs to be installed.
+
+`tests/homebrew.py` checks the emulation against Azahar with homebrew test programs: it builds them from source,
+runs each in 3dsrecomp and in Azahar, and compares the screens. Building them needs devkitPro's 3DS toolchain
+(devkitARM, libctru, citro3d), installed through devkitPro's own pacman (https://devkitpro.org/wiki/Getting_Started;
+on Arch: their keyring and repositories, then `pacman -S 3ds-dev`). Thanks to the devkitPro team for the toolchain,
+libctru and citro3d, and for the examples the tests start from.
+
 ## Extract a game
     ./3dsrecomp extract "My Game.cia"          # -> work/<title id>/game/ (or --out game)
 Takes an original .cia (encrypted or not), a .3ds/.cci cartridge dump or a .cxi, decrypts on the fly and writes

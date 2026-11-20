@@ -14,7 +14,12 @@ static uint32_t pt_lut[6][256];             /* procedural texture: noise, -, col
                                              * (filled through 0x0B0-0x0B7, table and index in 0x0AF) */
 static uintptr_t cur_word;
 static uint32_t top_list, cur_list;         /* top-level list of this submission, and the list now executing */                 /* host address of the command word being executed */
-static int gs_b15;                          /* b15 of the geometry shader reads 1 after any invocation, until 0x280 is written */
+static int gs_b15;
+/* Immediate mode (0x232 = 15): attributes arrive one by one through 0x233-0x235; each complete vertex (0x242 + 1
+ * attributes) is shaded and fed to a primitive assembler that lasts across vertices (0x25e topology, 0x25f restart);
+ * triangles are drawn as they complete, as Azahar's DrawImmediate does. */
+static float imm_attr[16][4]; static uint32_t imm_cur; static int imm_nb, imm_odd;
+static void draw_immediate(void);                          /* b15 of the geometry shader reads 1 after any invocation, until 0x280 is written */
 static uintptr_t uni_src[96];              /* where each uniform's last upload came from */
 static PicaShader vs, gs;                  /* vertex and geometry shader units */
 static uint64_t vs_ver = 1, gs_ver = 1;     /* bumped on every program or swizzle write */
@@ -78,13 +83,21 @@ static uint32_t write_reg(uint32_t id, uint32_t value, uint32_t mask) {
     switch (id) {
     case 0x22e: draw(0); break;
     case 0x22f: draw(1); break;
-    case 0x232: dflt_n = 0; break;
+    case 0x232: dflt_n = 0; imm_cur = 0; break;
+    case 0x25e: case 0x25f: imm_nb = 0; imm_odd = 0; break;           /* topology / restart: a new primitive (immediate mode) */
     case 0x280: gs_b15 = 0; break;                                   /* the program sets b0-b15: b15 is its own again */
     case 0x233: case 0x234: case 0x235:                              /* fixed vertex attribute data */
         dflt_queue[dflt_n++] = v;
         if (dflt_n == 3) {
             uint32_t idx = reg[0x232] & 0xf;
             if (idx < 15) unpack24(dflt_queue, dflt[idx]);
+            else {                                                   /* index 15: immediate mode, a vertex attribute */
+                unpack24(dflt_queue, imm_attr[imm_cur]);
+                if (imm_cur < (reg[0x242] & 15)) imm_cur++;
+                else { imm_cur = 0; draw_immediate(); }
+                dflt_n = 0;
+                break;
+            }
             if (getenv("RB_LOG_FIXED") && (int64_t)gpu_frame() == atoll(getenv("RB_LOG_FIXED")))
                 fprintf(stderr, "  fixed attr write: reg232 %08x -> attr %u = (%g %g %g %g) raw %08x %08x %08x\n", reg[0x232], idx,
                         dflt[idx < 15 ? idx : 0][0], dflt[idx < 15 ? idx : 0][1], dflt[idx < 15 ? idx : 0][2], dflt[idx < 15 ? idx : 0][3], dflt_queue[0], dflt_queue[1], dflt_queue[2]);
@@ -1406,6 +1419,52 @@ static void gs_draw_uniform(const Fb *fb, uint32_t base, const uint8_t *ib, int 
     for (uint32_t t = 0; t + 2 < out.n; t += 3) triangle(fb, &out.v[t], &out.v[t + 1], &out.v[t + 2]);
 }
 
+static void draw_immediate(void) {
+    static Vtx buf[3], first_v;
+    if ((reg[0x229] & 3) == 2) { if (!n_skipped_gs++) LOG(1, "pica: immediate-mode drawing through a geometry shader is not implemented"); return; }
+    { static int tried; if (!tried) { tried = 1; vkr_init(); } }
+    Fb fb;
+    fb.width = reg[0x11e] & 0x7ff; fb.hreg = (reg[0x11e] >> 12) & 0x3ff;
+    fb.cfmt = (reg[0x117] >> 16) & 7; fb.dfmt = reg[0x116] & 3;
+    fb.cbpp = fb.cfmt == 0 ? 4 : fb.cfmt == 1 ? 3 : 2; fb.dbpp = fb.dfmt == 0 ? 2 : fb.dfmt == 2 ? 3 : 4;
+    uint32_t caddr = (reg[0x11d] & 0x0fffffff) << 3, daddr = (reg[0x11c] & 0x0fffffff) << 3;
+    fb.color = phys(caddr, fb.width * (fb.hreg + 1) * fb.cbpp);
+    fb.depth = phys(daddr, fb.width * (fb.hreg + 1) * fb.dbpp);
+    /* the vertex: attributes to shader inputs as the loader does (0x2bb/0x2bc), then the vertex shader */
+    float in[16][4] = { { 0 } }, o[16][4] = { { 0 } };
+    uint32_t nin = (reg[0x2b9] & 15) + 1, nattr = (reg[0x242] & 15) + 1;
+    uint64_t map = (uint64_t)reg[0x2bc] << 32 | reg[0x2bb];
+    for (uint32_t a = 0; a < nin && a < nattr; a++) memcpy(in[(map >> (4 * a)) & 15], imm_attr[a], sizeof in[0]);
+    vs.bools = reg[0x2b0] & 0xffff;
+    for (int k = 0; k < 4; k++) vs.ints[k] = reg[0x2b1 + k];
+    pica_shader_prepare_ver(&vs, vs_ver);
+    if (pica_shader_run(&vs, reg[0x2ba] & 0xffff, in, o) < 0) LOG(1, "pica: vertex shader did not finish");
+    Vtx v; map_outputs(o, reg[0x2bd] & 0xffff, &v);
+    uint32_t topo = (reg[0x25e] >> 8) & 3;
+    const Vtx *t0 = 0, *t1 = 0;
+    Vtx tri_a, tri_b;
+    if (topo == 0 || topo == 3) {
+        buf[imm_nb++] = v;
+        if (imm_nb == 3) { tri_a = buf[0]; tri_b = buf[1]; t0 = &tri_a; t1 = &tri_b; v = buf[2]; imm_nb = 0; }
+    } else if (topo == 1) {
+        if (imm_nb == 2) { tri_a = imm_odd ? buf[1] : buf[0]; tri_b = imm_odd ? buf[0] : buf[1]; t0 = &tri_a; t1 = &tri_b; imm_odd ^= 1; buf[0] = buf[1]; buf[1] = v; }
+        else buf[imm_nb++] = v;
+    } else {
+        if (imm_nb == 0) { first_v = v; buf[0] = v; imm_nb = 1; }
+        else if (imm_nb == 1) { buf[1] = v; imm_nb = 2; }
+        else { tri_a = first_v; tri_b = buf[1]; t0 = &tri_a; t1 = &tri_b; buf[1] = v; }
+    }
+    if (!t0) return;
+    n_draws++;
+    if (flat_mode < 0) flat_mode = getenv("RB_FLAT") != 0;
+    for (int u = 0; u < 3; u++) setup_tex(&tu[u], u);
+    setup_tev();
+    setup_lighting();
+    triangle(&fb, t0, t1, &v);
+    if (vkr_on) { vk_submit(&fb, caddr, daddr); ntris = 0; }
+    else flush_tris(&fb);
+}
+
 static void draw(int indexed) {
     { static int tried; if (!tried) { tried = 1; vkr_init(); } }
     uint64_t t_draw0 = pns();
@@ -1581,6 +1640,6 @@ void pica_state(SS *s) {
     SS_V(s, reg); SS_V(s, lut); SS_V(s, fog_lut); SS_V(s, pt_lut); SS_V(s, uni_src); SS_V(s, vs); SS_V(s, gs);
     SS_V(s, uni_queue); SS_V(s, uni_n); SS_V(s, gs_uni_queue); SS_V(s, gs_uni_n); SS_V(s, dflt); SS_V(s, dflt_queue); SS_V(s, dflt_n);
     SS_V(s, tevs); SS_V(s, tev_buf_init); SS_V(s, lights); SS_V(s, nlights); SS_V(s, global_amb); SS_V(s, tu);
-    SS_V(s, flat_mode); SS_V(s, flat); SS_V(s, gs_b15);
+    SS_V(s, flat_mode); SS_V(s, flat); SS_V(s, gs_b15); SS_V(s, imm_attr); SS_V(s, imm_cur);
     if (ss_loading(s)) { vs_ver += 1000000; gs_ver += 1000000; lut_version += 1000000; }
 }

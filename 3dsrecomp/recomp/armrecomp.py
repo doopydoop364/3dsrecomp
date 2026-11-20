@@ -244,6 +244,95 @@ def selfrel_table(ins):
     return (ri, targets) if len(targets) >= 2 else None
 
 
+def jt_byte_table(ins, rm):
+    """GCC's switch through a table of 8- or 16-bit offsets: `ldrsb|ldrb|ldrsh|ldrh rm, [rB, rI]` right before
+    `add pc, pc, rm, lsl #2` (for 16-bit entries rI = 2 * the index: `add rI, rX, rX` or `lsl rI, rX, #1` before the
+    load), rB loaded from a literal earlier, the index bounded by `cmp rX, #N` and a branch away on HI (or CS) shortly
+    before. Returns {entry value: target} (the jump goes to add + 8 + 4 * value), or None."""
+    a = ins.addr - 4
+    if MODULE or ins.cond != 14 or not in_text(a):        # (a module's literals are only right once ldr:ro relocated them)
+        return None
+    p = rd32(a)
+    if (p & 0xFFF00FF0) == 0xE19000D0: signed, size = True, 1      # ldrsb rt, [rn, rm]
+    elif (p & 0xFFF00FF0) == 0xE7D00000: signed, size = False, 1   # ldrb rt, [rn, rm]
+    elif (p & 0xFFF00FF0) == 0xE19000F0: signed, size = True, 2    # ldrsh rt, [rn, rm]
+    elif (p & 0xFFF00FF0) == 0xE19000B0: signed, size = False, 2   # ldrh rt, [rn, rm]
+    else: return None
+    if (p >> 12) & 0xF != rm:
+        return None
+    rb, ri = (p >> 16) & 0xF, p & 0xF
+    first = 1
+    if size == 2:                                         # the doubling of the index just before the load
+        q = rd32(a - 4) if in_text(a - 4) else 0
+        if (q & 0xFFF0F000) == (0xE0800000 | ri << 12) and ((q >> 16) & 0xF) == (q & 0xF) and not (q & 0xFF0):
+            ri = q & 0xF                                  # add rI, rX, rX
+        elif (q & 0xFFFFFFF0) == (0xE1A00080 | ri << 12):
+            ri = q & 0xF                                  # lsl rI, rX, #1
+        elif q == (0xE0800000 | rb << 16 | rb << 12 | ri):
+            pass                                          # add rB, rB, rI: the load adds rI once more
+        else:
+            return None
+        first = 2
+    n = None                                              # bound: cmp ri, #N ; bhi|bcs away, within a few instructions
+    for k in range(first, first + 4):
+        b, cmpw = ins.addr - 4 - 4 * k, ins.addr - 8 - 4 * k
+        if not (in_text(b) and in_text(cmpw)):
+            break
+        bw, cw = rd32(b), rd32(cmpw)
+        if (bw & 0x0F000000) == 0x0A000000 and (bw >> 28) in (8, 2) and (cw & 0xFFF0F000) == 0xE3500000 and ((cw >> 16) & 0xF) == ri:
+            v = ror32(cw & 0xFF, ((cw >> 8) & 0xF) * 2)
+            n = v + 1 if (bw >> 28) == 8 else v
+            break
+    if not n or n > 256:
+        return None
+    table = None                                          # the table's address: the latest literal load into rB
+    a2 = ins.addr - 8
+    for _ in range(64):
+        if not in_text(a2):
+            break
+        q = rd32(a2)
+        if (q & 0xFF7FF000) == (0xE51F0000 | rb << 12):   # ldr rB, [pc, #+-imm]
+            lit = (a2 + 8 + (q & 0xFFF if q & (1 << 23) else -(q & 0xFFF))) & 0xFFFFFFFF
+            if BASE <= lit < RO_END - 3:
+                table = rd32(lit)
+            break
+        cls, op = (q >> 25) & 7, (q >> 21) & 0xF
+        is_test = cls in (0, 1) and 8 <= op <= 11 and (q >> 20) & 1 and not ((q & 0x0E000090) == 0x90 and (q >> 5) & 3)
+        is_store = (cls in (2, 3) and not (q >> 20) & 1) or ((q & 0x0E000090) == 0x90 and (q >> 5) & 3 and not (q >> 20) & 1)
+        if ((q >> 12) & 0xF) == rb and cls in (0, 1, 2, 3) and not is_test and not is_store and \
+                q != (0xE0800000 | rb << 16 | rb << 12 | ri):
+            break                                         # rB written some other way: give up
+        a2 -= 4
+    if table is None or not (BASE <= table and table + size * n <= RO_END):
+        return None
+    out = {}
+    for i in range(n):
+        v = IMG[table - BASE + size * i] | (IMG[table - BASE + size * i + 1] << 8 if size == 2 else 0)
+        if signed and v >= 1 << (8 * size - 1):
+            v -= 1 << (8 * size)
+        t = (ins.addr + 8 + 4 * v) & 0xFFFFFFFF
+        if not in_text(t):
+            return None
+        out[v] = t
+    return out
+
+
+def jt_division_loop(ins, rm):
+    """libgcc's ARM division (__udivsi3, __divsi3, ...): `rsbs rm, rm, #31 ; addne rm, rm, rm, lsl #1 ; [mov] ;
+    addne pc, pc, rm, lsl #2` jumps into 32 unrolled steps of 3 instructions: rm = 3 * (steps to skip)."""
+    seen_add = False
+    for k in range(1, 4):
+        a = ins.addr - 4 * k
+        if not in_text(a):
+            return False
+        q = rd32(a)
+        if (q & 0x0FFFFFFF) == (0x00800080 | rm << 16 | rm << 12 | rm):
+            seen_add = True                               # add rm, rm, rm, lsl #1
+        elif seen_add and (q & 0x0FFFFFFF) == (0x0270001F | rm << 16 | rm << 12):
+            return True                                   # rsbs rm, rm, #31
+    return False
+
+
 def emit_switch(ins, rm, targets):
     for t in targets:
         if not in_text(t):
@@ -268,8 +357,22 @@ def dp(ins):
             cases = ' '.join(f'case 0x{t:08x}u: {G(t)}' for t in ins.targets)
             return (f'uint32_t t = c->r[{(w >> 16) & 0xF}] + c->r[{w & 0xF}]; switch (t{" - MB" if MODULE else ""}) {{ {cases} }} '
                     f'IJUMP(t);')
+    if (w & 0x0FFFFFF0) == 0x008FF100 and jt_division_loop(ins, w & 0xF):   # libgcc's unrolled division
+        rm = w & 0xF
+        ins.targets = [addr + 8 + 12 * j for j in range(32)]
+        ins.falls = False
+        cases = ' '.join(f'case {3 * j}: {G(addr + 8 + 12 * j)}' for j in range(32))
+        return f'switch (c->r[{rm}]) {{ {cases} }} TRAP(0x{addr:08x}u, "division step out of range");'
     if (w & 0x0FFFFFF0) == 0x008FF100:                    # add pc, pc, rm, lsl #2
-        n = jt_bound(ins, w & 0xF) or jt_run_of_branches(addr)
+        n = jt_bound(ins, w & 0xF)
+        if n is None:
+            bt = jt_byte_table(ins, w & 0xF)              # GCC: by a byte offset from a table
+            if bt:
+                ins.targets = list(dict.fromkeys(bt.values()))
+                ins.falls = False
+                cases = ' '.join(f'case {v}: {G(t)}' for v, t in sorted(bt.items()))
+                return f'switch ((int32_t)c->r[{w & 0xF}]) {{ {cases} }} TRAP(0x{addr:08x}u, "jump table offset out of range");'
+            n = jt_run_of_branches(addr)
         if n is None:
             raise Unsup('jumptable_unbounded')
         return emit_switch(ins, w & 0xF, [addr + 8 + 4 * i for i in range(n)])

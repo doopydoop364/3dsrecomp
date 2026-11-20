@@ -4,6 +4,7 @@
     3dsrecomp run <dump... | title id> [game options]  build if needed, then play (e.g. --scale 2, --fullscreen)
     3dsrecomp build <dump... | title id>               extract, discover, recompile and compile into work/<title id>/
     3dsrecomp extract <dump> [--out DIR]              only decrypt and unpack a .cia / .3ds / .cxi into a game folder
+                                                      (homebrew: a .3dsx works everywhere a dump does)
     3dsrecomp info <dump>                             show what a dump is (title, encryption) without extracting
 
 Everything for a game lives in work/<title id>/: game/ (its data and saves), gen/ and obj/ (generated code), native
@@ -25,6 +26,10 @@ def info(argv):
     import extract as X
     if len(argv) != 1:
         sys.exit("usage: 3dsrecomp info <dump>")
+    if X.is_3dsx(argv[0]):
+        print(json.dumps({"file": argv[0], "container": "3DSX (homebrew)", "title_id": f"{X.homebrew_tid(argv[0]):016x}",
+                          "version": None, "kind": "homebrew", "encryption": "none"}, indent=2))
+        return
     with open(argv[0], "rb") as f:
         src, kind = X.open_ncch(argv[0], f)
         n = src.read(0, 0x200)
@@ -39,7 +44,7 @@ def info(argv):
 
 
 UPDATE_HI, DLC_HI = 0x0004000E, 0x0004008C
-DUMP_EXT = (".cia", ".3ds", ".cci", ".cxi")
+DUMP_EXT = (".cia", ".3ds", ".cci", ".cxi", ".3dsx")
 
 
 def _is_target(a):

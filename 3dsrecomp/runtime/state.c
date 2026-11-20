@@ -17,7 +17,7 @@
 #include <zlib.h>
 #include "vkr.h"
 
-#define STATE_VERSION 2      /* raise on any change to what a visitor saves (2: geometry-shader b15) */
+#define STATE_VERSION 3      /* raise on any change to what a visitor saves (2: geometry-shader b15, 3: immediate mode) */
 
 struct SS { gzFile g; int load, failed; const char *path; };
 

@@ -63,7 +63,11 @@ the rest of each list.
    - procedural textures (complete), shadow maps and shadow textures, gas / fog volumes, min/max blending factors,
      logic ops, texture wrap modes 4-7, 16-bit colour blending, every texture and framebuffer format, every
      combiner and lighting LUT mode, the rest of the GX transfer flags (scaling, format conversion, linear/tiled);
-   - checked feature by feature against the software renderer and Azahar (test cases for unused ones):
+   - immediate-mode drawing (0x232 index 15: vertices through 0x233-0x235) — *done (2026-11-19)*, found by the
+     homebrew tests;
+   - checked feature by feature against the software renderer and Azahar (test cases for unused ones). Homebrew
+     test programs (`tests/homebrew.py`, devkitPro's examples and our own in `tests/homebrew/`) run in both and are
+     compared screen by screen; and
      `tests/pica_synth.py` builds command lists, shaders and vertices from scratch and runs them through
      `build/gpu_replay` (software or Vulkan renderer).
 2. Audio (the whole DSP): biquad filters, the remaining mixer details (aux buses, effects), every sample format and

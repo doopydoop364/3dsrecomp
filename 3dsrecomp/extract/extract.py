@@ -140,8 +140,117 @@ def open_ncch(path, f):
     sys.exit(f"{path}: not a CIA, cartridge image or NCCH")
 
 
+# ---- homebrew (.3dsx, built with devkitPro's libctru): no NCCH, no ExHeader, no title id ----
+def homebrew_tid(path):
+    """A stable title id for a .3dsx (it has none): unique id 0xF8000-0xFFFFF (the homebrew range) from its bytes."""
+    import zlib
+    with open(path, "rb") as f:
+        crc = zlib.crc32(f.read()) & 0x7FFF
+    return 0x0004000000000000 | (0xF8000 | crc) << 8
+
+
+def is_3dsx(path):
+    with open(path, "rb") as f:
+        return f.read(4) == b"3DSX"
+
+
+def empty_romfs():
+    """A RomFS level-3 image with only the root directory (for homebrew without a RomFS)."""
+    dirs = struct.pack("<IIIIII", 0, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0)   # root: no children, no files
+    dhash, fhash = struct.pack("<I", 0), struct.pack("<I", 0xFFFFFFFF)
+    off = 0x28
+    hdr = struct.pack("<IIIIIIIIII", 0x28, off, 4, off + 4, len(dirs), off + 4 + len(dirs), 4, off + 8 + len(dirs), 0,
+                      (off + 8 + len(dirs) + 15) & ~15)
+    body = hdr + dhash + dirs + fhash
+    return body + bytes(((len(body) + 15) & ~15) - len(body))
+
+
+def extract_3dsx(path, out):
+    """A .3dsx as a game folder: the segments loaded and relocated at 0x00100000 as Azahar's loader does
+    (code, rodata, data with its bss, each page-aligned), a made-up ExHeader for them (kernel version 0x23a, all system
+    calls, priority 48, 16 KB stack: Azahar's homebrew settings), its SMDH as the icon and its RomFS (or an empty one)."""
+    data = open(path, "rb").read()
+    hsize, rsize = struct.unpack_from("<HH", data, 4)
+    code_sz, ro_sz, data_sz, bss_sz = struct.unpack_from("<IIII", data, 0x10)
+    smdh_off, smdh_sz, fs_off = struct.unpack_from("<III", data, 0x20) if hsize >= 0x2C else (0, 0, 0)
+    ntab = rsize // 4
+    pg = lambda n: (n + 0xFFF) & ~0xFFF
+    sizes = [pg(code_sz), pg(ro_sz), pg(data_sz)]
+    base = 0x00100000
+    addrs = [base, base + sizes[0], base + sizes[0] + sizes[1]]
+    offsets = [sizes[0], sizes[0] + sizes[1]]
+    img = bytearray(sum(sizes))
+    pos = hsize
+    relocs = [struct.unpack_from(f"<{ntab}I", data, pos + 4 * ntab * s) for s in range(3)]
+    pos += 3 * 4 * ntab
+    for s, n in enumerate((code_sz, ro_sz, data_sz - bss_sz)):
+        start = sum(sizes[:s])
+        img[start:start + n] = data[pos:pos + n]; pos += n
+    def translate(a):
+        if a < offsets[0]: return addrs[0] + a
+        if a < offsets[1]: return addrs[1] + a - offsets[0]
+        return addrs[2] + a - offsets[1]
+    for s in range(3):
+        start, end = sum(sizes[:s]), sum(sizes[:s + 1])
+        for t in range(ntab):
+            n = relocs[s][t]
+            entries = [struct.unpack_from("<HH", data, pos + 4 * i) for i in range(n)]
+            pos += 4 * n
+            if t >= 2:
+                continue
+            w = start
+            for skip, patch in entries:
+                w += 4 * skip
+                for _ in range(patch):
+                    if w >= end: break
+                    orig = struct.unpack_from("<I", img, w)[0]
+                    sub, addr = orig >> 28, translate(orig & 0x0FFFFFFF)
+                    if t == 0:
+                        if sub: sys.exit(f"{path}: unknown absolute relocation kind {sub}")
+                        v = addr
+                    else:
+                        d = (addr - (base + w)) & 0xFFFFFFFF
+                        v = d if sub == 0 else d & 0x7FFFFFFF if sub == 1 else sys.exit(f"{path}: unknown relative relocation kind {sub}")
+                    struct.pack_into("<I", img, w, v); w += 4
+    tid = homebrew_tid(path)
+    smdh = data[smdh_off:smdh_off + smdh_sz] if smdh_sz else b""
+    title = smdh[0x8 + 0x200:0x8 + 0x200 + 0x80].decode("utf-16-le", "replace").split("\0")[0] if len(smdh) >= 0x2040 else ""
+    long_title = smdh[0x8 + 0x200 + 0x80:0x8 + 0x200 + 0x180].decode("utf-16-le", "replace").split("\0")[0] if len(smdh) >= 0x2040 else ""
+    publisher = smdh[0x8 + 0x200 + 0x180:0x8 + 0x200 + 0x200].decode("utf-16-le", "replace").split("\0")[0] if len(smdh) >= 0x2040 else ""
+    name = (title or os.path.splitext(os.path.basename(path))[0]).encode("ascii", "replace")[:8]
+    exh = bytearray(0x800)
+    exh[0:8] = name.ljust(8, b"\0")
+    struct.pack_into("<IIII", exh, 0x10, addrs[0], sizes[0] >> 12, code_sz, 0x4000)
+    struct.pack_into("<III", exh, 0x20, addrs[1], sizes[1] >> 12, ro_sz)
+    struct.pack_into("<IIII", exh, 0x30, addrs[2], sizes[2] >> 12, data_sz, 0)   # bss is inside the data pages
+    struct.pack_into("<Q", exh, 0x200, tid)
+    exh[0x20f] = 48                                                # main thread priority
+    struct.pack_into("<I", exh, 0x370, 0xFE00023A)                 # kernel version 0x23a (11.17)
+    for i in range(1, 28):
+        struct.pack_into("<I", exh, 0x370 + 4 * i, 0xFFFFFFFF)
+    os.makedirs(out, exist_ok=True)
+    open(os.path.join(out, "exheader.bin"), "wb").write(exh)
+    open(os.path.join(out, "code.bin"), "wb").write(img)
+    open(os.path.join(out, "code_decompressed.bin"), "wb").write(img)
+    if smdh:
+        open(os.path.join(out, "icon.bin"), "wb").write(smdh)
+    romfs = data[fs_off:] if fs_off and fs_off < len(data) else empty_romfs()
+    ivfc = bytearray(0x1000)                                       # a minimal IVFC header: no hash levels, level 3 at 0x1000
+    ivfc[0:4] = b"IVFC"; struct.pack_into("<I", ivfc, 8, 0); struct.pack_into("<Q", ivfc, 0x44, len(romfs))
+    struct.pack_into("<I", ivfc, 0x4C, 12)
+    open(os.path.join(out, "romfs.bin"), "wb").write(bytes(ivfc) + romfs)
+    meta = {"title_id": f"{tid:016x}", "product_code": "homebrew", "title": title or os.path.basename(path),
+            "long_title": long_title, "publisher": publisher, "homebrew": os.path.basename(path)}
+    open(os.path.join(out, "title.json"), "w").write(json.dumps(meta, indent=2) + "\n")
+    print(f"{path}: homebrew (3DSX), title id {tid:016x} (made up), code {code_sz:#x} rodata {ro_sz:#x} data {data_sz:#x} "
+          f"(bss {bss_sz:#x}){', RomFS' if fs_off else ''}")
+    return tid
+
+
 def dump_title(path):
     """(title id, title version or None) of a dump, read from its headers without extracting anything."""
+    if is_3dsx(path):
+        return homebrew_tid(path), None
     with open(path, "rb") as f:
         src, _ = open_ncch(path, f)
         tid = struct.unpack_from("<Q", src.read(0, 0x200), 0x108)[0]
@@ -186,6 +295,10 @@ def smdh_names(icon):
 
 
 def extract(path, out, seeddb=None, fetch=False, force=False):
+    if is_3dsx(path):
+        if os.path.exists(out) and os.listdir(out) and not force:
+            sys.exit(f"{out} is not empty (use --force to overwrite)")
+        return extract_3dsx(path, out)
     f = open(path, "rb")
     src, kind = open_ncch(path, f)
     n = src.read(0, 0x200)
@@ -402,7 +515,7 @@ def add_dlc(path, game, seeddb=None, fetch=False):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="3dsrecomp extract", description="Decrypt and unpack a 3DS game dump into a game folder.")
-    ap.add_argument("dump", help=".cia, .3ds/.cci or .cxi file")
+    ap.add_argument("dump", help=".cia, .3ds/.cci or .cxi file, or a homebrew .3dsx")
     ap.add_argument("--out", help="output folder (default: work/<title id>/game in the 3dsrecomp folder)")
     ap.add_argument("--seeddb", help="seeddb.bin to use for seed-encrypted games")
     ap.add_argument("--fetch-seeds", action="store_true", help="ask Nintendo's seed server when seeddb.bin has no seed")
@@ -410,9 +523,7 @@ def main(argv=None):
     a = ap.parse_args(argv)
     out = a.out
     if not out:                                                    # peek at the title id for the default folder
-        with open(a.dump, "rb") as f:
-            src, _ = open_ncch(a.dump, f)
-            tid = struct.unpack_from("<Q", src.read(0, 0x200), 0x108)[0]
+        tid = dump_title(a.dump)[0]
         out = os.path.join(ROOT, "work", f"{tid:016x}", "game")
     extract(a.dump, out, a.seeddb, a.fetch_seeds, a.force)
 
