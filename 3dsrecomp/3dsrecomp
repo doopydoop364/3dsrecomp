@@ -93,8 +93,9 @@ def resolve(targets):
     for path, t_id, ver in sorted(addons, key=lambda a: a[1] >> 32):
         key, add = ("update", X.add_update) if t_id >> 32 == UPDATE_HI else ("dlc", X.add_dlc)
         old = have.get(key, {})
-        if (old.get("version") is not None and ver is not None and ver <= old["version"]) or \
-           (ver is None and old.get("file") == os.path.basename(path)):
+        stale = key == "dlc" and not os.path.exists(os.path.join(game, "dlc", "info.bin"))   # unpacked before am:app info
+        if not stale and ((old.get("version") is not None and ver is not None and ver <= old["version"]) or
+                          (ver is None and old.get("file") == os.path.basename(path))):
             continue                                 # already added (or a newer one is)
         print(f"3dsrecomp: adding {'the update' if key == 'update' else 'DLC'} {os.path.basename(path)}"
               f"{' (version %d)' % ver if ver is not None else ''}", flush=True)

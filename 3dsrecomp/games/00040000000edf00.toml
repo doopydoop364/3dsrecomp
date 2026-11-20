@@ -3,7 +3,9 @@
 
 [tests]
 # tests/smoke.sh 00040000000edf00: from a console where it never ran: extra data created, SD card access,
-# the title screen, Smash mode's character select
+# the title screen, Smash mode's character select. With the update and DLC added (as in the library), the DLC's
+# unlock announcements come first: frame 2400 shows a challenge screen (B leaves it), character select follows
+# after about 230 more A presses.
 input = "400-406:A;550-556:A;700-706:A;850-856:A;1000-1006:A;1150-1156:A;1300-1306:A;1450-1456:A;1600-1606:A;1750-1756:A;1900-1906:A;2050-2056:A;2200-2206:A;2350-2356:A"
 shots = "600,1300,2400"
 frames = 2400

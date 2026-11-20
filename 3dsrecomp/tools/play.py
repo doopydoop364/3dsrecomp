@@ -10,8 +10,14 @@
           run N            advance N frames (60 per second) with the held input
           press ITEMS [N]  hold ITEMS for N frames (default 6), then release
           hold ITEMS       keep holding ITEMS;  release   let go of everything
-          shot PATH        advance one frame and save it as a PNG (400x480: top screen above; bottom screen at
-                           x 40..359, y 240..479, so a touch at picture (x, y) is touch=(x-40)/(y-240))
+          shot PATH [OPTS] advance one frame and save it as a PNG (400x480: top screen above; bottom screen at
+                           x 40..359, y 240..479, so a touch at picture (x, y) is touch=(x-40)/(y-240)).
+                           OPTS: top | bottom | crop=X,Y,W,H | zoom=K (smaller pictures cost less to look at)
+          grid PATH N STEP [OPTS] [cols=C]   N frames STEP apart in one labelled picture
+          mash ITEMS N [GAP]   press N times, GAP frames apart (default 30): text boxes
+          settle [MAX] [OPTS]  run until the picture stops changing (cutscenes, loading), at most MAX frames
+          where            values named in games/<id>.toml [tests.memory] (e.g. the player's position)
+          peek ADDR [N]    N bytes of guest memory (hex)
           save PATH        write a save state;  load PATH   load one (the game restarts with it, paused)
           frame            the current frame number;  quit   end the game
         ITEMS: buttons A B X Y L R ZL ZR START SELECT UP DOWN LEFT RIGHT, circle=X/Y and cstick=X/Y (-154..154, up is
@@ -131,21 +137,165 @@ def connect(name, wait=120):
             time.sleep(0.1)
 
 
-def send(name, commands):
-    s, f = connect(name)
-    for c in commands:
-        f.write(c.strip() + "\n"); f.flush()
-        reply = f.readline()
+class Conn:
+    """One connection to a session's game; follows it across restarts (loading a state)."""
+    def __init__(self, name):
+        self.name = name
+        self.s, self.f = connect(name)
+
+    def raw(self, c):
+        self.f.write(c.strip() + "\n"); self.f.flush()
+        reply = self.f.readline()
         if not reply:
-            sys.exit(f"{c}: the game stopped (it may have crashed):\n{log_tail(name)}")
-        print(f"{c}: {reply.strip()}", flush=True)
+            sys.exit(f"{c}: the game stopped (it may have crashed):\n{log_tail(self.name)}")
+        reply = reply.strip()
+        if reply.startswith("ok loading"):                 # the game restarts with the state: reconnect when it listens
+            self.s.close(); time.sleep(0.3)
+            self.s, self.f = connect(self.name)
+        return reply
+
+    def frame(self):
+        return int(self.raw("frame").split()[-1])
+
+
+# ---- commands handled here, on top of the game's own (smaller pictures cost an agent less to look at) ----
+def _image(path):
+    from PIL import Image
+    return Image.open(path).convert("RGB")
+
+
+def _view(img, opts):
+    """top | bottom | crop=x,y,w,h | zoom=N, applied to a 400x480 shot."""
+    for o in opts:
+        if o == "top": img = img.crop((0, 0, 400, 240))
+        elif o == "bottom": img = img.crop((40, 240, 360, 480))
+        elif o.startswith("crop="):
+            x, y, w, h = (int(v) for v in o[5:].split(","))
+            img = img.crop((x, y, x + w, y + h))
+        elif o.startswith("zoom="):
+            k = float(o[5:]); img = img.resize((max(1, int(img.width * k)), max(1, int(img.height * k))))
+        else:
+            raise ValueError(f"unknown picture option {o}")
+    return img
+
+
+def _tmp(conn, tag):
+    return os.path.join(session(conn.name), f"tmp_{tag}.png")
+
+
+def cmd_shot(conn, args):
+    path, opts = args[0], args[1:]
+    if not opts:
+        return conn.raw(f"shot {path}")
+    t = _tmp(conn, "shot"); r = conn.raw(f"shot {t}")
+    if not r.startswith("ok"): return r
+    img = _view(_image(t), opts); img.save(path)
+    return f"{r.replace(t, path)} ({img.width}x{img.height})"
+
+
+def cmd_grid(conn, args):
+    """grid PATH N STEP [picture options] [cols=C]: N frames STEP apart in one picture, each labelled with its frame."""
+    from PIL import Image, ImageDraw
+    path, n, step = args[0], int(args[1]), int(args[2])
+    opts = [o for o in args[3:] if not o.startswith("cols=")]
+    cols = next((int(o[5:]) for o in args[3:] if o.startswith("cols=")), min(n, 4))
+    tiles = []
+    for i in range(n):
+        if i: conn.raw(f"run {step}")
+        t = _tmp(conn, f"grid{i}"); r = conn.raw(f"shot {t}")
+        if not r.startswith("ok"): return r
+        tiles.append((_view(_image(t), opts), r.split()[2]))
+    w, h = tiles[0][0].width, tiles[0][0].height
+    rows = (n + cols - 1) // cols
+    g = Image.new("RGB", (cols * w, rows * h), (40, 40, 40)); d = ImageDraw.Draw(g)
+    for i, (img, fr) in enumerate(tiles):
+        x, y = (i % cols) * w, (i // cols) * h
+        g.paste(img, (x, y)); d.text((x + 3, y + 2), fr, fill=(255, 255, 0))
+    g.save(path)
+    return f"ok frames {tiles[0][1]}..{tiles[-1][1]} grid {path} ({g.width}x{g.height})"
+
+
+def cmd_mash(conn, args):
+    """mash ITEMS N [GAP]: press ITEMS N times, GAP frames apart (default 30): for text boxes."""
+    items, n, gap = args[0], int(args[1]), int(args[2]) if len(args) > 2 else 30
+    for _ in range(n):
+        r = conn.raw(f"press {items}")
+        if not r.startswith("ok"): return r
+        r = conn.raw(f"run {gap}")
+    return r
+
+
+def cmd_settle(conn, args):
+    """settle [MAX] [picture options]: run until the picture stops changing (two equal shots 10 frames apart)."""
+    mx = int(args[0]) if args and args[0].isdigit() else 600
+    opts = [o for o in args if not o.isdigit()]
+    prev, waited = None, 0
+    while waited <= mx:
+        t = _tmp(conn, "settle"); r = conn.raw(f"shot {t}")
+        if not r.startswith("ok"): return r
+        cur = _view(_image(t), opts).tobytes()
+        if cur == prev:
+            return f"ok frame {conn.frame()} settled after {waited} frames"
+        prev = cur; conn.raw("run 10"); waited += 11
+    return f"ok frame {conn.frame()} still changing after {mx} frames"
+
+
+TYPES = {"u8": ("<B", 1), "s8": ("<b", 1), "u16": ("<H", 2), "s16": ("<h", 2), "u32": ("<I", 4), "s32": ("<i", 4), "f32": ("<f", 4)}
+
+
+def _peek(conn, addr, n):
+    r = conn.raw(f"peek {addr:08x} {n}")
+    if not r.startswith("ok "): raise ValueError(r)
+    return bytes.fromhex(r[3:])
+
+
+def cmd_where(conn, args):
+    """where: the values named in games/<id>.toml [tests.memory] (test-only data), e.g.
+         player_x = "f32 0x0803c1a4"          a value at a fixed address
+         player_y = "f32 *0x0803c1a4+0x28"    a pointer at that address, plus 0x28 (chains: *A+O1*+O2 ...)"""
+    import struct, tomllib
+    tid = open(os.path.join(session(conn.name), "title")).read().strip()
+    toml = os.path.join(ROOT, "games", f"{tid}.toml")
+    mem = tomllib.load(open(toml, "rb")).get("tests", {}).get("memory", {}) if os.path.exists(toml) else {}
+    if not mem: return f"error games/{tid}.toml has no [tests.memory] section"
+    out = []
+    for key, spec in mem.items():
+        typ, expr = spec.split(None, 1)
+        try:
+            parts = expr.replace(" ", "").split("+")
+            addr = None
+            for p_ in parts:
+                deref = p_.startswith("*") or p_.endswith("*")
+                v = int(p_.strip("*"), 0)
+                addr = v if addr is None else addr + v
+                if p_.startswith("*"): addr = struct.unpack("<I", _peek(conn, addr, 4))[0]
+                if p_.endswith("*"): addr = struct.unpack("<I", _peek(conn, addr, 4))[0]
+            fmt, n = TYPES[typ]
+            val = struct.unpack(fmt, _peek(conn, addr, n))[0]
+            out.append(f"{key}={val:.3f}" if typ == "f32" else f"{key}={val}")
+        except Exception as e:
+            out.append(f"{key}=? ({e})")
+    return "ok " + " ".join(out)
+
+
+LOCAL = {"shot": cmd_shot, "grid": cmd_grid, "mash": cmd_mash, "settle": cmd_settle, "where": cmd_where}
+
+
+def send(name, commands):
+    conn = Conn(name)
+    for c in commands:
+        words = c.split()
+        if words and words[0] in LOCAL and (words[0] != "shot" or len(words) > 2):
+            try:
+                reply = LOCAL[words[0]](conn, words[1:])
+            except (ValueError, IndexError, KeyError) as e:
+                reply = f"error {e}"
+        else:
+            reply = conn.raw(c)
+        print(f"{c}: {reply}", flush=True)
         if reply.startswith("ok bye"):
             break
-        if reply.startswith("ok loading"):              # the game restarts with the state: reconnect when it listens
-            s.close()
-            time.sleep(0.3)
-            s, f = connect(name)
-    s.close()
+    conn.s.close()
 
 
 def stop(name):

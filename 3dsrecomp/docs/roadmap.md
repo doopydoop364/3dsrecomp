@@ -32,14 +32,14 @@ is the module's current base plus an offset), so modules run wherever and howeve
 Smash reaches its character select; Pokémon X plays its intro with modules loading, unloading and reloading.
 Design and findings: `general_tool_design.md` section 11.
 
-## 3. Updates and DLC — *done (2026-11-19), waiting for a real update dump to test end to end*
+## 3. Updates and DLC — *done (2026-11-19), tested end to end with Smash's update and DLC*
 `3dsrecomp build|run` take the game plus update (0004000E) and DLC (0004008C) dumps, given together or lying in the
 same folder. The update's ExHeader and code replace the program before discovery (base kept in `game/base/`); its
 RomFS is served as SelfNCCH type 5 (the game layers it over the base RomFS itself, as on a console); DLC contents are
-served through the content archive 0x2345678A by content index. Design and findings: `general_tool_design.md`
-section 12. Smash's DLC (139 contents) is unpacked, but its contents are only ownership markers: the fighters come
-with the update, which is not in the library, so the base program never asks for DLC. `am:app` is not implemented
-(no library game opens it).
+served through the content archive 0x2345678A by content index, and `am:app` answers which DLC contents exist and are
+owned from the dump's TMD and ticket (`game/dlc/info.bin`, as Azahar decides). Smash with update 35296 and its DLC:
+the DLC fighters, Mii outfits and music unlock and appear at character select. Design: `general_tool_design.md`
+section 12.
 
 ## Stage A: playtesting
 1. Saves outside the game folder — *done (2026-11-19)*: `~/.local/share/3dsrecomp/<title id>/` (save, extra data,

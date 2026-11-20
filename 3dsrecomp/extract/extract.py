@@ -314,6 +314,55 @@ def add_update(path, game, seeddb=None, fetch=False):
     print(f"update {info['title_id']}{' version %d' % version if version is not None else ''} applied to {game}")
 
 
+def cia_title_records(f):
+    """What a console's title database knows about an installed CIA (am:app answers from it): title version and type,
+    the TMD's contents (index, type, id, size), which of them the CIA holds, and the ticket (id, version, size and its
+    content-index rights fields, which say which contents are owned)."""
+    f.seek(0)
+    head = f.read(0x2020)
+    hs, cs, ts, ms = u32(head, 0), u32(head, 8), u32(head, 0xC), u32(head, 0x10)
+    a = D.align64
+    tik = a(a(hs) + cs); tmd = a(tik + ts)
+    present = {i for i in range(0x10000) if head[0x20 + i // 8] & (0x80 >> (i % 8))} if len(head) >= 0x2020 else set()
+    sig = struct.unpack(">I", D.read_at(f, tmd, 4))[0]
+    body = tmd + 4 + D.SIG_SIZES.get(sig, 0x13C)
+    ttype = struct.unpack(">I", D.read_at(f, body + 0x54, 4))[0]
+    tver = struct.unpack(">H", D.read_at(f, body + 0x9C, 2))[0]
+    with contextlib.redirect_stdout(io.StringIO()):
+        contents, _ = D.parse_tmd(f, tmd)
+    tsig = struct.unpack(">I", D.read_at(f, tik, 4))[0]
+    tb = tik + 4 + D.SIG_SIZES.get(tsig, 0x13C)                  # ticket body (0x164 bytes), then its content index
+    t = D.read_at(f, tb, 0x164)
+    ticket_id, tick_ver = struct.unpack(">Q", t[0x90:0x98])[0], struct.unpack(">H", t[0xA6:0xA8])[0]
+    rights = []
+    ci = D.read_at(f, tb + 0x164, 8)
+    ci_size = struct.unpack(">I", ci[4:8])[0] if len(ci) == 8 else 0
+    if 0 < ci_size <= ts:
+        ci = D.read_at(f, tb + 0x164, ci_size)
+        always1, hsize, csize, hoff, hcount, hisize = struct.unpack(">HHIIHH", ci[:16])
+        if always1 == 1 and hsize == 20 and csize == ci_size and hisize == 20 and hoff + hcount * 20 <= ci_size:
+            for i in range(hcount):
+                doff, cnt, esz, _, typ = struct.unpack(">IIIIH", ci[hoff + i * 20:hoff + i * 20 + 18])
+                if typ != 3 or esz != 0x84 or doff + cnt * 0x84 > ci_size:
+                    continue
+                for j in range(cnt):
+                    e = ci[doff + j * 0x84:doff + (j + 1) * 0x84]
+                    rights.append((struct.unpack(">H", e[2:4])[0], e[4:0x84]))
+    return {"title_version": tver, "title_type": ttype, "contents": [(cidx, ctype, cid, csz, cidx in present) for cid, cidx, ctype, csz in contents],
+            "ticket_id": ticket_id, "ticket_version": tick_ver, "ticket_size": ts, "rights": rights}
+
+
+def write_title_records(r, path):
+    """game/dlc/info.bin for the runtime (services.c, am:app): little-endian, fixed records."""
+    with open(path, "wb") as o:
+        o.write(b"DLCI" + struct.pack("<IHHIQHHII", len(r["contents"]), r["title_version"], 0, r["title_type"], r["ticket_id"],
+                                       r["ticket_version"], 0, r["ticket_size"], len(r["rights"])))
+        for idx, typ, cid, size, present in r["contents"]:
+            o.write(struct.pack("<HHIQI", idx, typ, cid, size, int(present)))
+        for start, bits in r["rights"]:
+            o.write(struct.pack("<H", start) + bits)
+
+
 def add_dlc(path, game, seeddb=None, fetch=False):
     """Unpacks a DLC dump (title 0004008C xxxxxxxx, a CIA) into game/dlc/<TMD content index>.romfs: each content's
     RomFS, decrypted, which the runtime serves through the content archive (0x2345678A) like an installed title."""
@@ -321,6 +370,7 @@ def add_dlc(path, game, seeddb=None, fetch=False):
         if u32(D.read_at(f, 0, 4)) != 0x2020:
             sys.exit(f"{path}: DLC comes as a CIA")
         contents, version = cia_contents(f)
+        records = cia_title_records(f)
         out = os.path.join(game, "dlc"); tmp = out + ".tmp"
         if os.path.exists(tmp):
             shutil.rmtree(tmp)
@@ -342,6 +392,7 @@ def add_dlc(path, game, seeddb=None, fetch=False):
             with open(os.path.join(tmp, f"{idx}.romfs"), "wb") as o:
                 ctr_copy(R(), 0, ln, key, (tid << 64) | (3 << 56), o)
             n_ok += 1
+    write_title_records(records, os.path.join(tmp, "info.bin"))
     if os.path.exists(out):
         shutil.rmtree(out)
     os.replace(tmp, out)

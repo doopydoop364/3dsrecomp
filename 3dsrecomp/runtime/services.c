@@ -882,17 +882,112 @@ static void errf(KObject *s, uint32_t *cmd) {
     stub(s, cmd);
 }
 
+static void am_app(KObject *s, uint32_t *cmd);
 static const struct { const char *name; ServiceFn fn; } table[] = {
     { "srv:", srv }, { "err:f", errf },
     { "dsp::DSP", dsp }, { "y2r:u", y2r_service }, { "nfc:u", nfc_service }, { "nfc:m", nfc_service },
     { "hid:USER", hid }, { "hid:SPVR", hid }, { "gsp::Gpu", gsp_service },
     { "fs:USER", fs_user }, { "ndm:u", quiet_ok },
     { "ir:rst", irrst }, { "ir:USER", iruser }, { "ldr:ro", ldr_ro_service },
+    { "am:app", am_app },
     { "cecd:u", cecd }, { "boss:U", boss }, { "boss:P", boss }, { "frd:u", frd }, { "frd:a", frd }, { "ac:u", ac }, { "ac:i", ac },
     { "APT:A", apt }, { "APT:U", apt }, { "APT:S", apt },
     { "cfg:u", cfg }, { "cfg:s", cfg }, { "cfg:i", cfg },
     { "ptm:u", ptm }, { "ptm:s", ptm }, { "ptm:sysm", ptm }, { "ptm:gets", ptm }, { "ptm:play", ptm },
 };
+/* ---- am:app: what the console's title database says about the game's DLC (title 0004008C, same unique id), from
+ * game/dlc/info.bin (extract.py: TMD contents, which the dump holds, the ticket's rights), as Azahar answers ---- */
+typedef struct { uint16_t idx, type; uint32_t id; uint64_t size; uint32_t present; } DlcContent;
+static struct { int loaded, have; uint32_t n, nrights; uint16_t title_version; uint32_t title_type; uint64_t ticket_id;
+                uint16_t ticket_version; uint32_t ticket_size; DlcContent *c; struct { uint16_t start; uint8_t bits[128]; } *r; } dlc;
+static void dlc_load(void) {
+    if (dlc.loaded) return;
+    dlc.loaded = 1;
+    char p[700]; snprintf(p, sizeof p, "%s/dlc/info.bin", game_dir);
+    FILE *f = fopen(p, "rb"); uint8_t h[36];
+    if (!f) return;
+    if (fread(h, 1, 36, f) != 36 || memcmp(h, "DLCI", 4)) { fclose(f); return; }
+    memcpy(&dlc.n, h + 4, 4); memcpy(&dlc.title_version, h + 8, 2); memcpy(&dlc.title_type, h + 12, 4); memcpy(&dlc.ticket_id, h + 16, 8);
+    memcpy(&dlc.ticket_version, h + 24, 2); memcpy(&dlc.ticket_size, h + 28, 4); memcpy(&dlc.nrights, h + 32, 4);
+    dlc.c = calloc(dlc.n + 1, sizeof *dlc.c); dlc.r = calloc(dlc.nrights + 1, sizeof *dlc.r);
+    for (uint32_t i = 0; i < dlc.n; i++) { uint8_t e[20]; if (fread(e, 1, 20, f) != 20) break;
+        memcpy(&dlc.c[i].idx, e, 2); memcpy(&dlc.c[i].type, e + 2, 2); memcpy(&dlc.c[i].id, e + 4, 4); memcpy(&dlc.c[i].size, e + 8, 8); memcpy(&dlc.c[i].present, e + 16, 4); }
+    for (uint32_t i = 0; i < dlc.nrights; i++) { if (fread(&dlc.r[i].start, 2, 1, f) != 1 || fread(dlc.r[i].bits, 1, 128, f) != 128) break; }
+    fclose(f);
+    dlc.have = 1;
+    LOG(1, "am: DLC title database: %u contents, ticket rights in %u fields", dlc.n, dlc.nrights);
+}
+static int dlc_is_ours(uint32_t lo, uint32_t hi) { return hi == 0x0004008cu && (lo & 0xffffff00u) == (RECOMP_TITLE_ID_LO & 0xffffff00u); }
+static int dlc_rights(uint16_t i) {                       /* the ticket's content index (Azahar/GodMode9 rule) */
+    if (!dlc.nrights) return i < 256;
+    for (uint32_t k = 0; k < dlc.nrights; k++) {
+        if (i < dlc.r[k].start) break;
+        uint32_t bit = (uint32_t)(i - dlc.r[k].start);
+        if (bit >= 1024) continue;
+        if (dlc.r[k].bits[bit / 8] & (1u << (bit % 8))) return 1;
+    }
+    return 0;
+}
+static void dlc_info(uint32_t i, uint8_t out[24]) {      /* ContentInfo: index, type, id, size, ownership (1 downloaded, 2 owned) */
+    memset(out, 0, 24);
+    DlcContent *c = &dlc.c[i];
+    memcpy(out, &c->idx, 2); memcpy(out + 2, &c->type, 2); memcpy(out + 4, &c->id, 4); memcpy(out + 8, &c->size, 8);
+    out[16] = (uint8_t)((dlc_rights(c->idx) ? 2 : 0) | (c->present ? 1 : 0));
+}
+static uint32_t am_err(uint32_t desc) { return 0xe0000000u | (7u << 21) | (32u << 10) | desc; }   /* Usage, InvalidArgument, AM:
+                                                       31 InvalidTID, 60 InvalidTIDInList */
+static void am_app(KObject *s, uint32_t *cmd) {
+    dlc_load();
+    switch (cmd[0] >> 16) {
+    case 0x1001: {                                                     /* GetDLCContentInfoCount(media, tid) */
+        if (cmd[3] != 0x0004008cu) { reply(cmd, 2, 0); cmd[1] = am_err(31); cmd[2] = 0; break; }
+        reply(cmd, 2, 0); cmd[2] = dlc.have && dlc_is_ours(cmd[2], cmd[3]) ? dlc.n : 1; break;
+    }
+    case 0x1002: {                                                     /* FindDLCContentInfos(media, tid, count, indices, out) */
+        uint32_t lo = cmd[2], hi = cmd[3], n = cmd[4], in = cmd[6], out = cmd[8], res = RES_OK;
+        if (hi != 0x0004008cu) res = am_err(60);
+        else if (dlc.have && dlc_is_ours(lo, hi))
+            for (uint32_t k = 0; k < n; k++) {
+                uint16_t idx = (uint16_t)ld16(in + 2 * k); uint32_t i = 0;
+                while (i < dlc.n && dlc.c[i].idx != idx) i++;
+                if (i == dlc.n) { res = 0xffffffffu; break; }
+                uint8_t e[24]; dlc_info(i, e); memcpy((void *)(uintptr_t)(out + 24 * k), e, 24);
+            }
+        reply(cmd, 1, 0); cmd[1] = res; break;
+    }
+    case 0x1003: {                                                     /* ListDLCContentInfos(count, media, tid, start, out) */
+        uint32_t n = cmd[1], lo = cmd[3], hi = cmd[4], start = cmd[5], out = cmd[7], w = 0;
+        if (hi != 0x0004008cu) { reply(cmd, 2, 0); cmd[1] = am_err(60); cmd[2] = 0; break; }
+        if (dlc.have && dlc_is_ours(lo, hi))
+            for (uint32_t i = start; i < dlc.n && w < n; i++, w++) { uint8_t e[24]; dlc_info(i, e); memcpy((void *)(uintptr_t)(out + 24 * w), e, 24); }
+        LOG(1, "am: ListDLCContentInfos %08x%08x from %u: %u", hi, lo, start, w);
+        reply(cmd, 2, 0); cmd[2] = w; break;
+    }
+    case 0x1005: {                                                     /* GetDLCTitleInfos(media, count, tids, out) */
+        uint32_t n = cmd[2], d1 = cmd[3], tids = cmd[4], d2 = cmd[5], out = cmd[6], res = RES_OK;
+        for (uint32_t k = 0; k < n && res == RES_OK; k++) {
+            uint32_t lo = ld32(tids + 8 * k), hi = ld32(tids + 8 * k + 4);
+            if (hi != 0x0004008cu) { res = am_err(60); break; }
+            if (!dlc.have || !dlc_is_ours(lo, hi)) { res = 0xd9008078u; break; }   /* NotFound, InvalidState, Permanent (AM) */
+            uint8_t e[24] = { 0 }; uint64_t size = dlc.n ? dlc.c[0].size : 0;
+            memcpy(e, (void *)(uintptr_t)(tids + 8 * k), 8); memcpy(e + 8, &size, 8); memcpy(e + 16, &dlc.title_version, 2); memcpy(e + 20, &dlc.title_type, 4);
+            memcpy((void *)(uintptr_t)(out + 24 * k), e, 24);
+        }
+        reply(cmd, 1, 4); cmd[1] = res; cmd[2] = d1; cmd[3] = tids; cmd[4] = d2; cmd[5] = out; break;
+    }
+    case 0x1007: {                                                     /* ListDataTitleTicketInfos(count, tid, start, out) */
+        uint32_t n = cmd[1], lo = cmd[2], hi = cmd[3], start = cmd[4], out = cmd[6], w = 0;
+        if (n && start == 0 && dlc.have && dlc_is_ours(lo, hi)) {      /* TicketInfo: title id, ticket id, version, size */
+            uint8_t e[24] = { 0 }; memcpy(e, &lo, 4); memcpy(e + 4, &hi, 4); memcpy(e + 8, &dlc.ticket_id, 8);
+            memcpy(e + 16, &dlc.ticket_version, 2); memcpy(e + 20, &dlc.ticket_size, 4);
+            memcpy((void *)(uintptr_t)out, e, 24); w = 1;
+        }
+        reply(cmd, 2, 0); cmd[2] = w; break;
+    }
+    default: stub(s, cmd);
+    }
+}
+
 ServiceFn service_lookup(const char *name) {
     for (unsigned i = 0; i < sizeof table / sizeof *table; i++)
         if (!strcmp(table[i].name, name)) return table[i].fn;

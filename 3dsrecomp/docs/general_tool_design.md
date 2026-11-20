@@ -237,7 +237,9 @@ an installed update (title `0004000E` + the game's low word) supplies the ExHead
 RomFS stays the base one (SelfNCCH type 0) and the game opens the update's RomFS itself as SelfNCCH type 5 (the base
 RomFS when there is no update) and layers the two. DLC (`0004008C` + low word) is read through the content archive
 `0x2345678A`: archive path {title id, media type}, file path {open type, TMD content index, section, ExeFS name};
-a content that is not installed is "not found". Games may also ask `am:app` about DLC; none of the library does.
+a content that is not installed is "not found". Games ask `am:app` which DLC contents exist and are owned
+(ListDLCContentInfos, ownership 1 = downloaded, 2 = owned): Azahar answers from the installed TMD and the ticket's
+content-index rights (GodMode9's rule), "downloaded" being whether the content file is there.
 
 **What 3dsrecomp does.**
 - `3dsrecomp build|run` take several dumps (`run game.cia update.cia dlc.cia`) and also pick up an update or DLC dump
@@ -247,7 +249,9 @@ a content that is not installed is "not found". Games may also ask `am:app` abou
   `game/base/`), its RomFS becomes `game/update_romfs.bin`. Discovery, recompilation and the stage cache follow the
   program files, so the update's code is what gets recompiled; CRO modules come from the update's RomFS first.
 - DLC: every content's RomFS, decrypted, as `game/dlc/<TMD content index>.romfs` (indices, not content ids: they
-  differ when ids are skipped).
+  differ when ids are skipped), and `game/dlc/info.bin`: the TMD's contents (index, type, id, size), which ones the
+  CIA holds (its content bitmap), and the ticket's id, version, size and content-index rights fields.
+- `am:app` (0x1001-0x1003, 0x1005, 0x1007) answers from `info.bin` as Azahar does.
 - Runtime: SelfNCCH type 5 serves `update_romfs.bin` when present; archive `0x2345678A` serves the game's DLC
   contents and the system archives, all from their IVFC level-3 data (the exact level-3 size from the IVFC header).
 
@@ -256,3 +260,6 @@ content info) is a 14-byte "content data" marker of ownership. The fighters come
 library's Smash (title version 2080) has no update dump, so its code never asks for DLC. Checked without it: the
 update path end to end with a stand-in (the base dump extracted as an update; Smash running with the base RomFS
 served as the update RomFS); the DLC unpacking (all 139 contents decrypt to IVFC).
+Then with the real update (title version 35296, added 2026-11-19): the game reads DLC content 0, then lists its DLC
+through `am:app` (138 contents from index 1, all owned by the dump's ticket); the fighters (Mewtwo, Lucas, Roy, Ryu,
+Cloud, Corrin, Bayonetta), Mii outfits and music unlock with their announcements and appear at character select.

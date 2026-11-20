@@ -10,6 +10,7 @@
  *   save PATH        write a save state (state.c) of this moment; no frames pass
  *   load PATH        load a save state: the program restarts with it (same process id) and listens again, paused;
  *                    the reply "ok loading" comes first, then the connection closes
+ *   peek ADDR [N]    N bytes (1-256, default 4) of guest memory at ADDR (hex), as hex: "ok 0011aabb"
  *   frame            reply "ok frame F" without advancing
  *   quit             end the game
  * tools/play.py starts games in this mode and sends commands. */
@@ -126,6 +127,13 @@ void control_vblank(uint64_t frame) {
             if (cfd >= 0) { close(cfd); cfd = -1; }
             state_load_restart(arg);
             say("error loading failed");
+        } else if (!strcmp(cmd, "peek")) {                  /* peek ADDR [N]: N bytes of guest memory, as hex */
+            uint32_t a = (uint32_t)strtoul(arg, 0, 16), n = 4; char *sp = strchr(arg, ' ');
+            if (sp) n = (uint32_t)strtoul(sp + 1, 0, 0);
+            if (n == 0 || n > 256) { say("error peek reads 1 to 256 bytes"); continue; }
+            if (!mem_valid(a, n)) { say("error %08x+%u is not mapped", a, n); continue; }
+            char hex[520]; for (uint32_t i = 0; i < n; i++) snprintf(hex + 2 * i, 3, "%02x", ((uint8_t *)(uintptr_t)a)[i]);
+            say("ok %s", hex);
         } else if (!strcmp(cmd, "frame")) {
             say("ok frame %llu", (unsigned long long)frame);
         } else if (!strcmp(cmd, "quit")) {
