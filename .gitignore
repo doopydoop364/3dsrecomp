@@ -11,3 +11,6 @@ aes_keys.txt
 
 # compatibility link to the old folder name
 robobot-port
+
+# Azahar source, read as a behaviour reference (not part of this project)
+azahar-src/
